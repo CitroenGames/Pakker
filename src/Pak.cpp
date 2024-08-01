@@ -171,6 +171,68 @@ std::shared_ptr<std::vector<uint8_t>> PakFile::loadFile(const std::string& pakFi
     return std::make_shared<std::vector<uint8_t>>(std::move(fileData));
 }
 
+bool PakFile::addFileToPak(const std::string& pakFilename, const std::string& filename, const std::vector<uint8_t>& data) {
+    std::fstream pakStream(pakFilename, std::ios::in | std::ios::out | std::ios::binary);
+    if (!pakStream) {
+        std::cerr << "Error: Unable to open pak file." << std::endl;
+        return false;
+    }
+
+    // Read number of files
+    uint32_t numFiles;
+    pakStream.read(reinterpret_cast<char*>(&numFiles), sizeof(numFiles));
+    numFiles++;
+
+    // Read existing file table
+    std::vector<PakEntry> existingEntries;
+    for (uint32_t i = 0; i < numFiles - 1; ++i) {
+        char entryFilename[256] = { 0 };
+        uint32_t offset, size;
+        pakStream.read(entryFilename, sizeof(entryFilename));
+        pakStream.read(reinterpret_cast<char*>(&offset), sizeof(offset));
+        pakStream.read(reinterpret_cast<char*>(&size), sizeof(size));
+
+        PakEntry entry;
+        entry.filename = entryFilename;
+        entry.offset = offset;
+        entry.size = size;
+        existingEntries.push_back(entry);
+    }
+
+    // Add new file data
+    pakStream.seekp(0, std::ios::end);
+    std::vector<uint8_t> encryptedData = data;
+    encryptDecrypt(encryptedData);
+
+    PakEntry newEntry;
+    newEntry.filename = filename;
+    newEntry.offset = pakStream.tellp();
+    newEntry.size = encryptedData.size();
+
+    pakStream.write(reinterpret_cast<char*>(encryptedData.data()), encryptedData.size());
+
+    // Update file table
+    pakStream.seekp(sizeof(uint32_t));
+    pakStream.write(reinterpret_cast<char*>(&numFiles), sizeof(numFiles));
+
+    for (const auto& entry : existingEntries) {
+        char filenameBuffer[256] = { 0 };
+        strncpy(filenameBuffer, entry.filename.c_str(), sizeof(filenameBuffer) - 1);
+        pakStream.write(filenameBuffer, sizeof(filenameBuffer));
+        pakStream.write(reinterpret_cast<const char*>(&entry.offset), sizeof(entry.offset));
+        pakStream.write(reinterpret_cast<const char*>(&entry.size), sizeof(entry.size));
+    }
+
+    char newFilenameBuffer[256] = { 0 };
+    strncpy(newFilenameBuffer, newEntry.filename.c_str(), sizeof(newFilenameBuffer) - 1);
+    pakStream.write(newFilenameBuffer, sizeof(newFilenameBuffer));
+    pakStream.write(reinterpret_cast<const char*>(&newEntry.offset), sizeof(newEntry.offset));
+    pakStream.write(reinterpret_cast<const char*>(&newEntry.size), sizeof(newEntry.size));
+
+    pakStream.close();
+    return true;
+}
+
 bool PakFile::writeFile(const std::string& filename, const std::vector<uint8_t>& buffer) {
     std::ofstream fileStream(filename, std::ios::binary);
     if (!fileStream) {
