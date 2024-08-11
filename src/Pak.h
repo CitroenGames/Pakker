@@ -14,7 +14,7 @@ struct PakEntry {
     uint32_t size;
 };
 
-class PakFile {
+class Pakker {
 public:
     bool createPak(const std::string& pakFilename, const std::map<std::string, std::vector<uint8_t>>& files);
     bool extractPak(const std::string& pakFilename, const std::string& outputDir);
@@ -24,6 +24,8 @@ public:
     std::shared_ptr<std::vector<uint8_t>> loadFile(const std::string& pakFilename, const std::string& filename);
 
     bool addFileToPak(const std::string& pakFilename, const std::string& filename, const std::vector<uint8_t>& data);
+
+    bool createPakFromFolder(const std::string& pakFilename, const std::string& folderPath);
 
 private:
     bool writeFile(const std::string& filename, const std::vector<uint8_t>& buffer);

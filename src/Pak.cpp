@@ -5,14 +5,16 @@
 
 namespace fs = std::filesystem;
 
-void PakFile::encryptDecrypt(std::vector<uint8_t>& data) {
+void Pakker::encryptDecrypt(std::vector<uint8_t>& data) 
+{
     size_t keyLength = strlen(ENCRYPTION_KEY);
     for (size_t i = 0; i < data.size(); ++i) {
         data[i] ^= ENCRYPTION_KEY[i % keyLength];
     }
 }
 
-bool PakFile::createPak(const std::string& pakFilename, const std::map<std::string, std::vector<uint8_t>>& files) {
+bool Pakker::createPak(const std::string& pakFilename, const std::map<std::string, std::vector<uint8_t>>& files) 
+{
     std::ofstream pakStream(pakFilename, std::ios::binary);
     if (!pakStream) {
         std::cerr << "Error: Unable to create pak file." << std::endl;
@@ -51,7 +53,8 @@ bool PakFile::createPak(const std::string& pakFilename, const std::map<std::stri
     return true;
 }
 
-bool PakFile::extractPak(const std::string& pakFilename, const std::string& outputDir) {
+bool Pakker::extractPak(const std::string& pakFilename, const std::string& outputDir) 
+{
     std::ifstream pakStream(pakFilename, std::ios::binary);
     if (!pakStream) {
         std::cerr << "Error: Unable to open pak file." << std::endl;
@@ -80,6 +83,8 @@ bool PakFile::extractPak(const std::string& pakFilename, const std::string& outp
 
     // Extract files
     for (const auto& entry : entries) {
+        std::string fullPath = outputDir + "/" + entry.filename;
+        fs::create_directories(fs::path(fullPath).parent_path());
         pakStream.seekg(entry.offset);
         std::vector<uint8_t> fileData(entry.size);
         pakStream.read(reinterpret_cast<char*>(fileData.data()), entry.size);
@@ -97,7 +102,8 @@ bool PakFile::extractPak(const std::string& pakFilename, const std::string& outp
     return true;
 }
 
-bool PakFile::listPak(const std::string& pakFilename) {
+bool Pakker::listPak(const std::string& pakFilename) 
+{
     std::ifstream pakStream(pakFilename, std::ios::binary);
     if (!pakStream) {
         std::cerr << "Error: Unable to open pak file." << std::endl;
@@ -133,7 +139,8 @@ bool PakFile::listPak(const std::string& pakFilename) {
     return true;
 }
 
-std::vector<uint8_t> PakFile::readFileFromPak(const std::string& pakFilename, const std::string& filename) {
+std::vector<uint8_t> Pakker::readFileFromPak(const std::string& pakFilename, const std::string& filename) 
+{
     std::ifstream pakStream(pakFilename, std::ios::binary);
     if (!pakStream) {
         std::cerr << "Error: Unable to open pak file." << std::endl;
@@ -163,7 +170,8 @@ std::vector<uint8_t> PakFile::readFileFromPak(const std::string& pakFilename, co
     return {};
 }
 
-std::shared_ptr<std::vector<uint8_t>> PakFile::loadFile(const std::string& pakFilename, const std::string& filename) {
+std::shared_ptr<std::vector<uint8_t>> Pakker::loadFile(const std::string& pakFilename, const std::string& filename) 
+{
     std::vector<uint8_t> fileData = readFileFromPak(pakFilename, filename);
     if (fileData.empty()) {
         return nullptr;
@@ -171,7 +179,8 @@ std::shared_ptr<std::vector<uint8_t>> PakFile::loadFile(const std::string& pakFi
     return std::make_shared<std::vector<uint8_t>>(std::move(fileData));
 }
 
-bool PakFile::addFileToPak(const std::string& pakFilename, const std::string& filename, const std::vector<uint8_t>& data) {
+bool Pakker::addFileToPak(const std::string& pakFilename, const std::string& filename, const std::vector<uint8_t>& data) 
+{
     std::fstream pakStream(pakFilename, std::ios::in | std::ios::out | std::ios::binary);
     if (!pakStream) {
         std::cerr << "Error: Unable to open pak file." << std::endl;
@@ -185,7 +194,8 @@ bool PakFile::addFileToPak(const std::string& pakFilename, const std::string& fi
 
     // Read existing file table
     std::vector<PakEntry> existingEntries;
-    for (uint32_t i = 0; i < numFiles - 1; ++i) {
+    for (uint32_t i = 0; i < numFiles - 1; ++i) 
+    {
         char entryFilename[256] = { 0 };
         uint32_t offset, size;
         pakStream.read(entryFilename, sizeof(entryFilename));
@@ -215,7 +225,8 @@ bool PakFile::addFileToPak(const std::string& pakFilename, const std::string& fi
     pakStream.seekp(sizeof(uint32_t));
     pakStream.write(reinterpret_cast<char*>(&numFiles), sizeof(numFiles));
 
-    for (const auto& entry : existingEntries) {
+    for (const auto& entry : existingEntries) 
+    {
         char filenameBuffer[256] = { 0 };
         strncpy(filenameBuffer, entry.filename.c_str(), sizeof(filenameBuffer) - 1);
         pakStream.write(filenameBuffer, sizeof(filenameBuffer));
@@ -233,7 +244,32 @@ bool PakFile::addFileToPak(const std::string& pakFilename, const std::string& fi
     return true;
 }
 
-bool PakFile::writeFile(const std::string& filename, const std::vector<uint8_t>& buffer) {
+// helper function to normalize path separators
+std::string normalizePathSeparators(const std::string& path) {
+    std::string normalized = path;
+    std::replace(normalized.begin(), normalized.end(), '\\', '/');
+    return normalized;
+}
+
+bool Pakker::createPakFromFolder(const std::string& pakFilename, const std::string& folderPath) 
+{
+    std::map<std::string, std::vector<uint8_t>> files;
+
+    for (const auto& entry : fs::recursive_directory_iterator(folderPath)) {
+        if (fs::is_regular_file(entry.path())) {
+            std::string relativePath = fs::relative(entry.path(), folderPath).string();
+            relativePath = normalizePathSeparators(relativePath);  // Normalize to forward slashes
+            std::ifstream file(entry.path(), std::ios::binary);
+            std::vector<uint8_t> content((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+            files[relativePath] = content;
+        }
+    }
+
+    return createPak(pakFilename, files);
+}
+
+bool Pakker::writeFile(const std::string& filename, const std::vector<uint8_t>& buffer) 
+{
     std::ofstream fileStream(filename, std::ios::binary);
     if (!fileStream) {
         return false;
