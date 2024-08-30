@@ -1,6 +1,7 @@
-# 3D Game Asset Manager
+# Pakker
 
-This project demonstrates a comprehensive asset management system for 3D games, incorporating model loading, audio playback, and a custom file packaging system.
+Pakker is an asset resource storer designed to efficiently manage and store multiple files into a single archive. 
+This tool is useful for games, applications, or any projects that require bundling various resources like images, sounds, scripts, or other data files.
 
 ## Features
 
@@ -35,7 +36,7 @@ int main() {
 
     // Load Lua file from PAK
     std::shared_ptr<std::vector<uint8_t>> luaFileData = pakker.LoadFile("example.pak", "script.lua");
-    
+
     if (luaFileData) {
         std::string luaScript(luaFileData->begin(), luaFileData->end());
 
