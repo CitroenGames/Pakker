@@ -23,49 +23,37 @@ Our custom PAK file system provides efficient storage and retrieval of game asse
 - Add new assets to existing PAK files
 - Simple encryption for basic asset protection
 
-## 3D Model Loading
-
-Using Assimp, we can load various 3D model formats:
+## Loading LUA script example
 
 ```cpp
-std::shared_ptr<aiScene> load3DModel(const std::vector<uint8_t>& data, const std::string& filename) {
-    Assimp::Importer importer;
-    const aiScene* scene = importer.ReadFileFromMemory(
-        data.data(),
-        data.size(),
-        aiProcess_Triangulate | aiProcess_FlipUVs | aiProcess_GenNormals,
-        filename.c_str()
-    );
-    // ... error checking and scene handling
-}
-```
-
-## Audio Playback
-Integrate miniaudio for high-performance audio playback:
-
-```cpp
-#define MINIAUDIO_IMPLEMENTATION
-#include "miniaudio.h"
-
-void audio_callback(ma_device* pDevice, void* pOutput, const void* pInput, ma_uint32 frameCount) {
-    // Audio processing logic here
-}
+#include "Pak.h"
+#include <iostream>
+#include <lua.hpp>
 
 int main() {
-    ma_device_config deviceConfig = ma_device_config_init(ma_device_type_playback);
-    deviceConfig.playback.format   = ma_format_f32;
-    deviceConfig.playback.channels = 2;
-    deviceConfig.sampleRate        = 44100;
-    deviceConfig.dataCallback      = audio_callback;
+    Pakker pakker;
 
-    ma_device device;
-    if (ma_device_init(NULL, &deviceConfig, &device) != MA_SUCCESS) {
-        return -1;
+    // Load Lua file from PAK
+    std::shared_ptr<std::vector<uint8_t>> luaFileData = pakker.LoadFile("example.pak", "script.lua");
+    
+    if (luaFileData) {
+        std::string luaScript(luaFileData->begin(), luaFileData->end());
+
+        // Initialize Lua state
+        lua_State *L = luaL_newstate();
+        luaL_openlibs(L);
+
+        // Load and execute the Lua script
+        if (luaL_dostring(L, luaScript.c_str()) != LUA_OK) {
+            std::cerr << "Error executing Lua script: " << lua_tostring(L, -1) << std::endl;
+        }
+
+        // Close the Lua state
+        lua_close(L);
+    } else {
+        std::cerr << "Failed to load the Lua file from PAK" << std::endl;
     }
 
-    ma_device_start(&device);
-    // Main game loop
-    ma_device_uninit(&device);
     return 0;
 }
 ```
