@@ -94,6 +94,52 @@ int main() {
 }
 ```
 
+#### Creating a PAK file
+
+To create a PAK file from a directory of files:
+```cpp
+#include "Pak.h"
+
+Pakker pakker;
+pakker.CreatePakFromFolder("output.pak", "path/to/your/folder");
+```
+
+#### Extracting a PAK file
+
+To extract all files from a PAK file:
+```cpp
+#include "Pak.h"
+
+Pakker pakker;
+pakker.ExtractPak("output.pak", "output/directory");
+```
+
+#### Listing Contents of a PAK file
+
+To list all files in a PAK file:
+```cpp
+#include "Pak.h"
+
+Pakker pakker;
+pakker.ListPak("output.pak");
+```
+
+#### Reading a Specific File from a PAK file
+
+To read a specific file from a PAK file:
+```cpp
+#include "Pak.h"
+#include <iostream>
+
+Pakker pakker;
+auto fileData = pakker.LoadFile("output.pak", "filename.ext");
+
+if (fileData) {
+    std::cout << "File loaded successfully!" << std::endl;
+} else {
+    std::cerr << "Failed to load the file." << std::endl;
+}
+```
 ## Contributing
 Contributions are welcome! Please feel free to submit a Pull Request.
 ## License
