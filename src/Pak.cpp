@@ -2,9 +2,11 @@
 #include <filesystem>
 #include <algorithm>
 #include <cstring>
+#include <cctype>
 #include <limits>
 #include <numeric>
 #include <sstream>
+#include <unordered_set>
 
 #include "vendor/lz4.h"
 
@@ -207,6 +209,28 @@ void EncryptDecrypt(std::vector<uint8_t>& data, const std::string& key)
 
 using namespace PakInternal;
 
+// Returns true for file extensions known to be already compressed.
+// Skipping LZ4 on these avoids wasted CPU time (the result is always discarded).
+static bool IsLikelyPreCompressed(const std::string& filename)
+{
+    auto dotPos = filename.rfind('.');
+    if (dotPos == std::string::npos) return false;
+
+    std::string ext = filename.substr(dotPos);
+    std::transform(ext.begin(), ext.end(), ext.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+
+    static const std::unordered_set<std::string> compressedExts = {
+        ".png", ".jpg", ".jpeg", ".gif", ".webp", ".avif",
+        ".mp3", ".ogg", ".flac", ".aac", ".wma", ".opus",
+        ".mp4", ".webm", ".mkv",
+        ".zip", ".gz", ".7z", ".rar", ".bz2", ".xz", ".zst",
+        ".pak", ".lz4",
+    };
+
+    return compressedExts.count(ext) > 0;
+}
+
 // ===========================================================================
 // Pakker -- build-time API
 // ===========================================================================
@@ -261,6 +285,9 @@ bool Pakker::CreatePak(const std::string& pakFilename,
     std::vector<PakEntry> entries;
     entries.reserve(files.size());
 
+    std::vector<uint8_t> compressBuffer;
+    std::vector<uint8_t> encryptBuffer;
+
     for (const auto& [filename, data] : files) {
         std::string normalizedFilename = NormalizePathSeparators(filename);
         if (!IsValidFilename(normalizedFilename)) {
@@ -268,39 +295,43 @@ bool Pakker::CreatePak(const std::string& pakFilename,
             return false;
         }
 
-        std::vector<uint8_t> writeData;
+        const uint8_t* writePtr = data.data();
+        size_t writeSize = data.size();
         uint8_t flags = 0;
         uint64_t originalSize = data.size();
 
-        if (compress && !data.empty()) {
+        if (compress && !data.empty() && !IsLikelyPreCompressed(normalizedFilename)) {
             int maxCompressed = LZ4_compressBound(static_cast<int>(data.size()));
-            std::vector<uint8_t> compressed(maxCompressed);
+            compressBuffer.resize(maxCompressed);
             int compressedSize = LZ4_compress_default(
                 reinterpret_cast<const char*>(data.data()),
-                reinterpret_cast<char*>(compressed.data()),
+                reinterpret_cast<char*>(compressBuffer.data()),
                 static_cast<int>(data.size()),
                 maxCompressed);
 
             if (compressedSize > 0 &&
                 static_cast<uint64_t>(compressedSize) < originalSize) {
-                compressed.resize(compressedSize);
-                writeData = std::move(compressed);
+                compressBuffer.resize(compressedSize);
+                writePtr = compressBuffer.data();
+                writeSize = compressedSize;
                 flags = PAK_FLAG_COMPRESSED;
-            } else {
-                writeData = data;
             }
-        } else {
-            writeData = data;
         }
 
-        EncryptDecrypt(writeData, encryptionKey_);
+        // Encryption requires a mutable buffer; only copy when actually encrypting
+        if (!encryptionKey_.empty()) {
+            encryptBuffer.assign(writePtr, writePtr + writeSize);
+            EncryptDecrypt(encryptBuffer, encryptionKey_);
+            writePtr = encryptBuffer.data();
+            writeSize = encryptBuffer.size();
+        }
 
         uint64_t currentOffset = SafeStreamPos(pakStream.tellp());
-        uint64_t compressedSize = writeData.size();
-        entries.emplace_back(normalizedFilename, currentOffset, originalSize, compressedSize, flags);
+        entries.emplace_back(normalizedFilename, currentOffset, originalSize,
+                             static_cast<uint64_t>(writeSize), flags);
 
-        pakStream.write(reinterpret_cast<const char*>(writeData.data()),
-                       static_cast<std::streamsize>(writeData.size()));
+        pakStream.write(reinterpret_cast<const char*>(writePtr),
+                       static_cast<std::streamsize>(writeSize));
         if (!pakStream) {
             Log(PakLogLevel::Error, "CreatePak: Failed to write data for file: " + filename);
             return false;
@@ -567,7 +598,8 @@ bool Pakker::CreatePakFromFolder(const std::string& pakFilename,
                                  const std::string& folderPath,
                                  bool compress)
 {
-    std::map<std::string, std::vector<uint8_t>> files;
+    // Collect file paths first without loading contents into memory
+    std::vector<std::pair<std::string, fs::path>> filePaths; // (normalized name, disk path)
     try {
         for (const auto& entry : fs::recursive_directory_iterator(folderPath)) {
             if (fs::is_regular_file(entry.path())) {
@@ -577,21 +609,119 @@ bool Pakker::CreatePakFromFolder(const std::string& pakFilename,
                     Log(PakLogLevel::Warning, "CreatePakFromFolder: Skipping invalid filename: " + relativePath);
                     continue;
                 }
-                std::ifstream file(entry.path(), std::ios::binary);
-                if (!file) {
-                    Log(PakLogLevel::Warning, "CreatePakFromFolder: Failed to open file: " + entry.path().string());
-                    continue;
-                }
-                std::vector<uint8_t> content((std::istreambuf_iterator<char>(file)),
-                                             std::istreambuf_iterator<char>());
-                files[relativePath] = std::move(content);
+                filePaths.emplace_back(relativePath, entry.path());
             }
         }
     } catch (const fs::filesystem_error& e) {
         Log(PakLogLevel::Error, std::string("CreatePakFromFolder: Filesystem error: ") + e.what());
         return false;
     }
-    return CreatePak(pakFilename, files, compress);
+
+    // Sort for deterministic output
+    std::sort(filePaths.begin(), filePaths.end());
+
+    if (filePaths.size() > MAX_FILES_IN_PAK) {
+        Log(PakLogLevel::Error, "CreatePakFromFolder: Too many files to pack: " + std::to_string(filePaths.size()));
+        return false;
+    }
+
+    std::ofstream pakStream(pakFilename, std::ios::binary);
+    if (!pakStream) {
+        Log(PakLogLevel::Error, "CreatePakFromFolder: Unable to create pak file: " + pakFilename);
+        return false;
+    }
+
+    PakHeader header;
+    header.version = PAK_VERSION_2;
+    header.numFiles = static_cast<uint32_t>(filePaths.size());
+    header.fileTableOffset = 0;
+
+    if (!WritePakHeader(pakStream, header)) return false;
+
+    std::vector<PakEntry> entries;
+    entries.reserve(filePaths.size());
+
+    std::vector<uint8_t> compressBuffer;
+
+    // Stream each file from disk one at a time to avoid loading everything into memory
+    for (const auto& [normalizedName, diskPath] : filePaths) {
+        // Bulk read: open at end to get size, then read in one call
+        std::ifstream file(diskPath, std::ios::binary | std::ios::ate);
+        if (!file) {
+            Log(PakLogLevel::Warning, "CreatePakFromFolder: Failed to open file: " + diskPath.string());
+            continue;
+        }
+        auto fileSize = file.tellg();
+        file.seekg(0, std::ios::beg);
+        std::vector<uint8_t> data(static_cast<size_t>(fileSize));
+        if (fileSize > 0) {
+            file.read(reinterpret_cast<char*>(data.data()), fileSize);
+            if (!file) {
+                Log(PakLogLevel::Warning, "CreatePakFromFolder: Failed to read file: " + diskPath.string());
+                continue;
+            }
+        }
+        file.close();
+
+        const uint8_t* writePtr = data.data();
+        size_t writeSize = data.size();
+        uint8_t flags = 0;
+        uint64_t originalSize = data.size();
+
+        if (compress && !data.empty() && !IsLikelyPreCompressed(normalizedName)) {
+            int maxCompressed = LZ4_compressBound(static_cast<int>(data.size()));
+            compressBuffer.resize(maxCompressed);
+            int compressedSize = LZ4_compress_default(
+                reinterpret_cast<const char*>(data.data()),
+                reinterpret_cast<char*>(compressBuffer.data()),
+                static_cast<int>(data.size()),
+                maxCompressed);
+
+            if (compressedSize > 0 &&
+                static_cast<uint64_t>(compressedSize) < originalSize) {
+                compressBuffer.resize(compressedSize);
+                writePtr = compressBuffer.data();
+                writeSize = compressedSize;
+                flags = PAK_FLAG_COMPRESSED;
+            }
+        }
+
+        // Encrypt in-place on the buffer writePtr already points to
+        if (!encryptionKey_.empty()) {
+            if (writePtr == data.data()) {
+                EncryptDecrypt(data, encryptionKey_);
+            } else {
+                EncryptDecrypt(compressBuffer, encryptionKey_);
+            }
+            // writePtr remains valid — EncryptDecrypt does not resize
+        }
+
+        uint64_t currentOffset = SafeStreamPos(pakStream.tellp());
+        entries.emplace_back(normalizedName, currentOffset, originalSize,
+                             static_cast<uint64_t>(writeSize), flags);
+
+        pakStream.write(reinterpret_cast<const char*>(writePtr),
+                       static_cast<std::streamsize>(writeSize));
+        if (!pakStream) {
+            Log(PakLogLevel::Error, "CreatePakFromFolder: Failed to write data for file: " + normalizedName);
+            return false;
+        }
+    }
+
+    header.fileTableOffset = SafeStreamPos(pakStream.tellp());
+    header.numFiles = static_cast<uint32_t>(entries.size());
+    if (!WriteFileTable(pakStream, entries, PAK_VERSION_2)) return false;
+
+    pakStream.seekp(0, std::ios::beg);
+    if (!pakStream) {
+        Log(PakLogLevel::Error, "CreatePakFromFolder: Failed to seek to header.");
+        return false;
+    }
+    if (!WritePakHeader(pakStream, header)) return false;
+
+    pakStream.close();
+    Log(PakLogLevel::Info, "CreatePakFromFolder: PAK file '" + pakFilename + "' created successfully.");
+    return true;
 }
 
 uint32_t Pakker::GetFileCount(const std::string& pakFilename) const
