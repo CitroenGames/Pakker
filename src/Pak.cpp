@@ -1,811 +1,929 @@
-#include "pak.h"
-#include <fstream>
-#include <iostream>
+#include "Pak.h"
 #include <filesystem>
 #include <algorithm>
 #include <cstring>
 #include <limits>
+#include <numeric>
+#include <sstream>
+
+#include "vendor/lz4.h"
 
 namespace fs = std::filesystem;
 
-// Constructor initializes the encryption key
-Pakker::Pakker(const std::string& encryptionKey)
-    : encryptionKey_(encryptionKey)
+// ===========================================================================
+// Global logging
+// ===========================================================================
+
+static PakLogCallback g_logCallback = nullptr;
+
+void PakSetLogCallback(PakLogCallback cb) { g_logCallback = cb; }
+
+namespace PakInternal {
+
+void Log(PakLogLevel level, const std::string& msg)
 {
-    // Ensure we have a non-empty key for better security
-    if (encryptionKey_.empty()) {
-        encryptionKey_ = "default_fallback_key";
+    if (g_logCallback) {
+        g_logCallback(level, msg.c_str());
     }
 }
 
-// Encrypts or decrypts data in-place using XOR with the encryption key
-void Pakker::EncryptDecrypt(std::vector<uint8_t>& data) const
-{
-    if (data.empty() || encryptionKey_.empty()) return;
-    
-    const size_t keyLength = encryptionKey_.length();
-    for (size_t i = 0; i < data.size(); ++i)
-    {
-        data[i] ^= static_cast<uint8_t>(encryptionKey_[i % keyLength]);
-    }
-}
+// ===========================================================================
+// Shared utility functions
+// ===========================================================================
 
-// Normalizes path separators to '/' and validates path
-std::string Pakker::NormalizePathSeparators(const std::string& path) const
+std::string NormalizePathSeparators(const std::string& path)
 {
     std::string normalized = path;
     std::replace(normalized.begin(), normalized.end(), '\\', '/');
-    
-    // Remove any leading slashes to prevent absolute paths
     while (!normalized.empty() && normalized[0] == '/') {
         normalized.erase(0, 1);
     }
-    
     return normalized;
 }
 
-// Validates filename for security
-bool Pakker::IsValidFilename(const std::string& filename) const
+bool IsValidFilename(const std::string& filename)
 {
-    if (filename.empty() || filename.length() > MAX_FILENAME_LENGTH) {
-        return false;
-    }
-    
-    // Check for directory traversal attempts
-    if (filename.find("..") != std::string::npos) {
-        return false;
-    }
-    
-    // Check for null bytes
-    if (filename.find('\0') != std::string::npos) {
-        return false;
-    }
-    
-    // Check for invalid characters (platform-specific, but these are generally unsafe)
+    if (filename.empty() || filename.length() > MAX_FILENAME_LENGTH) return false;
+    if (filename.find("..") != std::string::npos) return false;
+    if (filename.find('\0') != std::string::npos) return false;
     const std::string invalidChars = "<>:\"|?*";
     for (char c : invalidChars) {
-        if (filename.find(c) != std::string::npos) {
-            return false;
-        }
+        if (filename.find(c) != std::string::npos) return false;
     }
-    
     return true;
 }
 
-// Safely converts stream position to uint64_t
-uint64_t Pakker::SafeStreamPos(std::streampos pos) const
+uint64_t SafeStreamPos(std::streampos pos)
 {
-    if (pos == std::streampos(-1)) {
-        return 0;
-    }
+    if (pos == std::streampos(-1)) return 0;
     return static_cast<uint64_t>(pos);
 }
 
-// Validates file table entry
-bool Pakker::ValidateEntry(const PakEntry& entry, uint64_t pakFileSize) const
+bool ValidateEntry(const PakEntry& entry, uint64_t pakFileSize)
 {
-    // Check for overflow in offset + size
-    if (entry.offset > pakFileSize || 
-        entry.size > pakFileSize ||
-        entry.offset + entry.size > pakFileSize) {
+    uint64_t diskSize = entry.compressedSize > 0 ? entry.compressedSize : entry.originalSize;
+    if (entry.offset > pakFileSize ||
+        diskSize > pakFileSize ||
+        entry.offset + diskSize > pakFileSize) {
         return false;
     }
-    
     return IsValidFilename(entry.filename);
 }
 
-// Improved WriteFile with better error handling
-bool Pakker::WriteFile(const std::string& filename, const std::vector<uint8_t>& buffer) const
-{
-    if (buffer.empty()) {
-        std::cerr << "WriteFile: Empty buffer for file: " << filename << std::endl;
-        return false;
-    }
-    
-    std::ofstream fileStream(filename, std::ios::binary);
-    if (!fileStream) {
-        std::cerr << "WriteFile: Unable to create file: " << filename << std::endl;
-        return false;
-    }
-    
-    fileStream.write(reinterpret_cast<const char*>(buffer.data()), 
-                     static_cast<std::streamsize>(buffer.size()));
-    
-    if (!fileStream) {
-        std::cerr << "WriteFile: Failed to write data to file: " << filename << std::endl;
-        return false;
-    }
-    
-    return true;
-}
+// ---------------------------------------------------------------------------
+// Header I/O
+// ---------------------------------------------------------------------------
 
-// Improved ReadPakHeader with better validation
-bool Pakker::ReadPakHeader(std::istream& stream, PakHeader& header) const
+bool ReadPakHeader(std::istream& stream, PakHeader& header)
 {
-    // Clear header first
     std::memset(&header, 0, sizeof(header));
-    
-    // Read the entire header at once for better performance
     stream.read(reinterpret_cast<char*>(&header), sizeof(header));
     if (!stream) {
-        std::cerr << "ReadPakHeader: Failed to read PAK header." << std::endl;
+        Log(PakLogLevel::Error, "ReadPakHeader: Failed to read PAK header.");
         return false;
     }
-
-    // Validate magic number
     if (std::memcmp(header.magic, PAK_MAGIC.data(), 4) != 0) {
-        std::cerr << "ReadPakHeader: Invalid magic number." << std::endl;
+        Log(PakLogLevel::Error, "ReadPakHeader: Invalid magic number.");
         return false;
     }
-
-    // Validate version
-    if (header.version != SUPPORTED_VERSION) {
-        std::cerr << "ReadPakHeader: Unsupported PAK version: " << header.version << std::endl;
+    if (header.version != PAK_VERSION_1 && header.version != PAK_VERSION_2) {
+        Log(PakLogLevel::Error, "ReadPakHeader: Unsupported PAK version: " + std::to_string(header.version));
         return false;
     }
-    
-    // Validate number of files
     if (header.numFiles > MAX_FILES_IN_PAK) {
-        std::cerr << "ReadPakHeader: Too many files in PAK: " << header.numFiles << std::endl;
+        Log(PakLogLevel::Error, "ReadPakHeader: Too many files in PAK: " + std::to_string(header.numFiles));
         return false;
     }
-
     return true;
 }
 
-// Improved WritePakHeader
-bool Pakker::WritePakHeader(std::ostream& stream, const PakHeader& header) const
+bool WritePakHeader(std::ostream& stream, const PakHeader& header)
 {
     stream.write(reinterpret_cast<const char*>(&header), sizeof(header));
     if (!stream) {
-        std::cerr << "WritePakHeader: Failed to write header." << std::endl;
+        Log(PakLogLevel::Error, "WritePakHeader: Failed to write header.");
         return false;
     }
     return true;
 }
 
-// Improved ReadFileTable with validation
-bool Pakker::ReadFileTable(std::istream& stream, uint32_t numFiles, std::vector<PakEntry>& entries) const
+// ---------------------------------------------------------------------------
+// File table I/O -- version-aware
+// ---------------------------------------------------------------------------
+
+bool ReadFileTable(std::istream& stream, uint32_t numFiles,
+                   uint32_t version, std::vector<PakEntry>& entries)
 {
     entries.clear();
-    entries.reserve(numFiles);  // Reserve space for better performance
-    
+    entries.reserve(numFiles);
+
     for (uint32_t i = 0; i < numFiles; ++i) {
         uint16_t nameLength;
         stream.read(reinterpret_cast<char*>(&nameLength), sizeof(nameLength));
         if (!stream || nameLength == 0 || nameLength > MAX_FILENAME_LENGTH) {
-            std::cerr << "ReadFileTable: Invalid filename length: " << nameLength << std::endl;
+            Log(PakLogLevel::Error, "ReadFileTable: Invalid filename length: " + std::to_string(nameLength));
             return false;
         }
 
         std::string filename(nameLength, '\0');
         stream.read(&filename[0], nameLength);
-        if (!stream)
-        {
-            std::cerr << "ReadFileTable: Failed to read filename." << std::endl;
+        if (!stream) {
+            Log(PakLogLevel::Error, "ReadFileTable: Failed to read filename.");
             return false;
         }
 
-        uint64_t offset, size;
+        uint64_t offset, originalSize;
         stream.read(reinterpret_cast<char*>(&offset), sizeof(offset));
-        stream.read(reinterpret_cast<char*>(&size), sizeof(size));
-        if (!stream)
-        {
-            std::cerr << "ReadFileTable: Failed to read file entry for: " << filename << std::endl;
+        stream.read(reinterpret_cast<char*>(&originalSize), sizeof(originalSize));
+        if (!stream) {
+            Log(PakLogLevel::Error, "ReadFileTable: Failed to read file entry for: " + filename);
             return false;
         }
 
-        // Validate the entry before adding it
-        PakEntry entry(std::move(filename), offset, size);
+        uint64_t compressedSize = originalSize;
+        uint8_t flags = 0;
+
+        if (version >= PAK_VERSION_2) {
+            stream.read(reinterpret_cast<char*>(&compressedSize), sizeof(compressedSize));
+            stream.read(reinterpret_cast<char*>(&flags), sizeof(flags));
+            if (!stream) {
+                Log(PakLogLevel::Error, "ReadFileTable: Failed to read v2 fields for: " + filename);
+                return false;
+            }
+        }
+
+        PakEntry entry(std::move(filename), offset, originalSize, compressedSize, flags);
         if (!IsValidFilename(entry.filename)) {
-            std::cerr << "ReadFileTable: Invalid filename: " << entry.filename << std::endl;
+            Log(PakLogLevel::Error, "ReadFileTable: Invalid filename: " + entry.filename);
             return false;
         }
-
         entries.emplace_back(std::move(entry));
     }
     return true;
 }
 
-// Improved WriteFileTable with better error handling
-bool Pakker::WriteFileTable(std::ostream& stream, const std::vector<PakEntry>& entries) const
+bool WriteFileTable(std::ostream& stream, const std::vector<PakEntry>& entries,
+                    uint32_t version)
 {
     for (const auto& entry : entries) {
         if (entry.filename.length() > MAX_FILENAME_LENGTH) {
-            std::cerr << "WriteFileTable: Filename too long: " << entry.filename << std::endl;
+            Log(PakLogLevel::Error, "WriteFileTable: Filename too long: " + entry.filename);
             return false;
         }
-        
+
         uint16_t nameLength = static_cast<uint16_t>(entry.filename.size());
         stream.write(reinterpret_cast<const char*>(&nameLength), sizeof(nameLength));
         stream.write(entry.filename.data(), nameLength);
         stream.write(reinterpret_cast<const char*>(&entry.offset), sizeof(entry.offset));
-        stream.write(reinterpret_cast<const char*>(&entry.size), sizeof(entry.size));
-        if (!stream)
-        {
-            std::cerr << "WriteFileTable: Failed to write file entry for: " << entry.filename << std::endl;
+        stream.write(reinterpret_cast<const char*>(&entry.originalSize), sizeof(entry.originalSize));
+
+        if (version >= PAK_VERSION_2) {
+            stream.write(reinterpret_cast<const char*>(&entry.compressedSize), sizeof(entry.compressedSize));
+            stream.write(reinterpret_cast<const char*>(&entry.flags), sizeof(entry.flags));
+        }
+
+        if (!stream) {
+            Log(PakLogLevel::Error, "WriteFileTable: Failed to write file entry for: " + entry.filename);
             return false;
         }
     }
     return true;
 }
 
-// Creates a PAK file from a map of filenames to their data
-bool Pakker::CreatePak(const std::string& pakFilename, const std::map<std::string, std::vector<uint8_t>>& files)
+// ---------------------------------------------------------------------------
+// Encryption
+// ---------------------------------------------------------------------------
+
+void EncryptDecrypt(std::vector<uint8_t>& data, const std::string& key)
 {
-    if (files.size() > MAX_FILES_IN_PAK) {
-        std::cerr << "CreatePak: Too many files to pack: " << files.size() << std::endl;
+    if (data.empty() || key.empty()) return;
+    const size_t keyLength = key.length();
+    for (size_t i = 0; i < data.size(); ++i) {
+        data[i] ^= static_cast<uint8_t>(key[i % keyLength]);
+    }
+}
+
+} // namespace PakInternal
+
+using namespace PakInternal;
+
+// ===========================================================================
+// Pakker -- build-time API
+// ===========================================================================
+
+Pakker::Pakker(const std::string& encryptionKey)
+    : encryptionKey_(encryptionKey)
+{
+}
+
+bool Pakker::WriteFile(const std::string& filename, const std::vector<uint8_t>& buffer) const
+{
+    if (buffer.empty()) {
+        Log(PakLogLevel::Error, "WriteFile: Empty buffer for file: " + filename);
         return false;
     }
-    
+    std::ofstream fileStream(filename, std::ios::binary);
+    if (!fileStream) {
+        Log(PakLogLevel::Error, "WriteFile: Unable to create file: " + filename);
+        return false;
+    }
+    fileStream.write(reinterpret_cast<const char*>(buffer.data()),
+                     static_cast<std::streamsize>(buffer.size()));
+    if (!fileStream) {
+        Log(PakLogLevel::Error, "WriteFile: Failed to write data to file: " + filename);
+        return false;
+    }
+    return true;
+}
+
+bool Pakker::CreatePak(const std::string& pakFilename,
+                       const std::map<std::string, std::vector<uint8_t>>& files,
+                       bool compress)
+{
+    if (files.size() > MAX_FILES_IN_PAK) {
+        Log(PakLogLevel::Error, "CreatePak: Too many files to pack: " + std::to_string(files.size()));
+        return false;
+    }
+
     std::ofstream pakStream(pakFilename, std::ios::binary);
     if (!pakStream) {
-        std::cerr << "CreatePak: Unable to create pak file: " << pakFilename << std::endl;
+        Log(PakLogLevel::Error, "CreatePak: Unable to create pak file: " + pakFilename);
         return false;
     }
 
     PakHeader header;
+    header.version = PAK_VERSION_2;
     header.numFiles = static_cast<uint32_t>(files.size());
-    header.fileTableOffset = 0; // Placeholder, will update later
+    header.fileTableOffset = 0;
 
-    if (!WritePakHeader(pakStream, header))
-    {
-        std::cerr << "CreatePak: Failed to write pak header." << std::endl;
-        return false;
-    }
+    if (!WritePakHeader(pakStream, header)) return false;
 
     std::vector<PakEntry> entries;
     entries.reserve(files.size());
 
-    // Write file data and collect entries
     for (const auto& [filename, data] : files) {
         std::string normalizedFilename = NormalizePathSeparators(filename);
-        
         if (!IsValidFilename(normalizedFilename)) {
-            std::cerr << "CreatePak: Invalid filename: " << filename << std::endl;
+            Log(PakLogLevel::Error, "CreatePak: Invalid filename: " + filename);
             return false;
         }
-        
-        std::vector<uint8_t> encryptedData = data;
-        EncryptDecrypt(encryptedData);
+
+        std::vector<uint8_t> writeData;
+        uint8_t flags = 0;
+        uint64_t originalSize = data.size();
+
+        if (compress && !data.empty()) {
+            int maxCompressed = LZ4_compressBound(static_cast<int>(data.size()));
+            std::vector<uint8_t> compressed(maxCompressed);
+            int compressedSize = LZ4_compress_default(
+                reinterpret_cast<const char*>(data.data()),
+                reinterpret_cast<char*>(compressed.data()),
+                static_cast<int>(data.size()),
+                maxCompressed);
+
+            if (compressedSize > 0 &&
+                static_cast<uint64_t>(compressedSize) < originalSize) {
+                compressed.resize(compressedSize);
+                writeData = std::move(compressed);
+                flags = PAK_FLAG_COMPRESSED;
+            } else {
+                writeData = data;
+            }
+        } else {
+            writeData = data;
+        }
+
+        EncryptDecrypt(writeData, encryptionKey_);
 
         uint64_t currentOffset = SafeStreamPos(pakStream.tellp());
-        entries.emplace_back(normalizedFilename, currentOffset, static_cast<uint64_t>(encryptedData.size()));
+        uint64_t compressedSize = writeData.size();
+        entries.emplace_back(normalizedFilename, currentOffset, originalSize, compressedSize, flags);
 
-        pakStream.write(reinterpret_cast<const char*>(encryptedData.data()), 
-                       static_cast<std::streamsize>(encryptedData.size()));
+        pakStream.write(reinterpret_cast<const char*>(writeData.data()),
+                       static_cast<std::streamsize>(writeData.size()));
         if (!pakStream) {
-            std::cerr << "CreatePak: Failed to write data for file: " << filename << std::endl;
+            Log(PakLogLevel::Error, "CreatePak: Failed to write data for file: " + filename);
             return false;
         }
     }
 
-    // Record the file table offset
     header.fileTableOffset = SafeStreamPos(pakStream.tellp());
-    std::cout << "CreatePak: File table will be written at offset " << header.fileTableOffset << std::endl;
+    if (!WriteFileTable(pakStream, entries, PAK_VERSION_2)) return false;
 
-    // Write the file table
-    if (!WriteFileTable(pakStream, entries))
-    {
-        std::cerr << "CreatePak: Failed to write file table." << std::endl;
-        return false;
-    }
-
-    // Update the header with the correct fileTableOffset
     pakStream.seekp(0, std::ios::beg);
-    if (!pakStream)
-    {
-        std::cerr << "CreatePak: Failed to seek to header." << std::endl;
+    if (!pakStream) {
+        Log(PakLogLevel::Error, "CreatePak: Failed to seek to header.");
         return false;
     }
-
-    if (!WritePakHeader(pakStream, header))
-    {
-        std::cerr << "CreatePak: Failed to update pak header with fileTableOffset." << std::endl;
-        return false;
-    }
+    if (!WritePakHeader(pakStream, header)) return false;
 
     pakStream.close();
-    std::cout << "CreatePak: PAK file '" << pakFilename << "' created successfully." << std::endl;
+    Log(PakLogLevel::Info, "CreatePak: PAK file '" + pakFilename + "' created successfully.");
     return true;
 }
 
-// Extracts all files from a PAK to the specified output directory
 bool Pakker::ExtractPak(const std::string& pakFilename, const std::string& outputDir) const
 {
     std::ifstream pakStream(pakFilename, std::ios::binary);
-    if (!pakStream)
-    {
-        std::cerr << "ExtractPak: Unable to open pak file: " << pakFilename << std::endl;
+    if (!pakStream) {
+        Log(PakLogLevel::Error, "ExtractPak: Unable to open pak file: " + pakFilename);
         return false;
     }
 
     PakHeader header;
-    if (!ReadPakHeader(pakStream, header))
-    {
-        std::cerr << "ExtractPak: Failed to read pak header." << std::endl;
-        return false;
-    }
+    if (!ReadPakHeader(pakStream, header)) return false;
 
-    // Get file size for validation
     pakStream.seekg(0, std::ios::end);
     uint64_t pakFileSize = SafeStreamPos(pakStream.tellg());
 
-    // Seek to fileTableOffset
     pakStream.seekg(header.fileTableOffset, std::ios::beg);
-    if (!pakStream)
-    {
-        std::cerr << "ExtractPak: Failed to seek to fileTableOffset." << std::endl;
+    if (!pakStream) {
+        Log(PakLogLevel::Error, "ExtractPak: Failed to seek to fileTableOffset.");
         return false;
     }
 
-    // Read file entries
     std::vector<PakEntry> entries;
-    if (!ReadFileTable(pakStream, header.numFiles, entries))
-    {
-        std::cerr << "ExtractPak: Failed to read file table." << std::endl;
-        return false;
-    }
+    if (!ReadFileTable(pakStream, header.numFiles, header.version, entries)) return false;
 
-    // Extract each file
     for (const auto& entry : entries) {
-        // Validate entry
         if (!ValidateEntry(entry, pakFileSize)) {
-            std::cerr << "ExtractPak: Invalid entry detected: " << entry.filename << std::endl;
+            Log(PakLogLevel::Error, "ExtractPak: Invalid entry detected: " + entry.filename);
             return false;
         }
-        
+
         pakStream.seekg(entry.offset, std::ios::beg);
         if (!pakStream) {
-            std::cerr << "ExtractPak: Failed to seek to offset for file: " << entry.filename << std::endl;
+            Log(PakLogLevel::Error, "ExtractPak: Failed to seek to offset for file: " + entry.filename);
             return false;
         }
 
-        std::vector<uint8_t> fileData(entry.size);
-        pakStream.read(reinterpret_cast<char*>(fileData.data()), 
-                      static_cast<std::streamsize>(entry.size));
+        uint64_t diskSize = entry.compressedSize;
+        std::vector<uint8_t> fileData(diskSize);
+        pakStream.read(reinterpret_cast<char*>(fileData.data()),
+                      static_cast<std::streamsize>(diskSize));
         if (!pakStream) {
-            std::cerr << "ExtractPak: Failed to read data for file: " << entry.filename << std::endl;
+            Log(PakLogLevel::Error, "ExtractPak: Failed to read data for file: " + entry.filename);
             return false;
         }
 
-        EncryptDecrypt(fileData); // Decrypt the file data
+        EncryptDecrypt(fileData, encryptionKey_);
+
+        if (entry.flags & PAK_FLAG_COMPRESSED) {
+            std::vector<uint8_t> decompressed(entry.originalSize);
+            int result = LZ4_decompress_safe(
+                reinterpret_cast<const char*>(fileData.data()),
+                reinterpret_cast<char*>(decompressed.data()),
+                static_cast<int>(fileData.size()),
+                static_cast<int>(entry.originalSize));
+            if (result < 0 || static_cast<uint64_t>(result) != entry.originalSize) {
+                Log(PakLogLevel::Error, "ExtractPak: Decompression failed for: " + entry.filename);
+                return false;
+            }
+            fileData = std::move(decompressed);
+        }
 
         std::string outputPath = (fs::path(outputDir) / entry.filename).string();
-
-        // **Sanitize the output path to prevent directory traversal attacks**
         fs::path sanitizedOutputPath = fs::weakly_canonical(fs::path(outputPath));
         fs::path sanitizedOutputDir = fs::weakly_canonical(fs::path(outputDir));
-
-        // Ensure the output path is within the output directory
-        if (sanitizedOutputPath.string().find(sanitizedOutputDir.string()) != 0)
-        {
-            std::cerr << "ExtractPak: Detected invalid file path: " << entry.filename << std::endl;
+        if (sanitizedOutputPath.string().find(sanitizedOutputDir.string()) != 0) {
+            Log(PakLogLevel::Error, "ExtractPak: Detected invalid file path: " + entry.filename);
             return false;
         }
 
-        // Create necessary directories
         fs::create_directories(fs::path(outputPath).parent_path());
-        if (!WriteFile(outputPath, fileData))
-        {
-            std::cerr << "ExtractPak: Failed to write file: " << outputPath << std::endl;
-            return false;
-        }
+        if (!WriteFile(outputPath, fileData)) return false;
     }
 
-    pakStream.close();
-    std::cout << "ExtractPak: All files extracted successfully to '" << outputDir << "'." << std::endl;
+    Log(PakLogLevel::Info, "ExtractPak: All files extracted successfully to '" + outputDir + "'.");
     return true;
 }
 
-// Lists all files contained within a PAK
 bool Pakker::ListPak(const std::string& pakFilename) const
 {
     std::ifstream pakStream(pakFilename, std::ios::binary);
-    if (!pakStream)
-    {
-        std::cerr << "ListPak: Unable to open pak file: " << pakFilename << std::endl;
+    if (!pakStream) {
+        Log(PakLogLevel::Error, "ListPak: Unable to open pak file: " + pakFilename);
         return false;
     }
 
     PakHeader header;
-    if (!ReadPakHeader(pakStream, header))
-    {
-        std::cerr << "ListPak: Failed to read pak header." << std::endl;
-        return false;
-    }
+    if (!ReadPakHeader(pakStream, header)) return false;
 
-    // Seek to fileTableOffset
     pakStream.seekg(header.fileTableOffset, std::ios::beg);
-    if (!pakStream)
-    {
-        std::cerr << "ListPak: Failed to seek to fileTableOffset." << std::endl;
+    if (!pakStream) {
+        Log(PakLogLevel::Error, "ListPak: Failed to seek to fileTableOffset.");
         return false;
     }
 
-    // Read file entries
     std::vector<PakEntry> entries;
-    if (!ReadFileTable(pakStream, header.numFiles, entries))
-    {
-        std::cerr << "ListPak: Failed to read file table." << std::endl;
-        return false;
-    }
+    if (!ReadFileTable(pakStream, header.numFiles, header.version, entries)) return false;
 
-    // Display file information
-    std::cout << "ListPak: Contents of '" << pakFilename << "':" << std::endl;
+    Log(PakLogLevel::Info, "ListPak: Contents of '" + pakFilename + "':");
     for (const auto& entry : entries) {
-        std::cout << " - " << entry.filename << " (Offset: " << entry.offset 
-                  << ", Size: " << entry.size << " bytes)" << std::endl;
+        std::ostringstream oss;
+        oss << " - " << entry.filename
+            << " (Offset: " << entry.offset
+            << ", Size: " << entry.originalSize << " bytes";
+        if (entry.flags & PAK_FLAG_COMPRESSED) {
+            oss << ", Compressed: " << entry.compressedSize << " bytes";
+        }
+        oss << ")";
+        Log(PakLogLevel::Info, oss.str());
     }
-
-    pakStream.close();
     return true;
 }
 
-// Reads a specific file from a PAK and returns its data
-std::vector<uint8_t> Pakker::ReadFileFromPak(const std::string& pakFilename, const std::string& filename) const
+std::vector<uint8_t> Pakker::ReadFileFromPak(const std::string& pakFilename,
+                                              const std::string& filename) const
 {
     std::ifstream pakStream(pakFilename, std::ios::binary);
-    if (!pakStream)
-    {
-        std::cerr << "ReadFileFromPak: Unable to open pak file: " << pakFilename << std::endl;
+    if (!pakStream) {
+        Log(PakLogLevel::Error, "ReadFileFromPak: Unable to open pak file: " + pakFilename);
         return {};
     }
 
     PakHeader header;
-    if (!ReadPakHeader(pakStream, header))
-    {
-        std::cerr << "ReadFileFromPak: Failed to read pak header." << std::endl;
-        return {};
-    }
+    if (!ReadPakHeader(pakStream, header)) return {};
 
-    // Get file size for validation
     pakStream.seekg(0, std::ios::end);
     uint64_t pakFileSize = SafeStreamPos(pakStream.tellg());
 
-    // Seek to fileTableOffset
     pakStream.seekg(header.fileTableOffset, std::ios::beg);
-    if (!pakStream)
-    {
-        std::cerr << "ReadFileFromPak: Failed to seek to fileTableOffset." << std::endl;
-        return {};
-    }
+    if (!pakStream) return {};
 
-    // Read file entries
     std::vector<PakEntry> entries;
-    if (!ReadFileTable(pakStream, header.numFiles, entries))
-    {
-        std::cerr << "ReadFileFromPak: Failed to read file table." << std::endl;
-        return {};
-    }
+    if (!ReadFileTable(pakStream, header.numFiles, header.version, entries)) return {};
 
-    // Search for the file entry
     std::string normalizedFilename = NormalizePathSeparators(filename);
     for (const auto& entry : entries) {
         if (entry.filename == normalizedFilename) {
-            // Validate entry
-            if (!ValidateEntry(entry, pakFileSize)) {
-                std::cerr << "ReadFileFromPak: Invalid entry: " << entry.filename << std::endl;
-                return {};
-            }
-            
+            if (!ValidateEntry(entry, pakFileSize)) return {};
+
             pakStream.seekg(entry.offset, std::ios::beg);
-            if (!pakStream) {
-                std::cerr << "ReadFileFromPak: Failed to seek to offset for file: " << entry.filename << std::endl;
-                return {};
-            }
+            if (!pakStream) return {};
 
-            std::vector<uint8_t> fileData(entry.size);
-            pakStream.read(reinterpret_cast<char*>(fileData.data()), 
-                          static_cast<std::streamsize>(entry.size));
-            if (!pakStream) {
-                std::cerr << "ReadFileFromPak: Failed to read data for file: " << entry.filename << std::endl;
-                return {};
-            }
+            uint64_t diskSize = entry.compressedSize;
+            std::vector<uint8_t> fileData(diskSize);
+            pakStream.read(reinterpret_cast<char*>(fileData.data()),
+                          static_cast<std::streamsize>(diskSize));
+            if (!pakStream) return {};
 
-            EncryptDecrypt(fileData); // Decrypt the file data
+            EncryptDecrypt(fileData, encryptionKey_);
+
+            if (entry.flags & PAK_FLAG_COMPRESSED) {
+                std::vector<uint8_t> decompressed(entry.originalSize);
+                int result = LZ4_decompress_safe(
+                    reinterpret_cast<const char*>(fileData.data()),
+                    reinterpret_cast<char*>(decompressed.data()),
+                    static_cast<int>(fileData.size()),
+                    static_cast<int>(entry.originalSize));
+                if (result < 0 || static_cast<uint64_t>(result) != entry.originalSize) {
+                    Log(PakLogLevel::Error, "ReadFileFromPak: Decompression failed for: " + entry.filename);
+                    return {};
+                }
+                return decompressed;
+            }
             return fileData;
         }
     }
 
-    std::cerr << "ReadFileFromPak: File not found in pak: " << filename << std::endl;
+    Log(PakLogLevel::Error, "ReadFileFromPak: File not found in pak: " + filename);
     return {};
 }
 
-// Loads a specific file from a PAK and returns a shared pointer to its data
-std::shared_ptr<std::vector<uint8_t>> Pakker::LoadFile(const std::string& pakFilename, const std::string& filename) const
+std::shared_ptr<std::vector<uint8_t>> Pakker::LoadFile(const std::string& pakFilename,
+                                                        const std::string& filename) const
 {
-    std::vector<uint8_t> fileData = ReadFileFromPak(pakFilename, filename);
-    if (fileData.empty())
-    {
-        return nullptr;
-    }
-    return std::make_shared<std::vector<uint8_t>>(std::move(fileData));
+    auto data = ReadFileFromPak(pakFilename, filename);
+    if (data.empty()) return nullptr;
+    return std::make_shared<std::vector<uint8_t>>(std::move(data));
 }
 
-// Adds a single file to an existing PAK
-bool Pakker::AddFileToPak(const std::string& pakFilename, const std::string& filename, const std::vector<uint8_t>& data)
+bool Pakker::AddFileToPak(const std::string& pakFilename,
+                          const std::string& filename,
+                          const std::vector<uint8_t>& data)
 {
-    // Validate filename
     std::string normalizedFilename = NormalizePathSeparators(filename);
     if (!IsValidFilename(normalizedFilename)) {
-        std::cerr << "AddFileToPak: Invalid filename: " << filename << std::endl;
+        Log(PakLogLevel::Error, "AddFileToPak: Invalid filename: " + filename);
         return false;
     }
-    
-    // Open the PAK file with both input and output capabilities
+
     std::fstream pakStream(pakFilename, std::ios::in | std::ios::out | std::ios::binary);
-    if (!pakStream)
-    {
-        std::cerr << "AddFileToPak: Unable to open pak file: " << pakFilename << std::endl;
+    if (!pakStream) {
+        Log(PakLogLevel::Error, "AddFileToPak: Unable to open pak file: " + pakFilename);
         return false;
     }
 
-    // Read the existing PAK header
     PakHeader header;
-    if (!ReadPakHeader(pakStream, header))
-    {
-        std::cerr << "AddFileToPak: Failed to read pak header." << std::endl;
-        return false;
-    }
+    if (!ReadPakHeader(pakStream, header)) return false;
 
-    std::cout << "AddFileToPak: Current file table offset is " << header.fileTableOffset << std::endl;
-
-    // Read existing file table
     pakStream.seekg(header.fileTableOffset, std::ios::beg);
-    if (!pakStream)
-    {
-        std::cerr << "AddFileToPak: Failed to seek to fileTableOffset." << std::endl;
-        return false;
-    }
+    if (!pakStream) return false;
 
     std::vector<PakEntry> entries;
-    if (!ReadFileTable(pakStream, header.numFiles, entries))
-    {
-        std::cerr << "AddFileToPak: Failed to read file table." << std::endl;
-        return false;
-    }
+    if (!ReadFileTable(pakStream, header.numFiles, header.version, entries)) return false;
 
-    // Check if the file already exists in the PAK
-    auto it = std::find_if(entries.begin(), entries.end(), [&](const PakEntry& entry) {
-        return entry.filename == normalizedFilename;
+    auto it = std::find_if(entries.begin(), entries.end(), [&](const PakEntry& e) {
+        return e.filename == normalizedFilename;
     });
-
-    if (it != entries.end())
-    {
-        std::cerr << "AddFileToPak: File already exists in pak: " << filename << std::endl;
+    if (it != entries.end()) {
+        Log(PakLogLevel::Error, "AddFileToPak: File already exists in pak: " + filename);
         return false;
     }
-
-    // Check if we would exceed the file limit
     if (header.numFiles + 1 > MAX_FILES_IN_PAK) {
-        std::cerr << "AddFileToPak: Would exceed maximum file count." << std::endl;
+        Log(PakLogLevel::Error, "AddFileToPak: Would exceed maximum file count.");
         return false;
     }
 
-    // Move to the end of the file to append the new file data
     pakStream.seekp(0, std::ios::end);
-
-    if (!pakStream) {
-        std::cerr << "AddFileToPak: Failed to seek to end of pak file." << std::endl;
-        return false;
-    }
+    if (!pakStream) return false;
 
     uint64_t newOffset = SafeStreamPos(pakStream.tellp());
-    std::cout << "AddFileToPak: Appending new file at offset " << newOffset << std::endl;
-
     std::vector<uint8_t> encryptedData = data;
-    EncryptDecrypt(encryptedData);
-    pakStream.write(reinterpret_cast<const char*>(encryptedData.data()), 
+    EncryptDecrypt(encryptedData, encryptionKey_);
+
+    pakStream.write(reinterpret_cast<const char*>(encryptedData.data()),
                    static_cast<std::streamsize>(encryptedData.size()));
-    if (!pakStream) {
-        std::cerr << "AddFileToPak: Failed to write data for file: " << filename << std::endl;
-        return false;
-    }
+    if (!pakStream) return false;
 
-    // Update entries and header
-    entries.emplace_back(normalizedFilename, newOffset, static_cast<uint64_t>(encryptedData.size()));
+    uint64_t originalSize = data.size();
+    uint64_t compressedSize = encryptedData.size();
+    entries.emplace_back(normalizedFilename, newOffset, originalSize, compressedSize, 0);
     header.numFiles += 1;
-
-    // Update the file table offset to current end
     header.fileTableOffset = SafeStreamPos(pakStream.tellp());
-    std::cout << "AddFileToPak: New file table offset is " << header.fileTableOffset << std::endl;
 
-    // Seek to the beginning to write the updated header
     pakStream.seekp(0, std::ios::beg);
-    if (!pakStream)
-    {
-        std::cerr << "AddFileToPak: Failed to seek to beginning of pak file." << std::endl;
-        return false;
-    }
+    if (!WritePakHeader(pakStream, header)) return false;
 
-    if (!WritePakHeader(pakStream, header))
-    {
-        std::cerr << "AddFileToPak: Failed to update pak header with new fileTableOffset." << std::endl;
-        return false;
-    }
-
-    // Seek to the new fileTableOffset to write the updated file table
     pakStream.seekp(header.fileTableOffset, std::ios::beg);
-    if (!pakStream)
-    {
-        std::cerr << "AddFileToPak: Failed to seek to new fileTableOffset." << std::endl;
-        return false;
-    }
+    if (!WriteFileTable(pakStream, entries, header.version)) return false;
 
-    if (!WriteFileTable(pakStream, entries))
-    {
-        std::cerr << "AddFileToPak: Failed to write updated file table." << std::endl;
-        return false;
-    }
-
-    pakStream.close();
-    std::cout << "AddFileToPak: File '" << filename << "' added successfully." << std::endl;
+    Log(PakLogLevel::Info, "AddFileToPak: File '" + filename + "' added successfully.");
     return true;
 }
 
-// Creates a PAK file from all files within a specified folder
-bool Pakker::CreatePakFromFolder(const std::string& pakFilename, const std::string& folderPath)
+bool Pakker::CreatePakFromFolder(const std::string& pakFilename,
+                                 const std::string& folderPath,
+                                 bool compress)
 {
     std::map<std::string, std::vector<uint8_t>> files;
-
-    try
-    {
-        for (const auto& entry : fs::recursive_directory_iterator(folderPath))
-        {
-            if (fs::is_regular_file(entry.path()))
-            {
+    try {
+        for (const auto& entry : fs::recursive_directory_iterator(folderPath)) {
+            if (fs::is_regular_file(entry.path())) {
                 std::string relativePath = fs::relative(entry.path(), folderPath).string();
                 relativePath = NormalizePathSeparators(relativePath);
-                
                 if (!IsValidFilename(relativePath)) {
-                    std::cerr << "CreatePakFromFolder: Skipping invalid filename: " << relativePath << std::endl;
+                    Log(PakLogLevel::Warning, "CreatePakFromFolder: Skipping invalid filename: " + relativePath);
                     continue;
                 }
-                
                 std::ifstream file(entry.path(), std::ios::binary);
-                if (!file)
-                {
-                    std::cerr << "CreatePakFromFolder: Failed to open file: " << entry.path() << std::endl;
+                if (!file) {
+                    Log(PakLogLevel::Warning, "CreatePakFromFolder: Failed to open file: " + entry.path().string());
                     continue;
                 }
-                
-                std::vector<uint8_t> content((std::istreambuf_iterator<char>(file)), 
-                                           std::istreambuf_iterator<char>());
+                std::vector<uint8_t> content((std::istreambuf_iterator<char>(file)),
+                                             std::istreambuf_iterator<char>());
                 files[relativePath] = std::move(content);
             }
         }
-    }
-    catch (const fs::filesystem_error& e)
-    {
-        std::cerr << "CreatePakFromFolder: Filesystem error: " << e.what() << std::endl;
+    } catch (const fs::filesystem_error& e) {
+        Log(PakLogLevel::Error, std::string("CreatePakFromFolder: Filesystem error: ") + e.what());
         return false;
     }
-
-    return CreatePak(pakFilename, files);
+    return CreatePak(pakFilename, files, compress);
 }
 
-// Get file count without reading entire file table
 uint32_t Pakker::GetFileCount(const std::string& pakFilename) const
 {
     std::ifstream pakStream(pakFilename, std::ios::binary);
-    if (!pakStream) {
-        return 0;
-    }
-
+    if (!pakStream) return 0;
     PakHeader header;
-    if (!ReadPakHeader(pakStream, header)) {
-        return 0;
-    }
-
+    if (!ReadPakHeader(pakStream, header)) return 0;
     return header.numFiles;
 }
 
-// Check if a file exists in PAK without reading it
 bool Pakker::FileExists(const std::string& pakFilename, const std::string& filename) const
 {
     return GetFileInfo(pakFilename, filename).found;
 }
 
-// Get file info without reading the actual file data
-Pakker::FileInfo Pakker::GetFileInfo(const std::string& pakFilename, const std::string& filename) const
+Pakker::FileInfo Pakker::GetFileInfo(const std::string& pakFilename,
+                                     const std::string& filename) const
 {
     FileInfo info{};
     info.found = false;
 
     std::ifstream pakStream(pakFilename, std::ios::binary);
-    if (!pakStream) {
-        return info;  
-    }
+    if (!pakStream) return info;
 
     PakHeader header;
-    if (!ReadPakHeader(pakStream, header)) {
-        return info;
-    }
+    if (!ReadPakHeader(pakStream, header)) return info;
 
     pakStream.seekg(header.fileTableOffset, std::ios::beg);
-    if (!pakStream) {
-        return info;
-    }
+    if (!pakStream) return info;
 
     std::vector<PakEntry> entries;
-    if (!ReadFileTable(pakStream, header.numFiles, entries)) {
-        return info;
-    }
+    if (!ReadFileTable(pakStream, header.numFiles, header.version, entries)) return info;
 
     std::string normalizedFilename = NormalizePathSeparators(filename);
-    auto it = std::find_if(entries.begin(), entries.end(), 
-                          [&](const PakEntry& entry) {
-                              return entry.filename == normalizedFilename;
-                          });
-
+    auto it = std::find_if(entries.begin(), entries.end(),
+                          [&](const PakEntry& e) { return e.filename == normalizedFilename; });
     if (it != entries.end()) {
         info.filename = it->filename;
-        info.size = it->size;
+        info.size = it->originalSize;
         info.found = true;
     }
-
     return info;
 }
 
-// Extract single file to disk
-bool Pakker::ExtractSingleFile(const std::string& pakFilename, const std::string& filename, const std::string& outputPath) const
+bool Pakker::ExtractSingleFile(const std::string& pakFilename,
+                               const std::string& filename,
+                               const std::string& outputPath) const
 {
     std::vector<uint8_t> fileData = ReadFileFromPak(pakFilename, filename);
-    if (fileData.empty()) {
-        return false;
-    }
-
-    // Create necessary directories
+    if (fileData.empty()) return false;
     fs::create_directories(fs::path(outputPath).parent_path());
-    
     return WriteFile(outputPath, fileData);
 }
 
-// Validate PAK file integrity
 bool Pakker::ValidatePak(const std::string& pakFilename) const
 {
     std::ifstream pakStream(pakFilename, std::ios::binary);
     if (!pakStream) {
-        std::cerr << "ValidatePak: Unable to open pak file: " << pakFilename << std::endl;
+        Log(PakLogLevel::Error, "ValidatePak: Unable to open pak file: " + pakFilename);
         return false;
     }
 
-    // Get file size
     pakStream.seekg(0, std::ios::end);
     uint64_t pakFileSize = SafeStreamPos(pakStream.tellg());
     pakStream.seekg(0, std::ios::beg);
 
     PakHeader header;
-    if (!ReadPakHeader(pakStream, header)) {
-        return false;
-    }
+    if (!ReadPakHeader(pakStream, header)) return false;
 
-    // Validate file table offset
     if (header.fileTableOffset >= pakFileSize) {
-        std::cerr << "ValidatePak: Invalid file table offset." << std::endl;
+        Log(PakLogLevel::Error, "ValidatePak: Invalid file table offset.");
         return false;
     }
 
     pakStream.seekg(header.fileTableOffset, std::ios::beg);
-    if (!pakStream) {
-        std::cerr << "ValidatePak: Failed to seek to file table." << std::endl;
-        return false;
-    }
+    if (!pakStream) return false;
 
     std::vector<PakEntry> entries;
-    if (!ReadFileTable(pakStream, header.numFiles, entries)) {
-        return false;
-    }
+    if (!ReadFileTable(pakStream, header.numFiles, header.version, entries)) return false;
 
-    // Validate each entry
     for (const auto& entry : entries) {
         if (!ValidateEntry(entry, pakFileSize)) {
-            std::cerr << "ValidatePak: Invalid entry: " << entry.filename << std::endl;
+            Log(PakLogLevel::Error, "ValidatePak: Invalid entry: " + entry.filename);
             return false;
         }
     }
 
-    std::cout << "ValidatePak: PAK file '" << pakFilename << "' is valid." << std::endl;
+    Log(PakLogLevel::Info, "ValidatePak: PAK file '" + pakFilename + "' is valid.");
     return true;
+}
+
+// ===========================================================================
+// PakReader -- runtime read-only API for shipping builds
+// ===========================================================================
+
+PakReader::PakReader(const std::string& encryptionKey)
+    : encryptionKey_(encryptionKey)
+{
+}
+
+PakReader::~PakReader()
+{
+    Close();
+}
+
+PakReader::PakReader(PakReader&& other) noexcept
+    : encryptionKey_(std::move(other.encryptionKey_)),
+      pakStream_(std::move(other.pakStream_)),
+      header_(other.header_),
+      pakFileSize_(other.pakFileSize_),
+      formatVersion_(other.formatVersion_),
+      isOpen_(other.isOpen_),
+      fileTable_(std::move(other.fileTable_))
+{
+    other.isOpen_ = false;
+    other.pakFileSize_ = 0;
+    other.formatVersion_ = 0;
+}
+
+PakReader& PakReader::operator=(PakReader&& other) noexcept
+{
+    if (this != &other) {
+        Close();
+        encryptionKey_ = std::move(other.encryptionKey_);
+        pakStream_ = std::move(other.pakStream_);
+        header_ = other.header_;
+        pakFileSize_ = other.pakFileSize_;
+        formatVersion_ = other.formatVersion_;
+        isOpen_ = other.isOpen_;
+        fileTable_ = std::move(other.fileTable_);
+        other.isOpen_ = false;
+        other.pakFileSize_ = 0;
+        other.formatVersion_ = 0;
+    }
+    return *this;
+}
+
+bool PakReader::Open(const std::string& pakFilename)
+{
+    Close();
+
+    pakStream_.open(pakFilename, std::ios::binary);
+    if (!pakStream_) {
+        Log(PakLogLevel::Error, "PakReader::Open: Unable to open pak file: " + pakFilename);
+        return false;
+    }
+
+    if (!ReadPakHeader(pakStream_, header_)) {
+        pakStream_.close();
+        return false;
+    }
+    formatVersion_ = header_.version;
+
+    pakStream_.seekg(0, std::ios::end);
+    pakFileSize_ = SafeStreamPos(pakStream_.tellg());
+
+    pakStream_.seekg(header_.fileTableOffset, std::ios::beg);
+    if (!pakStream_) {
+        Log(PakLogLevel::Error, "PakReader::Open: Failed to seek to file table.");
+        pakStream_.close();
+        return false;
+    }
+
+    std::vector<PakEntry> entries;
+    if (!ReadFileTable(pakStream_, header_.numFiles, formatVersion_, entries)) {
+        pakStream_.close();
+        return false;
+    }
+
+    // Build hash map for O(1) lookup
+    fileTable_.reserve(entries.size());
+    for (auto& entry : entries) {
+        if (!ValidateEntry(entry, pakFileSize_)) {
+            Log(PakLogLevel::Error, "PakReader::Open: Invalid entry: " + entry.filename);
+            pakStream_.close();
+            fileTable_.clear();
+            return false;
+        }
+        std::string key = entry.filename;
+        fileTable_.emplace(std::move(key), std::move(entry));
+    }
+
+    isOpen_ = true;
+    Log(PakLogLevel::Info, "PakReader::Open: Opened '" + pakFilename + "' with " +
+        std::to_string(header_.numFiles) + " files.");
+    return true;
+}
+
+void PakReader::Close()
+{
+    if (isOpen_) {
+        pakStream_.close();
+        fileTable_.clear();
+        header_ = PakHeader{};
+        pakFileSize_ = 0;
+        formatVersion_ = 0;
+        isOpen_ = false;
+    }
+}
+
+bool PakReader::IsOpen() const { return isOpen_; }
+
+std::vector<uint8_t> PakReader::ReadEntry(const PakEntry& entry) const
+{
+    pakStream_.seekg(entry.offset, std::ios::beg);
+    if (!pakStream_) {
+        Log(PakLogLevel::Error, "PakReader: Failed to seek for file: " + entry.filename);
+        return {};
+    }
+
+    uint64_t diskSize = entry.compressedSize;
+    std::vector<uint8_t> rawData(diskSize);
+    pakStream_.read(reinterpret_cast<char*>(rawData.data()),
+                    static_cast<std::streamsize>(diskSize));
+    if (!pakStream_) {
+        Log(PakLogLevel::Error, "PakReader: Failed to read file: " + entry.filename);
+        return {};
+    }
+
+    EncryptDecrypt(rawData, encryptionKey_);
+
+    if (entry.flags & PAK_FLAG_COMPRESSED) {
+        std::vector<uint8_t> decompressed(entry.originalSize);
+        int result = LZ4_decompress_safe(
+            reinterpret_cast<const char*>(rawData.data()),
+            reinterpret_cast<char*>(decompressed.data()),
+            static_cast<int>(rawData.size()),
+            static_cast<int>(entry.originalSize));
+        if (result < 0 || static_cast<uint64_t>(result) != entry.originalSize) {
+            Log(PakLogLevel::Error, "PakReader: Decompression failed for: " + entry.filename);
+            return {};
+        }
+        return decompressed;
+    }
+
+    return rawData;
+}
+
+std::vector<uint8_t> PakReader::ReadFile(const std::string& filename) const
+{
+    if (!isOpen_) {
+        Log(PakLogLevel::Error, "PakReader::ReadFile: No PAK file is open.");
+        return {};
+    }
+
+    std::string normalized = NormalizePathSeparators(filename);
+    auto it = fileTable_.find(normalized);
+    if (it == fileTable_.end()) {
+        Log(PakLogLevel::Error, "PakReader::ReadFile: File not found: " + filename);
+        return {};
+    }
+
+    return ReadEntry(it->second);
+}
+
+std::shared_ptr<std::vector<uint8_t>> PakReader::LoadFile(const std::string& filename) const
+{
+    auto data = ReadFile(filename);
+    if (data.empty()) return nullptr;
+    return std::make_shared<std::vector<uint8_t>>(std::move(data));
+}
+
+bool PakReader::FileExists(const std::string& filename) const
+{
+    if (!isOpen_) return false;
+    std::string normalized = NormalizePathSeparators(filename);
+    return fileTable_.count(normalized) > 0;
+}
+
+uint32_t PakReader::GetFileCount() const
+{
+    if (!isOpen_) return 0;
+    return static_cast<uint32_t>(fileTable_.size());
+}
+
+PakReader::FileInfo PakReader::GetFileInfo(const std::string& filename) const
+{
+    FileInfo info{};
+    info.found = false;
+    info.compressed = false;
+    info.originalSize = 0;
+    info.compressedSize = 0;
+
+    if (!isOpen_) return info;
+
+    std::string normalized = NormalizePathSeparators(filename);
+    auto it = fileTable_.find(normalized);
+    if (it != fileTable_.end()) {
+        info.filename = it->second.filename;
+        info.originalSize = it->second.originalSize;
+        info.compressedSize = it->second.compressedSize;
+        info.compressed = (it->second.flags & PAK_FLAG_COMPRESSED) != 0;
+        info.found = true;
+    }
+    return info;
+}
+
+std::vector<std::pair<std::string, std::vector<uint8_t>>>
+PakReader::ReadFiles(const std::vector<std::string>& filenames) const
+{
+    std::vector<std::pair<std::string, std::vector<uint8_t>>> results;
+    if (!isOpen_ || filenames.empty()) return results;
+
+    // Resolve all entries and remember their original index
+    struct ResolvedEntry {
+        size_t originalIndex;
+        const PakEntry* entry;
+    };
+    std::vector<ResolvedEntry> resolved;
+    resolved.reserve(filenames.size());
+    results.resize(filenames.size());
+
+    for (size_t i = 0; i < filenames.size(); ++i) {
+        std::string normalized = NormalizePathSeparators(filenames[i]);
+        auto it = fileTable_.find(normalized);
+        if (it != fileTable_.end()) {
+            resolved.push_back({i, &it->second});
+        }
+        results[i].first = filenames[i];
+    }
+
+    // Sort by offset for sequential I/O
+    std::sort(resolved.begin(), resolved.end(),
+              [](const ResolvedEntry& a, const ResolvedEntry& b) {
+                  return a.entry->offset < b.entry->offset;
+              });
+
+    // Read in offset order
+    for (const auto& r : resolved) {
+        results[r.originalIndex].second = ReadEntry(*r.entry);
+    }
+
+    return results;
 }

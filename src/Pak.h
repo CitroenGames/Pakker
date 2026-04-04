@@ -4,126 +4,194 @@
 #include <string>
 #include <vector>
 #include <map>
+#include <unordered_map>
 #include <memory>
 #include <cstdint>
 #include <string_view>
+#include <fstream>
+#include <functional>
+
+// ---------------------------------------------------------------------------
+// Logging
+// ---------------------------------------------------------------------------
+
+enum class PakLogLevel { Info, Warning, Error };
+using PakLogCallback = void(*)(PakLogLevel level, const char* message);
+
+// Set a global log callback. When null (default), all logging is suppressed.
+void PakSetLogCallback(PakLogCallback cb);
+
+// ---------------------------------------------------------------------------
+// Shared types & constants
+// ---------------------------------------------------------------------------
+
+namespace PakInternal {
+
+static constexpr size_t MAX_FILENAME_LENGTH = 65535;
+static constexpr size_t MAX_FILES_IN_PAK    = 1000000;
+static constexpr std::string_view PAK_MAGIC = "PAK0";
+static constexpr uint32_t PAK_VERSION_1     = 1;
+static constexpr uint32_t PAK_VERSION_2     = 2; // compression support
+
+struct PakHeader {
+    char magic[4] = { 'P', 'A', 'K', '0' };
+    uint32_t version   = PAK_VERSION_2;
+    uint32_t numFiles  = 0;
+    uint64_t fileTableOffset = 0;
+    uint32_t reserved[4] = {0, 0, 0, 0};
+};
+
+struct PakEntry {
+    std::string filename;
+    uint64_t offset       = 0;
+    uint64_t originalSize = 0;
+    uint64_t compressedSize = 0; // == originalSize when uncompressed (v2)
+    uint8_t  flags        = 0;   // bit 0: compressed (v2)
+
+    PakEntry() = default;
+    PakEntry(std::string name, uint64_t off, uint64_t origSz,
+             uint64_t compSz = 0, uint8_t f = 0)
+        : filename(std::move(name)), offset(off), originalSize(origSz),
+          compressedSize(compSz == 0 ? origSz : compSz), flags(f) {}
+};
+
+static constexpr uint8_t PAK_FLAG_COMPRESSED = 0x01;
+
+// Internal helpers shared by Pakker and PakReader
+void Log(PakLogLevel level, const std::string& msg);
+
+std::string NormalizePathSeparators(const std::string& path);
+bool IsValidFilename(const std::string& filename);
+uint64_t SafeStreamPos(std::streampos pos);
+bool ValidateEntry(const PakEntry& entry, uint64_t pakFileSize);
+
+bool ReadPakHeader(std::istream& stream, PakHeader& header);
+bool ReadFileTable(std::istream& stream, uint32_t numFiles,
+                   uint32_t version, std::vector<PakEntry>& entries);
+bool WritePakHeader(std::ostream& stream, const PakHeader& header);
+bool WriteFileTable(std::ostream& stream, const std::vector<PakEntry>& entries,
+                    uint32_t version);
+
+void EncryptDecrypt(std::vector<uint8_t>& data, const std::string& key);
+
+} // namespace PakInternal
+
+// ---------------------------------------------------------------------------
+// Pakker -- build-time API (create, extract, modify PAK files)
+// ---------------------------------------------------------------------------
 
 class Pakker {
 public:
-    // Constructor with optional encryption key
-    explicit Pakker(const std::string& encryptionKey = "example_key");
+    // encryptionKey: pass empty string for no encryption (recommended for shipping)
+    explicit Pakker(const std::string& encryptionKey = "");
 
-    // Creates a PAK file from a map of filenames to their data
-    bool CreatePak(const std::string& pakFilename, const std::map<std::string, std::vector<uint8_t>>& files);
+    // Creates a PAK file. compress=true uses LZ4 per-file compression.
+    bool CreatePak(const std::string& pakFilename,
+                   const std::map<std::string, std::vector<uint8_t>>& files,
+                   bool compress = false);
 
-    // Extracts all files from a PAK to the specified output directory
-    bool ExtractPak(const std::string& pakFilename, const std::string& outputDir) const;
+    bool ExtractPak(const std::string& pakFilename,
+                    const std::string& outputDir) const;
 
-    // Lists all files contained within a PAK
     bool ListPak(const std::string& pakFilename) const;
 
-    // Reads a specific file from a PAK and returns its data
-    std::vector<uint8_t> ReadFileFromPak(const std::string& pakFilename, const std::string& filename) const;
+    std::vector<uint8_t> ReadFileFromPak(const std::string& pakFilename,
+                                          const std::string& filename) const;
 
-    // Loads a specific file from a PAK and returns a shared pointer to its data
-    std::shared_ptr<std::vector<uint8_t>> LoadFile(const std::string& pakFilename, const std::string& filename) const;
+    std::shared_ptr<std::vector<uint8_t>> LoadFile(const std::string& pakFilename,
+                                                    const std::string& filename) const;
 
-    // Adds a single file to an existing PAK
-    bool AddFileToPak(const std::string& pakFilename, const std::string& filename, const std::vector<uint8_t>& data);
+    bool AddFileToPak(const std::string& pakFilename,
+                      const std::string& filename,
+                      const std::vector<uint8_t>& data);
 
-    // Creates a PAK file from all files within a specified folder
-    bool CreatePakFromFolder(const std::string& pakFilename, const std::string& folderPath);
+    bool CreatePakFromFolder(const std::string& pakFilename,
+                             const std::string& folderPath,
+                             bool compress = false);
 
-    // New: Get file count without reading entire file table
     uint32_t GetFileCount(const std::string& pakFilename) const;
-
-    // New: Check if a file exists in PAK without reading it
     bool FileExists(const std::string& pakFilename, const std::string& filename) const;
 
-    // New: Get file info without reading the actual file data
     struct FileInfo {
         std::string filename;
         uint64_t size;
         bool found;
     };
-    FileInfo GetFileInfo(const std::string& pakFilename, const std::string& filename) const;
+    FileInfo GetFileInfo(const std::string& pakFilename,
+                         const std::string& filename) const;
 
-    // New: Extract single file to memory or disk
-    bool ExtractSingleFile(const std::string& pakFilename, const std::string& filename, const std::string& outputPath) const;
+    bool ExtractSingleFile(const std::string& pakFilename,
+                           const std::string& filename,
+                           const std::string& outputPath) const;
 
-    // New: Validate PAK file integrity
     bool ValidatePak(const std::string& pakFilename) const;
 
 private:
-    struct PakEntry {
+    bool WriteFile(const std::string& filename,
+                   const std::vector<uint8_t>& buffer) const;
+
+    std::string encryptionKey_;
+};
+
+// ---------------------------------------------------------------------------
+// PakReader -- runtime read-only API for shipping builds
+//
+// Open a PAK once, keep the file table cached in memory, serve reads from the
+// persistent handle with O(1) filename lookup.
+//
+// NOT thread-safe: callers must synchronize access externally.
+// ---------------------------------------------------------------------------
+
+class PakReader {
+public:
+    // encryptionKey: pass empty string for no encryption (default, fastest)
+    explicit PakReader(const std::string& encryptionKey = "");
+    ~PakReader();
+
+    // Non-copyable, movable
+    PakReader(const PakReader&) = delete;
+    PakReader& operator=(const PakReader&) = delete;
+    PakReader(PakReader&& other) noexcept;
+    PakReader& operator=(PakReader&& other) noexcept;
+
+    // Lifecycle
+    bool Open(const std::string& pakFilename);
+    void Close();
+    bool IsOpen() const;
+
+    // Single file read
+    std::vector<uint8_t> ReadFile(const std::string& filename) const;
+    std::shared_ptr<std::vector<uint8_t>> LoadFile(const std::string& filename) const;
+
+    // Metadata (no I/O after Open)
+    bool FileExists(const std::string& filename) const;
+    uint32_t GetFileCount() const;
+
+    struct FileInfo {
         std::string filename;
-        uint64_t offset;
-        uint64_t size;
-        
-        // Constructor for better initialization
-        PakEntry(std::string name, uint64_t off, uint64_t sz) 
-            : filename(std::move(name)), offset(off), size(sz) {}
+        uint64_t originalSize;
+        uint64_t compressedSize;
+        bool compressed;
+        bool found;
     };
+    FileInfo GetFileInfo(const std::string& filename) const;
 
-    struct PakHeader {
-        char magic[4] = { 'P', 'A', 'K', '0' }; // Magic number to identify PAK files
-        uint32_t version = 1;                   // Version number for potential future use
-        uint32_t numFiles = 0;                  // Number of files contained in the PAK
-        uint64_t fileTableOffset = 0;           // Offset in the file where the file table starts
-        
-        // Add padding for future extensions while maintaining compatibility
-        uint32_t reserved[4] = {0, 0, 0, 0};    // Reserved for future use
-    };
+    // Batch read -- reads multiple files, sorted by offset for sequential I/O
+    std::vector<std::pair<std::string, std::vector<uint8_t>>>
+        ReadFiles(const std::vector<std::string>& filenames) const;
 
-    // Constants for better maintainability
-    static constexpr size_t MAX_FILENAME_LENGTH = 65535;
-    static constexpr size_t MAX_FILES_IN_PAK = 1000000;
-    static constexpr std::string_view PAK_MAGIC = "PAK0";
-    static constexpr uint32_t SUPPORTED_VERSION = 1;
+private:
+    std::vector<uint8_t> ReadEntry(const PakInternal::PakEntry& entry) const;
 
-    // Writes raw data to a file
-    bool WriteFile(const std::string& filename, const std::vector<uint8_t>& buffer) const;
+    std::string encryptionKey_;
+    mutable std::ifstream pakStream_;
+    PakInternal::PakHeader header_{};
+    uint64_t pakFileSize_ = 0;
+    uint32_t formatVersion_ = 0;
+    bool isOpen_ = false;
 
-    // Reads the PAK header from a stream
-    bool ReadPakHeader(std::istream& stream, PakHeader& header) const;
-
-    // Writes the PAK header to a stream
-    bool WritePakHeader(std::ostream& stream, const PakHeader& header) const;
-
-    // Reads the file table from the given stream at the current position
-    bool ReadFileTable(std::istream& stream, uint32_t numFiles, std::vector<PakEntry>& entries) const;
-
-    // Writes the file table to the given stream at the current position
-    bool WriteFileTable(std::ostream& stream, const std::vector<PakEntry>& entries) const;
-
-    // Encrypts or decrypts data using XOR with the encryption key
-    void EncryptDecrypt(std::vector<uint8_t>& data) const;
-
-    // Normalizes path separators to '/'
-    std::string NormalizePathSeparators(const std::string& path) const;
-
-    // New: Validates filename for security
-    bool IsValidFilename(const std::string& filename) const;
-
-    // New: Safely converts stream position to uint64_t
-    uint64_t SafeStreamPos(std::streampos pos) const;
-
-    // New: Validates file table entry
-    bool ValidateEntry(const PakEntry& entry, uint64_t pakFileSize) const;
-
-    // New: Improved error handling with error codes
-    enum class ErrorCode {
-        SUCCESS = 0,
-        FILE_NOT_FOUND,
-        INVALID_FORMAT,
-        CORRUPTION_DETECTED,
-        ACCESS_DENIED,
-        INVALID_PATH
-    };
-
-    mutable ErrorCode lastError_ = ErrorCode::SUCCESS;
-
-    std::string encryptionKey_; // Encryption key used for encrypting/decrypting data
+    // O(1) lookup: normalized filename -> entry
+    std::unordered_map<std::string, PakInternal::PakEntry> fileTable_;
 };
 
 #endif // PAK_H
