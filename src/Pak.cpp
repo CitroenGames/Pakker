@@ -257,20 +257,18 @@ Pakker::Pakker(const std::string& encryptionKey)
 
 bool Pakker::WriteFile(const std::string& filename, const std::vector<uint8_t>& buffer) const
 {
-    if (buffer.empty()) {
-        Log(PakLogLevel::Error, "WriteFile: Empty buffer for file: " + filename);
-        return false;
-    }
     std::ofstream fileStream(filename, std::ios::binary);
     if (!fileStream) {
         Log(PakLogLevel::Error, "WriteFile: Unable to create file: " + filename);
         return false;
     }
-    fileStream.write(reinterpret_cast<const char*>(buffer.data()),
-                     static_cast<std::streamsize>(buffer.size()));
-    if (!fileStream) {
-        Log(PakLogLevel::Error, "WriteFile: Failed to write data to file: " + filename);
-        return false;
+    if (!buffer.empty()) {
+        fileStream.write(reinterpret_cast<const char*>(buffer.data()),
+                         static_cast<std::streamsize>(buffer.size()));
+        if (!fileStream) {
+            Log(PakLogLevel::Error, "WriteFile: Failed to write data to file: " + filename);
+            return false;
+        }
     }
     return true;
 }
@@ -314,7 +312,8 @@ bool Pakker::CreatePak(const std::string& pakFilename,
         uint8_t flags = 0;
         uint64_t originalSize = data.size();
 
-        if (compress && !data.empty() && !IsLikelyPreCompressed(normalizedFilename)) {
+        if (compress && !data.empty() && !IsLikelyPreCompressed(normalizedFilename)
+            && data.size() <= static_cast<size_t>(std::numeric_limits<int>::max())) {
             int maxCompressed = LZ4_compressBound(static_cast<int>(data.size()));
             compressBuffer.resize(maxCompressed);
             int compressedSize = LZ4_compress_default(
@@ -420,6 +419,11 @@ bool Pakker::ExtractPak(const std::string& pakFilename, const std::string& outpu
         EncryptDecrypt(fileData, encryptionKey_);
 
         if (entry.flags & PAK_FLAG_COMPRESSED) {
+            if (fileData.size() > static_cast<size_t>(std::numeric_limits<int>::max()) ||
+                entry.originalSize > static_cast<uint64_t>(std::numeric_limits<int>::max())) {
+                Log(PakLogLevel::Error, "ExtractPak: File too large for LZ4 decompression: " + entry.filename);
+                return false;
+            }
             std::vector<uint8_t> decompressed(entry.originalSize);
             int result = LZ4_decompress_safe(
                 reinterpret_cast<const char*>(fileData.data()),
@@ -522,6 +526,11 @@ std::vector<uint8_t> Pakker::ReadFileFromPak(const std::string& pakFilename,
             EncryptDecrypt(fileData, encryptionKey_);
 
             if (entry.flags & PAK_FLAG_COMPRESSED) {
+                if (fileData.size() > static_cast<size_t>(std::numeric_limits<int>::max()) ||
+                    entry.originalSize > static_cast<uint64_t>(std::numeric_limits<int>::max())) {
+                    Log(PakLogLevel::Error, "ReadFileFromPak: File too large for LZ4 decompression: " + entry.filename);
+                    return {};
+                }
                 std::vector<uint8_t> decompressed(entry.originalSize);
                 int result = LZ4_decompress_safe(
                     reinterpret_cast<const char*>(fileData.data()),
@@ -545,8 +554,8 @@ std::vector<uint8_t> Pakker::ReadFileFromPak(const std::string& pakFilename,
 std::shared_ptr<std::vector<uint8_t>> Pakker::LoadFile(const std::string& pakFilename,
                                                         const std::string& filename) const
 {
+    if (!FileExists(pakFilename, filename)) return nullptr;
     auto data = ReadFileFromPak(pakFilename, filename);
-    if (data.empty()) return nullptr;
     return std::make_shared<std::vector<uint8_t>>(std::move(data));
 }
 
@@ -587,7 +596,7 @@ bool Pakker::AddFileToPak(const std::string& pakFilename,
         return false;
     }
 
-    pakStream.seekp(0, std::ios::end);
+    pakStream.seekp(header.fileTableOffset, std::ios::beg);
     if (!pakStream) return false;
 
     uint64_t newOffset = SafeStreamPos(pakStream.tellp());
@@ -618,6 +627,15 @@ bool Pakker::AddFileToPak(const std::string& pakFilename,
 
     pakStream.seekp(header.fileTableOffset, std::ios::beg);
     if (!WriteFileTable(pakStream, entries, header.version)) return false;
+
+    // Truncate any leftover bytes from the old file table
+    uint64_t finalSize = SafeStreamPos(pakStream.tellp());
+    pakStream.close();
+    try {
+        fs::resize_file(pakFilename, finalSize);
+    } catch (const fs::filesystem_error&) {
+        // Non-fatal: file is functionally correct, just may have trailing bytes
+    }
 
     Log(PakLogLevel::Info, "AddFileToPak: File '" + filename + "' added successfully.");
     return true;
@@ -697,7 +715,8 @@ bool Pakker::CreatePakFromFolder(const std::string& pakFilename,
         uint8_t flags = 0;
         uint64_t originalSize = data.size();
 
-        if (compress && !data.empty() && !IsLikelyPreCompressed(normalizedName)) {
+        if (compress && !data.empty() && !IsLikelyPreCompressed(normalizedName)
+            && data.size() <= static_cast<size_t>(std::numeric_limits<int>::max())) {
             int maxCompressed = LZ4_compressBound(static_cast<int>(data.size()));
             compressBuffer.resize(maxCompressed);
             int compressedSize = LZ4_compress_default(
@@ -800,8 +819,13 @@ bool Pakker::ExtractSingleFile(const std::string& pakFilename,
                                const std::string& filename,
                                const std::string& outputPath) const
 {
+    // ReadFileFromPak returns empty vector for both "not found" and "0-byte file".
+    // Use FileExists to distinguish the two cases.
+    if (!FileExists(pakFilename, filename)) {
+        Log(PakLogLevel::Error, "ExtractSingleFile: File not found in pak: " + filename);
+        return false;
+    }
     std::vector<uint8_t> fileData = ReadFileFromPak(pakFilename, filename);
-    if (fileData.empty()) return false;
     fs::create_directories(fs::path(outputPath).parent_path());
     return WriteFile(outputPath, fileData);
 }
@@ -974,6 +998,11 @@ std::vector<uint8_t> PakReader::ReadEntry(const PakEntry& entry) const
     EncryptDecrypt(rawData, encryptionKey_);
 
     if (entry.flags & PAK_FLAG_COMPRESSED) {
+        if (rawData.size() > static_cast<size_t>(std::numeric_limits<int>::max()) ||
+            entry.originalSize > static_cast<uint64_t>(std::numeric_limits<int>::max())) {
+            Log(PakLogLevel::Error, "PakReader: File too large for LZ4 decompression: " + entry.filename);
+            return {};
+        }
         std::vector<uint8_t> decompressed(entry.originalSize);
         int result = LZ4_decompress_safe(
             reinterpret_cast<const char*>(rawData.data()),
@@ -1009,8 +1038,8 @@ std::vector<uint8_t> PakReader::ReadFile(const std::string& filename) const
 
 std::shared_ptr<std::vector<uint8_t>> PakReader::LoadFile(const std::string& filename) const
 {
+    if (!FileExists(filename)) return nullptr;
     auto data = ReadFile(filename);
-    if (data.empty()) return nullptr;
     return std::make_shared<std::vector<uint8_t>>(std::move(data));
 }
 
