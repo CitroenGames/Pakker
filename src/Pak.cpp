@@ -37,8 +37,11 @@ std::string NormalizePathSeparators(const std::string& path)
 {
     std::string normalized = path;
     std::replace(normalized.begin(), normalized.end(), '\\', '/');
-    while (!normalized.empty() && normalized[0] == '/') {
-        normalized.erase(0, 1);
+    auto firstNonSlash = normalized.find_first_not_of('/');
+    if (firstNonSlash == std::string::npos) {
+        normalized.clear();
+    } else if (firstNonSlash > 0) {
+        normalized.erase(0, firstNonSlash);
     }
     return normalized;
 }
@@ -46,11 +49,15 @@ std::string NormalizePathSeparators(const std::string& path)
 bool IsValidFilename(const std::string& filename)
 {
     if (filename.empty() || filename.length() > MAX_FILENAME_LENGTH) return false;
-    if (filename.find("..") != std::string::npos) return false;
-    if (filename.find('\0') != std::string::npos) return false;
-    const std::string invalidChars = "<>:\"|?*";
-    for (char c : invalidChars) {
-        if (filename.find(c) != std::string::npos) return false;
+
+    // Single pass: check for invalid characters, null bytes, and ".." sequences
+    static constexpr std::string_view invalidChars = "<>:\"|?*";
+    char prev = 0;
+    for (char c : filename) {
+        if (c == '\0') return false;
+        if (invalidChars.find(c) != std::string_view::npos) return false;
+        if (c == '.' && prev == '.') return false;
+        prev = c;
     }
     return true;
 }
@@ -78,7 +85,6 @@ bool ValidateEntry(const PakEntry& entry, uint64_t pakFileSize)
 
 bool ReadPakHeader(std::istream& stream, PakHeader& header)
 {
-    std::memset(&header, 0, sizeof(header));
     stream.read(reinterpret_cast<char*>(&header), sizeof(header));
     if (!stream) {
         Log(PakLogLevel::Error, "ReadPakHeader: Failed to read PAK header.");
@@ -216,11 +222,20 @@ static bool IsLikelyPreCompressed(const std::string& filename)
     auto dotPos = filename.rfind('.');
     if (dotPos == std::string::npos) return false;
 
-    std::string ext = filename.substr(dotPos);
-    std::transform(ext.begin(), ext.end(), ext.begin(),
-                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    // Lowercase extension into a stack buffer to avoid heap allocation.
+    // All known extensions are <= 5 chars (e.g. ".jpeg", ".flac", ".webm").
+    constexpr size_t kMaxExtLen = 8;
+    size_t extLen = filename.size() - dotPos;
+    if (extLen > kMaxExtLen) return false;
 
-    static const std::unordered_set<std::string> compressedExts = {
+    char buf[kMaxExtLen + 1];
+    for (size_t i = 0; i < extLen; ++i) {
+        buf[i] = static_cast<char>(std::tolower(static_cast<unsigned char>(filename[dotPos + i])));
+    }
+    buf[extLen] = '\0';
+    std::string_view ext(buf, extLen);
+
+    static const std::unordered_set<std::string_view> compressedExts = {
         ".png", ".jpg", ".jpeg", ".gif", ".webp", ".avif",
         ".mp3", ".ogg", ".flac", ".aac", ".wma", ".opus",
         ".mp4", ".webm", ".mkv",
@@ -286,7 +301,6 @@ bool Pakker::CreatePak(const std::string& pakFilename,
     entries.reserve(files.size());
 
     std::vector<uint8_t> compressBuffer;
-    std::vector<uint8_t> encryptBuffer;
 
     for (const auto& [filename, data] : files) {
         std::string normalizedFilename = NormalizePathSeparators(filename);
@@ -318,12 +332,18 @@ bool Pakker::CreatePak(const std::string& pakFilename,
             }
         }
 
-        // Encryption requires a mutable buffer; only copy when actually encrypting
+        // Encrypt in-place on whichever buffer writePtr already points to
         if (!encryptionKey_.empty()) {
-            encryptBuffer.assign(writePtr, writePtr + writeSize);
-            EncryptDecrypt(encryptBuffer, encryptionKey_);
-            writePtr = encryptBuffer.data();
-            writeSize = encryptBuffer.size();
+            if (writePtr == data.data()) {
+                // Data is from the const map value; copy into compressBuffer to mutate
+                compressBuffer.assign(data.begin(), data.end());
+                EncryptDecrypt(compressBuffer, encryptionKey_);
+                writePtr = compressBuffer.data();
+                writeSize = compressBuffer.size();
+            } else {
+                // writePtr points to compressBuffer (compression happened); encrypt in-place
+                EncryptDecrypt(compressBuffer, encryptionKey_);
+            }
         }
 
         uint64_t currentOffset = SafeStreamPos(pakStream.tellp());
@@ -571,15 +591,24 @@ bool Pakker::AddFileToPak(const std::string& pakFilename,
     if (!pakStream) return false;
 
     uint64_t newOffset = SafeStreamPos(pakStream.tellp());
-    std::vector<uint8_t> encryptedData = data;
-    EncryptDecrypt(encryptedData, encryptionKey_);
 
-    pakStream.write(reinterpret_cast<const char*>(encryptedData.data()),
-                   static_cast<std::streamsize>(encryptedData.size()));
+    const uint8_t* writePtr = data.data();
+    size_t writeSize = data.size();
+    std::vector<uint8_t> encryptedData;
+
+    if (!encryptionKey_.empty()) {
+        encryptedData = data;
+        EncryptDecrypt(encryptedData, encryptionKey_);
+        writePtr = encryptedData.data();
+        writeSize = encryptedData.size();
+    }
+
+    pakStream.write(reinterpret_cast<const char*>(writePtr),
+                   static_cast<std::streamsize>(writeSize));
     if (!pakStream) return false;
 
     uint64_t originalSize = data.size();
-    uint64_t compressedSize = encryptedData.size();
+    uint64_t compressedSize = writeSize;
     entries.emplace_back(normalizedFilename, newOffset, originalSize, compressedSize, 0);
     header.numFiles += 1;
     header.fileTableOffset = SafeStreamPos(pakStream.tellp());
