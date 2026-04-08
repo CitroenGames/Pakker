@@ -5,11 +5,20 @@ enable_language(C)
 
 set(CMAKE_CXX_STANDARD 20)
 
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
+
 file(GLOB_RECURSE SOURCES "src/*.cpp" "src/*.h" "src/*.c")
 
 option(BUILD_EXAMPLES "Build examples" ON)
 
 add_library(${PROJECT_NAME} STATIC ${SOURCES})
+
+target_compile_options(${PROJECT_NAME} PRIVATE
+    $<$<CONFIG:Release>:-O2>
+    $<$<CONFIG:RelWithDebInfo>:-O2 -g>
+)
 
 target_include_directories(${PROJECT_NAME} PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
