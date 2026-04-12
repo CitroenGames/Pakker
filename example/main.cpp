@@ -6,6 +6,7 @@
 #include <fstream>
 #include <thread>
 #include <chrono>
+#include <vector>
 
 // Helper: read entire file into a vector
 std::vector<uint8_t> readEntireFile(const std::string& filename) {
@@ -34,13 +35,12 @@ void exampleLogCallback(PakLogLevel level, const char* message) {
 }
 
 int main() {
-    // Enable logging for this example (in shipping builds, leave it null for silence)
     PakSetLogCallback(exampleLogCallback);
 
     // -----------------------------------------------------------------------
-    // BUILD TIME: Create a compressed PAK file using Pakker
+    // BUILD TIME: Create a page-aligned, compressed PAK using PakOptions
     // -----------------------------------------------------------------------
-    Pakker pakker; // no encryption key = no encryption (fastest)
+    Pakker pakker;
     std::map<std::string, std::vector<uint8_t>> files;
 
     std::string audioFilename = "example.mp3";
@@ -52,19 +52,23 @@ int main() {
 
     files[audioFilename] = audioData;
 
-    // Create a compressed PAK (LZ4)
-    if (!pakker.CreatePak("assets.pak", files, true)) {
+    // Page-aligned PAK for optimal mmap performance and GPU upload
+    PakOptions opts;
+    opts.compress = true;       // LZ4 per-file compression
+    opts.alignment = 4096;      // 4KB page alignment for memory-mapped I/O
+    opts.formatVersion = 3;     // v3 format with alignment support
+
+    if (!pakker.CreatePak("assets.pak", files, opts)) {
         std::cerr << "Failed to create pak file." << std::endl;
         return 1;
     }
 
-    // List contents (build-time utility)
     pakker.ListPak("assets.pak");
 
     // -----------------------------------------------------------------------
-    // RUNTIME: Use PakReader for shipping builds (open once, read many)
+    // RUNTIME: PakReader with memory-mapped I/O
     // -----------------------------------------------------------------------
-    PakReader reader; // no encryption key = no encryption
+    PakReader reader;
 
     if (!reader.Open("assets.pak")) {
         std::cerr << "Failed to open pak file for reading." << std::endl;
@@ -72,6 +76,7 @@ int main() {
     }
 
     std::cout << "PAK has " << reader.GetFileCount() << " file(s)." << std::endl;
+    std::cout << "Memory-mapped I/O: " << (reader.IsMapped() ? "yes" : "no") << std::endl;
 
     // O(1) file existence check (no disk I/O)
     if (reader.FileExists(audioFilename)) {
@@ -81,23 +86,57 @@ int main() {
                   << (info.compressed ? " (compressed)" : "") << std::endl;
     }
 
-    // Load audio from PAK
+    // -----------------------------------------------------------------------
+    // ZERO-COPY READ: Direct pointer into mmap for uncompressed assets
+    // -----------------------------------------------------------------------
+    {
+        auto span = reader.ReadFileZeroCopy(audioFilename);
+        if (span) {
+            std::cout << "Zero-copy read: " << span.size << " bytes, "
+                      << (span.ownsData ? "allocated (compressed/encrypted)"
+                                        : "mapped (zero-copy)")
+                      << std::endl;
+        }
+        // span is valid until reader.Close() for non-owning
+    }
+
+    // -----------------------------------------------------------------------
+    // THREAD-SAFE CONCURRENT READS
+    // -----------------------------------------------------------------------
+    {
+        const int numThreads = 4;
+        std::vector<std::thread> threads;
+        threads.reserve(numThreads);
+
+        std::cout << "Launching " << numThreads << " concurrent read threads..." << std::endl;
+
+        for (int i = 0; i < numThreads; ++i) {
+            threads.emplace_back([&reader, &audioFilename, i]() {
+                auto data = reader.ReadFile(audioFilename);
+                std::cout << "  Thread " << i << ": read "
+                          << data.size() << " bytes" << std::endl;
+            });
+        }
+
+        for (auto& t : threads) t.join();
+        std::cout << "All threads completed." << std::endl;
+    }
+
+    // -----------------------------------------------------------------------
+    // BATCH READ: Parallel decompression with mmap
+    // -----------------------------------------------------------------------
+    auto batchResults = reader.ReadFiles({audioFilename});
+    std::cout << "Batch read returned " << batchResults.size() << " file(s)." << std::endl;
+
+    // Load audio for playback
     auto pakAudioData = reader.LoadFile(audioFilename);
     if (!pakAudioData) {
         std::cerr << "Failed to load audio from PAK file." << std::endl;
         return 1;
     }
 
-    // Batch read example (reads sorted by offset for sequential I/O)
-    auto batchResults = reader.ReadFiles({audioFilename});
-    std::cout << "Batch read returned " << batchResults.size() << " file(s)." << std::endl;
-
-    // Reader stays open -- no need to reparse the file table for subsequent reads
-    // reader.Close() is called automatically by the destructor
-
     // -----------------------------------------------------------------------
     // Audio playback demo using miniaudio
-    // Write the audio data to a temp file since miniaudio needs a file path
     // -----------------------------------------------------------------------
     std::string tempAudioPath = "temp_audio.mp3";
     {
