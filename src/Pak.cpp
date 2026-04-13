@@ -65,9 +65,12 @@ bool IsValidFilename(const std::string& filename)
     return true;
 }
 
-uint64_t SafeStreamPos(std::streampos pos)
+uint64_t SafeStreamPos(std::ios& stream, std::streampos pos)
 {
-    if (pos == std::streampos(-1)) return 0;
+    if (pos == std::streampos(-1)) {
+        stream.setstate(std::ios::failbit);
+        return 0;
+    }
     return static_cast<uint64_t>(pos);
 }
 
@@ -260,7 +263,7 @@ static bool IsLikelyPreCompressed(const std::string& filename)
 static bool WritePadding(std::ostream& stream, uint32_t alignment)
 {
     if (alignment <= 1) return true;
-    uint64_t cur = SafeStreamPos(stream.tellp());
+    uint64_t cur = SafeStreamPos(stream, stream.tellp());
     uint64_t aligned = (cur + alignment - 1) & ~(static_cast<uint64_t>(alignment) - 1);
     uint64_t pad = aligned - cur;
     if (pad > 0) {
@@ -407,7 +410,7 @@ bool Pakker::CreatePak(const std::string& pakFilename,
             }
         }
 
-        uint64_t currentOffset = SafeStreamPos(pakStream.tellp());
+        uint64_t currentOffset = SafeStreamPos(pakStream, pakStream.tellp());
         if (!pakStream) {
             Log(PakLogLevel::Error, "CreatePak: Failed to get stream position.");
             return false;
@@ -423,7 +426,7 @@ bool Pakker::CreatePak(const std::string& pakFilename,
         }
     }
 
-    header.fileTableOffset = SafeStreamPos(pakStream.tellp());
+    header.fileTableOffset = SafeStreamPos(pakStream, pakStream.tellp());
     if (!pakStream) {
         Log(PakLogLevel::Error, "CreatePak: Failed to get file table offset.");
         return false;
@@ -466,7 +469,7 @@ bool Pakker::ExtractPak(const std::string& pakFilename, const std::string& outpu
     if (!ReadPakHeader(pakStream, header)) return false;
 
     pakStream.seekg(0, std::ios::end);
-    uint64_t pakFileSize = SafeStreamPos(pakStream.tellg());
+    uint64_t pakFileSize = SafeStreamPos(pakStream, pakStream.tellg());
 
     pakStream.seekg(header.fileTableOffset, std::ios::beg);
     if (!pakStream) {
@@ -584,7 +587,7 @@ std::vector<uint8_t> Pakker::ReadFileFromPak(const std::string& pakFilename,
     if (!ReadPakHeader(pakStream, header)) return {};
 
     pakStream.seekg(0, std::ios::end);
-    uint64_t pakFileSize = SafeStreamPos(pakStream.tellg());
+    uint64_t pakFileSize = SafeStreamPos(pakStream, pakStream.tellg());
 
     pakStream.seekg(header.fileTableOffset, std::ios::beg);
     if (!pakStream) return {};
@@ -662,6 +665,10 @@ bool Pakker::AddFileToPak(const std::string& pakFilename,
     if (!ReadPakHeader(pakStream, header)) return false;
 
     uint32_t alignment = (header.alignment > 0) ? header.alignment : 1;
+    if ((alignment & (alignment - 1)) != 0) {
+        Log(PakLogLevel::Error, "AddFileToPak: Alignment in header is not a power of 2.");
+        return false;
+    }
 
     pakStream.seekg(header.fileTableOffset, std::ios::beg);
     if (!pakStream) return false;
@@ -690,7 +697,7 @@ bool Pakker::AddFileToPak(const std::string& pakFilename,
         return false;
     }
 
-    uint64_t newOffset = SafeStreamPos(pakStream.tellp());
+    uint64_t newOffset = SafeStreamPos(pakStream, pakStream.tellp());
     if (!pakStream) {
         Log(PakLogLevel::Error, "AddFileToPak: Failed to get stream position.");
         return false;
@@ -742,7 +749,7 @@ bool Pakker::AddFileToPak(const std::string& pakFilename,
     entries.emplace_back(normalizedFilename, newOffset, originalSize,
                          static_cast<uint64_t>(writeSize), flags);
     header.numFiles += 1;
-    header.fileTableOffset = SafeStreamPos(pakStream.tellp());
+    header.fileTableOffset = SafeStreamPos(pakStream, pakStream.tellp());
     if (!pakStream) {
         Log(PakLogLevel::Error, "AddFileToPak: Failed to get file table offset.");
         return false;
@@ -755,7 +762,7 @@ bool Pakker::AddFileToPak(const std::string& pakFilename,
     if (!WriteFileTable(pakStream, entries, header.version)) return false;
 
     // Truncate any leftover bytes from the old file table
-    uint64_t finalSize = SafeStreamPos(pakStream.tellp());
+    uint64_t finalSize = SafeStreamPos(pakStream, pakStream.tellp());
     pakStream.close();
     try {
         fs::resize_file(pakFilename, finalSize);
@@ -841,6 +848,10 @@ bool Pakker::CreatePakFromFolder(const std::string& pakFilename,
             continue;
         }
         auto fileSize = file.tellg();
+        if (fileSize == std::streampos(-1)) {
+            Log(PakLogLevel::Warning, "CreatePakFromFolder: Failed to get file size: " + diskPath.string());
+            continue;
+        }
         file.seekg(0, std::ios::beg);
         std::vector<uint8_t> data(static_cast<size_t>(fileSize));
         if (fileSize > 0) {
@@ -895,7 +906,7 @@ bool Pakker::CreatePakFromFolder(const std::string& pakFilename,
             // writePtr remains valid -- EncryptDecrypt does not resize
         }
 
-        uint64_t currentOffset = SafeStreamPos(pakStream.tellp());
+        uint64_t currentOffset = SafeStreamPos(pakStream, pakStream.tellp());
         if (!pakStream) {
             Log(PakLogLevel::Error, "CreatePakFromFolder: Failed to get stream position.");
             return false;
@@ -911,7 +922,7 @@ bool Pakker::CreatePakFromFolder(const std::string& pakFilename,
         }
     }
 
-    header.fileTableOffset = SafeStreamPos(pakStream.tellp());
+    header.fileTableOffset = SafeStreamPos(pakStream, pakStream.tellp());
     if (!pakStream) {
         Log(PakLogLevel::Error, "CreatePakFromFolder: Failed to get file table offset.");
         return false;
@@ -1010,7 +1021,7 @@ bool Pakker::ValidatePak(const std::string& pakFilename) const
     }
 
     pakStream.seekg(0, std::ios::end);
-    uint64_t pakFileSize = SafeStreamPos(pakStream.tellg());
+    uint64_t pakFileSize = SafeStreamPos(pakStream, pakStream.tellg());
     pakStream.seekg(0, std::ios::beg);
 
     PakHeader header;
@@ -1158,7 +1169,13 @@ bool PakReader::Open(const std::string& pakFilename)
     alignment_ = (header_.alignment > 0) ? header_.alignment : 1;
 
     pakStream_.seekg(0, std::ios::end);
-    pakFileSize_ = SafeStreamPos(pakStream_.tellg());
+    pakFileSize_ = SafeStreamPos(pakStream_, pakStream_.tellg());
+
+    if (header_.fileTableOffset >= pakFileSize_) {
+        Log(PakLogLevel::Error, "PakReader::Open: Invalid file table offset.");
+        pakStream_.close();
+        return false;
+    }
 
     pakStream_.seekg(header_.fileTableOffset, std::ios::beg);
     if (!pakStream_) {
@@ -1253,7 +1270,7 @@ std::vector<uint8_t> PakReader::ReadEntry(const PakInternal::PakEntry& entry,
 
     if (useMmap && guard) {
         // Memory-mapped path: direct pointer, no syscall
-        if (entry.offset + diskSize > fileSize) {
+        if (entry.offset > fileSize || diskSize > fileSize - entry.offset) {
             Log(PakLogLevel::Error, "PakReader: Entry exceeds file bounds: " + entry.filename);
             return {};
         }
@@ -1360,7 +1377,7 @@ std::vector<uint8_t> PakReader::ReadEntryFromMmap(const PakInternal::PakEntry& e
 {
     uint64_t diskSize = entry.compressedSize;
 
-    if (!guard || entry.offset + diskSize > fileSize) {
+    if (!guard || entry.offset > fileSize || diskSize > fileSize - entry.offset) {
         Log(PakLogLevel::Error, "PakReader: Entry exceeds file bounds: " + entry.filename);
         return {};
     }
@@ -1481,7 +1498,7 @@ PakSpan PakReader::ReadFileZeroCopy(const std::string& filename) const
     // True zero-copy: only possible with mmap + uncompressed + unencrypted
     if (localUseMmap && localGuard &&
         !(entryCopy.flags & PakInternal::PAK_FLAG_COMPRESSED) && localEncryptionKey.empty()) {
-        if (entryCopy.offset + entryCopy.originalSize > localFileSize) {
+        if (entryCopy.offset > localFileSize || entryCopy.originalSize > localFileSize - entryCopy.offset) {
             PakInternal::Log(PakLogLevel::Error, "PakReader::ReadFileZeroCopy: Entry exceeds file bounds.");
             return span;
         }

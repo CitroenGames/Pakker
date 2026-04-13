@@ -73,7 +73,7 @@ void Log(PakLogLevel level, const std::string& msg);
 
 std::string NormalizePathSeparators(const std::string& path);
 bool IsValidFilename(const std::string& filename);
-uint64_t SafeStreamPos(std::streampos pos);
+uint64_t SafeStreamPos(std::ios& stream, std::streampos pos);
 bool ValidateEntry(const PakEntry& entry, uint64_t pakFileSize);
 
 bool ReadPakHeader(std::istream& stream, PakHeader& header);
