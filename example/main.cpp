@@ -16,6 +16,10 @@ std::vector<uint8_t> readEntireFile(const std::string& filename) {
         return {};
     }
     std::streamsize size = file.tellg();
+    if (size < 0) {
+        std::cerr << "Unable to determine file size: " << filename << std::endl;
+        return {};
+    }
     file.seekg(0, std::ios::beg);
     std::vector<uint8_t> buffer(size);
     if (!file.read(reinterpret_cast<char*>(buffer.data()), size)) {
