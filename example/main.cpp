@@ -60,7 +60,6 @@ int main() {
     PakOptions opts;
     opts.compress = true;       // LZ4 per-file compression
     opts.alignment = 4096;      // 4KB page alignment for memory-mapped I/O
-    opts.formatVersion = 3;     // v3 format with alignment support
 
     if (!pakker.CreatePak("assets.pak", files, opts)) {
         std::cerr << "Failed to create pak file." << std::endl;
@@ -82,26 +81,31 @@ int main() {
     std::cout << "PAK has " << reader.GetFileCount() << " file(s)." << std::endl;
     std::cout << "Memory-mapped I/O: " << (reader.IsMapped() ? "yes" : "no") << std::endl;
 
-    // O(1) file existence check (no disk I/O)
-    if (reader.FileExists(audioFilename)) {
-        auto info = reader.GetFileInfo(audioFilename);
-        std::cout << "Found '" << info.filename << "': "
-                  << info.originalSize << " bytes"
-                  << (info.compressed ? " (compressed)" : "") << std::endl;
+    // Resolve once and cache the handle in your asset system
+    PakFileHandle audioHandle = reader.Find(audioFilename);
+    if (!audioHandle) {
+        std::cerr << "Audio asset not found in PAK." << std::endl;
+        return 1;
+    }
+
+    if (const PakFileInfo* info = reader.Info(audioHandle)) {
+        std::cout << "Found '" << info->filename << "': "
+                  << info->originalSize << " bytes"
+                  << (info->compressed ? " (compressed)" : "") << std::endl;
     }
 
     // -----------------------------------------------------------------------
     // ZERO-COPY READ: Direct pointer into mmap for uncompressed assets
     // -----------------------------------------------------------------------
     {
-        auto span = reader.ReadFileZeroCopy(audioFilename);
-        if (span) {
-            std::cout << "Zero-copy read: " << span.size << " bytes, "
-                      << (span.ownsData ? "allocated (compressed/encrypted)"
-                                        : "mapped (zero-copy)")
-                      << std::endl;
+        PakView view;
+        PakStatus status = reader.View(audioHandle, view);
+        if (status == PakStatus::Ok) {
+            std::cout << "Mapped view: " << view.size << " bytes" << std::endl;
+        } else {
+            std::cout << "Mapped view unavailable: " << PakStatusToString(status) << std::endl;
         }
-        // span is valid until reader.Close() for non-owning
+        // view keeps the mapping alive even if reader.Close() is called later.
     }
 
     // -----------------------------------------------------------------------
@@ -115,10 +119,12 @@ int main() {
         std::cout << "Launching " << numThreads << " concurrent read threads..." << std::endl;
 
         for (int i = 0; i < numThreads; ++i) {
-            threads.emplace_back([&reader, &audioFilename, i]() {
-                auto data = reader.ReadFile(audioFilename);
+            threads.emplace_back([&reader, audioHandle, i]() {
+                std::vector<uint8_t> data;
+                PakStatus status = reader.Load(audioHandle, data);
                 std::cout << "  Thread " << i << ": read "
-                          << data.size() << " bytes" << std::endl;
+                          << data.size() << " bytes (" << PakStatusToString(status) << ")"
+                          << std::endl;
             });
         }
 
@@ -127,14 +133,16 @@ int main() {
     }
 
     // -----------------------------------------------------------------------
-    // BATCH READ: Parallel decompression with mmap
+    // BATCH RESOLVE: Feed handles to your engine job system
     // -----------------------------------------------------------------------
-    auto batchResults = reader.ReadFiles({audioFilename});
-    std::cout << "Batch read returned " << batchResults.size() << " file(s)." << std::endl;
+    std::string_view batchNames[] = {audioFilename};
+    PakFileHandle batchHandles[1];
+    std::cout << "Batch resolve found "
+              << reader.Resolve(batchNames, batchHandles) << " file(s)." << std::endl;
 
     // Load audio for playback
-    auto pakAudioData = reader.LoadFile(audioFilename);
-    if (!pakAudioData) {
+    std::vector<uint8_t> pakAudioData;
+    if (reader.Load(audioHandle, pakAudioData) != PakStatus::Ok) {
         std::cerr << "Failed to load audio from PAK file." << std::endl;
         return 1;
     }
@@ -145,8 +153,8 @@ int main() {
     std::string tempAudioPath = "temp_audio.mp3";
     {
         std::ofstream tempFile(tempAudioPath, std::ios::binary);
-        tempFile.write(reinterpret_cast<const char*>(pakAudioData->data()),
-                       static_cast<std::streamsize>(pakAudioData->size()));
+        tempFile.write(reinterpret_cast<const char*>(pakAudioData.data()),
+                       static_cast<std::streamsize>(pakAudioData.size()));
     }
 
     ma_result result;

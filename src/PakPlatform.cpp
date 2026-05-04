@@ -72,6 +72,17 @@ void UnmapFile(MappedFile& mf)
     mf.size = 0;
 }
 
+bool PrefetchMappedRange(const MappedFile& mf, uint64_t offset, uint64_t size)
+{
+    if (!mf.data || offset > mf.size || size > mf.size - offset) return false;
+    if (size == 0) return true;
+
+    WIN32_MEMORY_RANGE_ENTRY range{};
+    range.VirtualAddress = static_cast<char*>(mf.data) + offset;
+    range.NumberOfBytes = static_cast<SIZE_T>(size);
+    return PrefetchVirtualMemory(GetCurrentProcess(), 1, &range, 0) != FALSE;
+}
+
 #else // POSIX (Linux, macOS)
 
 MappedFile MapFileReadOnly(const char* path)
@@ -113,6 +124,24 @@ void UnmapFile(MappedFile& mf)
     mf.size = 0;
 }
 
+bool PrefetchMappedRange(const MappedFile& mf, uint64_t offset, uint64_t size)
+{
+    if (!mf.data || offset > mf.size || size > mf.size - offset) return false;
+    if (size == 0) return true;
+
+    long pageSize = sysconf(_SC_PAGESIZE);
+    if (pageSize <= 0) return true;
+
+    uint64_t page = static_cast<uint64_t>(pageSize);
+    uint64_t alignedOffset = offset & ~(page - 1);
+    uint64_t adjust = offset - alignedOffset;
+    uint64_t adjustedSize = size + adjust;
+
+    const char* base = static_cast<const char*>(mf.data);
+    void* address = const_cast<char*>(base + alignedOffset);
+    return madvise(address, static_cast<size_t>(adjustedSize), MADV_WILLNEED) == 0;
+}
+
 #endif // _WIN32
 
 } // namespace PakPlatform
@@ -123,6 +152,7 @@ namespace PakPlatform {
 
 MappedFile MapFileReadOnly(const char*) { return {}; }
 void UnmapFile(MappedFile& mf) { mf = {}; }
+bool PrefetchMappedRange(const MappedFile&, uint64_t, uint64_t) { return false; }
 
 } // namespace PakPlatform
 

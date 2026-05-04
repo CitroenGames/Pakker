@@ -3,12 +3,10 @@
 #include <algorithm>
 #include <atomic>
 #include <cstring>
-#include <cctype>
 #include <limits>
 #include <numeric>
 #include <sstream>
 #include <unordered_set>
-#include <thread>
 
 #include "vendor/lz4.h"
 
@@ -21,6 +19,23 @@ namespace fs = std::filesystem;
 static std::atomic<PakLogCallback> g_logCallback{nullptr};
 
 void PakSetLogCallback(PakLogCallback cb) { g_logCallback.store(cb, std::memory_order_release); }
+
+const char* PakStatusToString(PakStatus status)
+{
+    switch (status) {
+        case PakStatus::Ok: return "Ok";
+        case PakStatus::NotOpen: return "NotOpen";
+        case PakStatus::NotFound: return "NotFound";
+        case PakStatus::InvalidHandle: return "InvalidHandle";
+        case PakStatus::InvalidArgument: return "InvalidArgument";
+        case PakStatus::BufferTooSmall: return "BufferTooSmall";
+        case PakStatus::Unsupported: return "Unsupported";
+        case PakStatus::CorruptArchive: return "CorruptArchive";
+        case PakStatus::IoError: return "IoError";
+        case PakStatus::DecompressionFailed: return "DecompressionFailed";
+    }
+    return "Unknown";
+}
 
 namespace PakInternal {
 
@@ -100,9 +115,7 @@ bool ReadPakHeader(std::istream& stream, PakHeader& header)
         Log(PakLogLevel::Error, "ReadPakHeader: Invalid magic number.");
         return false;
     }
-    if (header.version != PAK_VERSION_1 &&
-        header.version != PAK_VERSION_2 &&
-        header.version != PAK_VERSION_3) {
+    if (header.version != PAK_VERSION_4) {
         Log(PakLogLevel::Error, "ReadPakHeader: Unsupported PAK version: " + std::to_string(header.version));
         return false;
     }
@@ -110,8 +123,6 @@ bool ReadPakHeader(std::istream& stream, PakHeader& header)
         Log(PakLogLevel::Error, "ReadPakHeader: Too many files in PAK: " + std::to_string(header.numFiles));
         return false;
     }
-    // For v1/v2, the alignment field was part of reserved[] and is 0.
-    // Treat 0 as unaligned (alignment = 1).
     return true;
 }
 
@@ -126,11 +137,11 @@ bool WritePakHeader(std::ostream& stream, const PakHeader& header)
 }
 
 // ---------------------------------------------------------------------------
-// File table I/O -- version-aware
+// File table I/O
 // ---------------------------------------------------------------------------
 
 bool ReadFileTable(std::istream& stream, uint32_t numFiles,
-                   uint32_t version, std::vector<PakEntry>& entries)
+                   std::vector<PakEntry>& entries)
 {
     entries.clear();
     entries.reserve(numFiles);
@@ -158,16 +169,13 @@ bool ReadFileTable(std::istream& stream, uint32_t numFiles,
             return false;
         }
 
-        uint64_t compressedSize = originalSize;
+        uint64_t compressedSize = 0;
         uint8_t flags = 0;
-
-        if (version >= PAK_VERSION_2) {
-            stream.read(reinterpret_cast<char*>(&compressedSize), sizeof(compressedSize));
-            stream.read(reinterpret_cast<char*>(&flags), sizeof(flags));
-            if (!stream) {
-                Log(PakLogLevel::Error, "ReadFileTable: Failed to read v2 fields for: " + filename);
-                return false;
-            }
+        stream.read(reinterpret_cast<char*>(&compressedSize), sizeof(compressedSize));
+        stream.read(reinterpret_cast<char*>(&flags), sizeof(flags));
+        if (!stream) {
+            Log(PakLogLevel::Error, "ReadFileTable: Failed to read compression fields for: " + filename);
+            return false;
         }
 
         PakEntry entry(std::move(filename), offset, originalSize, compressedSize, flags);
@@ -180,8 +188,7 @@ bool ReadFileTable(std::istream& stream, uint32_t numFiles,
     return true;
 }
 
-bool WriteFileTable(std::ostream& stream, const std::vector<PakEntry>& entries,
-                    uint32_t version)
+bool WriteFileTable(std::ostream& stream, const std::vector<PakEntry>& entries)
 {
     for (const auto& entry : entries) {
         if (entry.filename.length() > MAX_FILENAME_LENGTH) {
@@ -194,11 +201,8 @@ bool WriteFileTable(std::ostream& stream, const std::vector<PakEntry>& entries,
         stream.write(entry.filename.data(), nameLength);
         stream.write(reinterpret_cast<const char*>(&entry.offset), sizeof(entry.offset));
         stream.write(reinterpret_cast<const char*>(&entry.originalSize), sizeof(entry.originalSize));
-
-        if (version >= PAK_VERSION_2) {
-            stream.write(reinterpret_cast<const char*>(&entry.compressedSize), sizeof(entry.compressedSize));
-            stream.write(reinterpret_cast<const char*>(&entry.flags), sizeof(entry.flags));
-        }
+        stream.write(reinterpret_cast<const char*>(&entry.compressedSize), sizeof(entry.compressedSize));
+        stream.write(reinterpret_cast<const char*>(&entry.flags), sizeof(entry.flags));
 
         if (!stream) {
             Log(PakLogLevel::Error, "WriteFileTable: Failed to write file entry for: " + entry.filename);
@@ -228,35 +232,13 @@ using namespace PakInternal;
 // Maximum input size for LZ4 functions (from LZ4_MAX_INPUT_SIZE)
 static constexpr uint64_t LZ4_MAX_SAFE_SIZE = 0x7E000000;
 
-// Returns true for file extensions known to be already compressed.
-// Skipping LZ4 on these avoids wasted CPU time (the result is always discarded).
-static bool IsLikelyPreCompressed(const std::string& filename)
+static void EncryptDecryptSpan(std::span<uint8_t> data, const std::string& key)
 {
-    auto dotPos = filename.rfind('.');
-    if (dotPos == std::string::npos) return false;
-
-    // Lowercase extension into a stack buffer to avoid heap allocation.
-    // All known extensions are <= 5 chars (e.g. ".jpeg", ".flac", ".webm").
-    constexpr size_t kMaxExtLen = 8;
-    size_t extLen = filename.size() - dotPos;
-    if (extLen > kMaxExtLen) return false;
-
-    char buf[kMaxExtLen + 1];
-    for (size_t i = 0; i < extLen; ++i) {
-        buf[i] = static_cast<char>(std::tolower(static_cast<unsigned char>(filename[dotPos + i])));
+    if (data.empty() || key.empty()) return;
+    const size_t keyLength = key.length();
+    for (size_t i = 0; i < data.size(); ++i) {
+        data[i] ^= static_cast<uint8_t>(key[i % keyLength]);
     }
-    buf[extLen] = '\0';
-    std::string_view ext(buf, extLen);
-
-    static const std::unordered_set<std::string_view> compressedExts = {
-        ".png", ".jpg", ".jpeg", ".gif", ".webp", ".avif",
-        ".mp3", ".ogg", ".flac", ".aac", ".wma", ".opus",
-        ".mp4", ".webm", ".mkv",
-        ".zip", ".gz", ".7z", ".rar", ".bz2", ".xz", ".zst",
-        ".pak", ".lz4",
-    };
-
-    return compressedExts.count(ext) > 0;
 }
 
 // Helper: write zero-padding bytes to align stream position
@@ -319,11 +301,7 @@ bool Pakker::CreatePak(const std::string& pakFilename,
         return false;
     }
 
-    uint32_t version = options.formatVersion;
-    if (version < PAK_VERSION_2) version = PAK_VERSION_2;
-    if (version > PAK_VERSION_3) version = PAK_VERSION_3;
-
-    uint32_t alignment = (version >= PAK_VERSION_3) ? options.alignment : 1;
+    uint32_t alignment = options.alignment;
     // Ensure alignment is a power of 2
     if (alignment == 0) alignment = 1;
     if ((alignment & (alignment - 1)) != 0) {
@@ -338,10 +316,10 @@ bool Pakker::CreatePak(const std::string& pakFilename,
     }
 
     PakHeader header;
-    header.version = version;
+    header.version = PAK_VERSION_4;
     header.numFiles = static_cast<uint32_t>(files.size());
     header.fileTableOffset = 0;
-    header.alignment = (version >= PAK_VERSION_3) ? alignment : 0;
+    header.alignment = alignment;
 
     if (!WritePakHeader(pakStream, header)) return false;
 
@@ -374,7 +352,7 @@ bool Pakker::CreatePak(const std::string& pakFilename,
         uint8_t flags = 0;
         uint64_t originalSize = data.size();
 
-        if (options.compress && !data.empty() && !IsLikelyPreCompressed(normalizedFilename)) {
+        if (options.compress && !data.empty()) {
             if (data.size() > LZ4_MAX_SAFE_SIZE) {
                 Log(PakLogLevel::Warning, "CreatePak: File too large for LZ4, storing uncompressed: " + normalizedFilename);
             } else {
@@ -431,7 +409,7 @@ bool Pakker::CreatePak(const std::string& pakFilename,
         Log(PakLogLevel::Error, "CreatePak: Failed to get file table offset.");
         return false;
     }
-    if (!WriteFileTable(pakStream, entries, version)) return false;
+    if (!WriteFileTable(pakStream, entries)) return false;
 
     pakStream.seekp(0, std::ios::beg);
     if (!pakStream) {
@@ -443,18 +421,6 @@ bool Pakker::CreatePak(const std::string& pakFilename,
     pakStream.close();
     Log(PakLogLevel::Info, "CreatePak: PAK file '" + pakFilename + "' created successfully.");
     return true;
-}
-
-// Legacy overload: produces v2 for backward compatibility
-bool Pakker::CreatePak(const std::string& pakFilename,
-                       const std::map<std::string, std::vector<uint8_t>>& files,
-                       bool compress)
-{
-    PakOptions opts;
-    opts.compress = compress;
-    opts.formatVersion = PAK_VERSION_2;
-    opts.alignment = 1;
-    return CreatePak(pakFilename, files, opts);
 }
 
 bool Pakker::ExtractPak(const std::string& pakFilename, const std::string& outputDir) const
@@ -478,7 +444,7 @@ bool Pakker::ExtractPak(const std::string& pakFilename, const std::string& outpu
     }
 
     std::vector<PakEntry> entries;
-    if (!ReadFileTable(pakStream, header.numFiles, header.version, entries)) return false;
+    if (!ReadFileTable(pakStream, header.numFiles, entries)) return false;
 
     for (const auto& entry : entries) {
         if (!ValidateEntry(entry, pakFileSize)) {
@@ -557,7 +523,7 @@ bool Pakker::ListPak(const std::string& pakFilename) const
     }
 
     std::vector<PakEntry> entries;
-    if (!ReadFileTable(pakStream, header.numFiles, header.version, entries)) return false;
+    if (!ReadFileTable(pakStream, header.numFiles, entries)) return false;
 
     Log(PakLogLevel::Info, "ListPak: Contents of '" + pakFilename + "':");
     for (const auto& entry : entries) {
@@ -572,6 +538,52 @@ bool Pakker::ListPak(const std::string& pakFilename) const
         Log(PakLogLevel::Info, oss.str());
     }
     return true;
+}
+
+std::vector<std::string> Pakker::ListFiles(const std::string& pakFilename) const
+{
+    std::ifstream pakStream(pakFilename, std::ios::binary);
+    if (!pakStream) {
+        Log(PakLogLevel::Error, "ListFiles: Unable to open pak file: " + pakFilename);
+        return {};
+    }
+
+    PakHeader header;
+    if (!ReadPakHeader(pakStream, header)) return {};
+
+    pakStream.seekg(header.fileTableOffset, std::ios::beg);
+    if (!pakStream) {
+        Log(PakLogLevel::Error, "ListFiles: Failed to seek to fileTableOffset.");
+        return {};
+    }
+
+    std::vector<PakEntry> entries;
+    if (!ReadFileTable(pakStream, header.numFiles, entries)) return {};
+
+    std::vector<std::string> files;
+    files.reserve(entries.size());
+    for (const auto& entry : entries) {
+        files.push_back(entry.filename);
+    }
+
+    std::sort(files.begin(), files.end());
+    return files;
+}
+
+std::vector<std::string> Pakker::ListFilesWithPrefix(const std::string& pakFilename,
+                                                     const std::string& prefix) const
+{
+    const std::string normalizedPrefix = NormalizePathSeparators(prefix);
+    const auto files = ListFiles(pakFilename);
+
+    std::vector<std::string> matchingFiles;
+    for (const auto& file : files) {
+        if (file.starts_with(normalizedPrefix)) {
+            matchingFiles.push_back(file);
+        }
+    }
+
+    return matchingFiles;
 }
 
 std::vector<uint8_t> Pakker::ReadFileFromPak(const std::string& pakFilename,
@@ -593,7 +605,7 @@ std::vector<uint8_t> Pakker::ReadFileFromPak(const std::string& pakFilename,
     if (!pakStream) return {};
 
     std::vector<PakEntry> entries;
-    if (!ReadFileTable(pakStream, header.numFiles, header.version, entries)) return {};
+    if (!ReadFileTable(pakStream, header.numFiles, entries)) return {};
 
     std::string normalizedFilename = NormalizePathSeparators(filename);
     for (const auto& entry : entries) {
@@ -674,7 +686,7 @@ bool Pakker::AddFileToPak(const std::string& pakFilename,
     if (!pakStream) return false;
 
     std::vector<PakEntry> entries;
-    if (!ReadFileTable(pakStream, header.numFiles, header.version, entries)) return false;
+    if (!ReadFileTable(pakStream, header.numFiles, entries)) return false;
 
     auto it = std::find_if(entries.begin(), entries.end(), [&](const PakEntry& e) {
         return e.filename == normalizedFilename;
@@ -710,8 +722,7 @@ bool Pakker::AddFileToPak(const std::string& pakFilename,
     std::vector<uint8_t> compressBuffer;
 
     // Compress if requested and the file is compressible
-    if (compress && !data.empty() && !IsLikelyPreCompressed(normalizedFilename)
-        && header.version >= PAK_VERSION_2) {
+    if (compress && !data.empty()) {
         if (data.size() > LZ4_MAX_SAFE_SIZE) {
             Log(PakLogLevel::Warning, "AddFileToPak: File too large for LZ4, storing uncompressed: " + normalizedFilename);
         } else {
@@ -759,7 +770,7 @@ bool Pakker::AddFileToPak(const std::string& pakFilename,
     if (!WritePakHeader(pakStream, header)) return false;
 
     pakStream.seekp(header.fileTableOffset, std::ios::beg);
-    if (!WriteFileTable(pakStream, entries, header.version)) return false;
+    if (!WriteFileTable(pakStream, entries)) return false;
 
     // Truncate any leftover bytes from the old file table
     uint64_t finalSize = SafeStreamPos(pakStream, pakStream.tellp());
@@ -809,11 +820,7 @@ bool Pakker::CreatePakFromFolder(const std::string& pakFilename,
         return false;
     }
 
-    uint32_t version = options.formatVersion;
-    if (version < PAK_VERSION_2) version = PAK_VERSION_2;
-    if (version > PAK_VERSION_3) version = PAK_VERSION_3;
-
-    uint32_t alignment = (version >= PAK_VERSION_3) ? options.alignment : 1;
+    uint32_t alignment = options.alignment;
     if (alignment == 0) alignment = 1;
     if ((alignment & (alignment - 1)) != 0) {
         Log(PakLogLevel::Error, "CreatePakFromFolder: Alignment must be a power of 2.");
@@ -827,10 +834,10 @@ bool Pakker::CreatePakFromFolder(const std::string& pakFilename,
     }
 
     PakHeader header;
-    header.version = version;
+    header.version = PAK_VERSION_4;
     header.numFiles = static_cast<uint32_t>(filePaths.size());
     header.fileTableOffset = 0;
-    header.alignment = (version >= PAK_VERSION_3) ? alignment : 0;
+    header.alignment = alignment;
 
     if (!WritePakHeader(pakStream, header)) return false;
 
@@ -874,7 +881,7 @@ bool Pakker::CreatePakFromFolder(const std::string& pakFilename,
         uint8_t flags = 0;
         uint64_t originalSize = data.size();
 
-        if (options.compress && !data.empty() && !IsLikelyPreCompressed(normalizedName)) {
+        if (options.compress && !data.empty()) {
             if (data.size() > LZ4_MAX_SAFE_SIZE) {
                 Log(PakLogLevel::Warning, "CreatePakFromFolder: File too large for LZ4, storing uncompressed: " + normalizedName);
             } else {
@@ -928,7 +935,7 @@ bool Pakker::CreatePakFromFolder(const std::string& pakFilename,
         return false;
     }
     header.numFiles = static_cast<uint32_t>(entries.size());
-    if (!WriteFileTable(pakStream, entries, version)) return false;
+    if (!WriteFileTable(pakStream, entries)) return false;
 
     pakStream.seekp(0, std::ios::beg);
     if (!pakStream) {
@@ -940,18 +947,6 @@ bool Pakker::CreatePakFromFolder(const std::string& pakFilename,
     pakStream.close();
     Log(PakLogLevel::Info, "CreatePakFromFolder: PAK file '" + pakFilename + "' created successfully.");
     return true;
-}
-
-// Legacy overload: produces v2 for backward compatibility
-bool Pakker::CreatePakFromFolder(const std::string& pakFilename,
-                                 const std::string& folderPath,
-                                 bool compress)
-{
-    PakOptions opts;
-    opts.compress = compress;
-    opts.formatVersion = PAK_VERSION_2;
-    opts.alignment = 1;
-    return CreatePakFromFolder(pakFilename, folderPath, opts);
 }
 
 uint32_t Pakker::GetFileCount(const std::string& pakFilename) const
@@ -984,7 +979,7 @@ Pakker::FileInfo Pakker::GetFileInfo(const std::string& pakFilename,
     if (!pakStream) return info;
 
     std::vector<PakEntry> entries;
-    if (!ReadFileTable(pakStream, header.numFiles, header.version, entries)) return info;
+    if (!ReadFileTable(pakStream, header.numFiles, entries)) return info;
 
     std::string normalizedFilename = NormalizePathSeparators(filename);
     auto it = std::find_if(entries.begin(), entries.end(),
@@ -1027,7 +1022,7 @@ bool Pakker::ValidatePak(const std::string& pakFilename) const
     PakHeader header;
     if (!ReadPakHeader(pakStream, header)) return false;
 
-    if (header.fileTableOffset >= pakFileSize) {
+    if (header.fileTableOffset > pakFileSize) {
         Log(PakLogLevel::Error, "ValidatePak: Invalid file table offset.");
         return false;
     }
@@ -1036,7 +1031,7 @@ bool Pakker::ValidatePak(const std::string& pakFilename) const
     if (!pakStream) return false;
 
     std::vector<PakEntry> entries;
-    if (!ReadFileTable(pakStream, header.numFiles, header.version, entries)) return false;
+    if (!ReadFileTable(pakStream, header.numFiles, entries)) return false;
 
     for (const auto& entry : entries) {
         if (!ValidateEntry(entry, pakFileSize)) {
@@ -1074,16 +1069,14 @@ PakReader::PakReader(PakReader&& other) noexcept
     pakFilename_ = std::move(other.pakFilename_);
     header_ = other.header_;
     pakFileSize_ = other.pakFileSize_;
-    formatVersion_ = other.formatVersion_;
     isOpen_ = other.isOpen_;
-    fileTable_ = std::move(other.fileTable_);
+    table_ = std::move(other.table_);
     mappedGuard_ = std::move(other.mappedGuard_);
     useMmap_ = other.useMmap_;
     alignment_ = other.alignment_;
 
     other.isOpen_ = false;
     other.pakFileSize_ = 0;
-    other.formatVersion_ = 0;
     other.useMmap_ = false;
     other.alignment_ = 1;
 }
@@ -1106,10 +1099,9 @@ PakReader& PakReader::operator=(PakReader&& other) noexcept
             mappedGuard_.reset();
             useMmap_ = false;
             pakStream_.close();
-            fileTable_.clear();
+            table_.reset();
             header_ = PakInternal::PakHeader{};
             pakFileSize_ = 0;
-            formatVersion_ = 0;
             isOpen_ = false;
             alignment_ = 1;
             pakFilename_.clear();
@@ -1120,9 +1112,8 @@ PakReader& PakReader::operator=(PakReader&& other) noexcept
         pakFilename_ = std::move(other.pakFilename_);
         header_ = other.header_;
         pakFileSize_ = other.pakFileSize_;
-        formatVersion_ = other.formatVersion_;
         isOpen_ = other.isOpen_;
-        fileTable_ = std::move(other.fileTable_);
+        table_ = std::move(other.table_);
         mappedGuard_ = std::move(other.mappedGuard_);
         useMmap_ = other.useMmap_;
         alignment_ = other.alignment_;
@@ -1130,7 +1121,6 @@ PakReader& PakReader::operator=(PakReader&& other) noexcept
 
         other.isOpen_ = false;
         other.pakFileSize_ = 0;
-        other.formatVersion_ = 0;
         other.useMmap_ = false;
         other.alignment_ = 1;
     }
@@ -1145,10 +1135,9 @@ bool PakReader::Open(const std::string& pakFilename)
         mappedGuard_.reset();
         useMmap_ = false;
         pakStream_.close();
-        fileTable_.clear();
+        table_.reset();
         header_ = PakHeader{};
         pakFileSize_ = 0;
-        formatVersion_ = 0;
         isOpen_ = false;
         alignment_ = 1;
     }
@@ -1165,13 +1154,12 @@ bool PakReader::Open(const std::string& pakFilename)
         pakStream_.close();
         return false;
     }
-    formatVersion_ = header_.version;
     alignment_ = (header_.alignment > 0) ? header_.alignment : 1;
 
     pakStream_.seekg(0, std::ios::end);
     pakFileSize_ = SafeStreamPos(pakStream_, pakStream_.tellg());
 
-    if (header_.fileTableOffset >= pakFileSize_) {
+    if (header_.fileTableOffset > pakFileSize_) {
         Log(PakLogLevel::Error, "PakReader::Open: Invalid file table offset.");
         pakStream_.close();
         return false;
@@ -1185,22 +1173,41 @@ bool PakReader::Open(const std::string& pakFilename)
     }
 
     std::vector<PakEntry> entries;
-    if (!ReadFileTable(pakStream_, header_.numFiles, formatVersion_, entries)) {
+    if (!ReadFileTable(pakStream_, header_.numFiles, entries)) {
         pakStream_.close();
         return false;
     }
 
-    // Build hash map for O(1) lookup
-    fileTable_.reserve(entries.size());
+    auto table = std::make_shared<RuntimeTable>();
+    table->entries.reserve(entries.size());
+    table->infos.reserve(entries.size());
+    table->indexByName.reserve(entries.size());
+
     for (auto& entry : entries) {
         if (!ValidateEntry(entry, pakFileSize_)) {
             Log(PakLogLevel::Error, "PakReader::Open: Invalid entry: " + entry.filename);
             pakStream_.close();
-            fileTable_.clear();
             return false;
         }
-        std::string key = entry.filename;
-        fileTable_.emplace(std::move(key), std::move(entry));
+
+        uint32_t index = static_cast<uint32_t>(table->entries.size());
+        table->entries.emplace_back(std::move(entry));
+
+        const auto& storedEntry = table->entries.back();
+        PakFileInfo info{};
+        info.filename = storedEntry.filename;
+        info.originalSize = storedEntry.originalSize;
+        info.compressedSize = storedEntry.compressedSize;
+        info.offset = storedEntry.offset;
+        info.compressed = (storedEntry.flags & PakInternal::PAK_FLAG_COMPRESSED) != 0;
+        table->infos.emplace_back(info);
+
+        auto [_, inserted] = table->indexByName.emplace(storedEntry.filename, index);
+        if (!inserted) {
+            Log(PakLogLevel::Error, "PakReader::Open: Duplicate entry: " + storedEntry.filename);
+            pakStream_.close();
+            return false;
+        }
     }
 
     // Attempt memory-mapped I/O -- close ifstream first to avoid double file handle
@@ -1217,11 +1224,11 @@ bool PakReader::Open(const std::string& pakFilename)
         pakStream_.open(pakFilename, std::ios::binary);
         if (!pakStream_) {
             Log(PakLogLevel::Error, "PakReader::Open: Failed to re-open pak file for streaming.");
-            fileTable_.clear();
             return false;
         }
     }
 
+    table_ = std::move(table);
     isOpen_ = true;
     Log(PakLogLevel::Info, "PakReader::Open: Opened '" + pakFilename + "' with " +
         std::to_string(header_.numFiles) + " files" +
@@ -1236,10 +1243,9 @@ void PakReader::Close()
         mappedGuard_.reset();
         useMmap_ = false;
         pakStream_.close();
-        fileTable_.clear();
+        table_.reset();
         header_ = PakHeader{};
         pakFileSize_ = 0;
-        formatVersion_ = 0;
         isOpen_ = false;
         alignment_ = 1;
         pakFilename_.clear();
@@ -1259,289 +1265,349 @@ bool PakReader::IsMapped() const
 }
 
 // ---------------------------------------------------------------------------
-// ReadEntry -- branch on mmap vs ifstream
+// Handle lookup and metadata
 // ---------------------------------------------------------------------------
 
-std::vector<uint8_t> PakReader::ReadEntry(const PakInternal::PakEntry& entry,
-    bool useMmap, uint64_t fileSize, const std::string& encryptionKey,
-    const std::shared_ptr<PakInternal::MappedFileGuard>& guard) const
+bool PakReader::NeedsPathNormalization(std::string_view path)
 {
-    uint64_t diskSize = entry.compressedSize;
+    return path.find('\\') != std::string_view::npos ||
+           (!path.empty() && path.front() == '/');
+}
 
-    if (useMmap && guard) {
-        // Memory-mapped path: direct pointer, no syscall
-        if (entry.offset > fileSize || diskSize > fileSize - entry.offset) {
-            Log(PakLogLevel::Error, "PakReader: Entry exceeds file bounds: " + entry.filename);
-            return {};
-        }
+std::string PakReader::NormalizePath(std::string_view path)
+{
+    return PakInternal::NormalizePathSeparators(std::string(path));
+}
 
-        const uint8_t* rawPtr = static_cast<const uint8_t*>(guard->mf.data) + entry.offset;
+PakFileHandle PakReader::FindInTable(const RuntimeTable& table, std::string_view filename)
+{
+    if (filename.empty()) return {};
 
-        // If encrypted, we need a mutable copy
-        if (!encryptionKey.empty()) {
-            std::vector<uint8_t> rawData(rawPtr, rawPtr + diskSize);
-            EncryptDecrypt(rawData, encryptionKey);
-
-            if (entry.flags & PAK_FLAG_COMPRESSED) {
-                if (entry.originalSize > LZ4_MAX_SAFE_SIZE || rawData.size() > LZ4_MAX_SAFE_SIZE) {
-                    Log(PakLogLevel::Error, "PakReader: Entry exceeds LZ4 size limit: " + entry.filename);
-                    return {};
-                }
-                thread_local std::vector<uint8_t> decompBuf;
-                decompBuf.resize(entry.originalSize);
-                int result = LZ4_decompress_safe(
-                    reinterpret_cast<const char*>(rawData.data()),
-                    reinterpret_cast<char*>(decompBuf.data()),
-                    static_cast<int>(rawData.size()),
-                    static_cast<int>(entry.originalSize));
-                if (result < 0 || static_cast<uint64_t>(result) != entry.originalSize) {
-                    Log(PakLogLevel::Error, "PakReader: Decompression failed for: " + entry.filename);
-                    return {};
-                }
-                return {decompBuf.begin(), decompBuf.end()};
-            }
-            return rawData;
-        }
-
-        // No encryption
-        if (entry.flags & PAK_FLAG_COMPRESSED) {
-            if (entry.originalSize > LZ4_MAX_SAFE_SIZE || diskSize > LZ4_MAX_SAFE_SIZE) {
-                Log(PakLogLevel::Error, "PakReader: Entry exceeds LZ4 size limit: " + entry.filename);
-                return {};
-            }
-            thread_local std::vector<uint8_t> decompBuf;
-            decompBuf.resize(entry.originalSize);
-            int result = LZ4_decompress_safe(
-                reinterpret_cast<const char*>(rawPtr),
-                reinterpret_cast<char*>(decompBuf.data()),
-                static_cast<int>(diskSize),
-                static_cast<int>(entry.originalSize));
-            if (result < 0 || static_cast<uint64_t>(result) != entry.originalSize) {
-                Log(PakLogLevel::Error, "PakReader: Decompression failed for: " + entry.filename);
-                return {};
-            }
-            return {decompBuf.begin(), decompBuf.end()};
-        }
-
-        // Uncompressed, unencrypted: copy from mmap
-        return {rawPtr, rawPtr + diskSize};
+    if (NeedsPathNormalization(filename)) {
+        std::string normalized = NormalizePath(filename);
+        auto it = table.indexByName.find(normalized);
+        return it != table.indexByName.end() ? PakFileHandle{it->second} : PakFileHandle{};
     }
 
-    // ifstream fallback: serialize access to the stream
-    std::lock_guard streamLock(streamMutex_);
+    auto it = table.indexByName.find(filename);
+    return it != table.indexByName.end() ? PakFileHandle{it->second} : PakFileHandle{};
+}
 
-    pakStream_.seekg(entry.offset, std::ios::beg);
-    if (!pakStream_) {
-        Log(PakLogLevel::Error, "PakReader: Failed to seek for file: " + entry.filename);
-        return {};
+PakFileHandle PakReader::Find(std::string_view filename) const
+{
+    std::shared_ptr<const RuntimeTable> table;
+    {
+        std::shared_lock lock(mutex_);
+        if (!isOpen_ || !table_) return {};
+        table = table_;
     }
+    return FindInTable(*table, filename);
+}
 
-    std::vector<uint8_t> rawData(diskSize);
-    pakStream_.read(reinterpret_cast<char*>(rawData.data()),
-                    static_cast<std::streamsize>(diskSize));
-    if (!pakStream_) {
-        Log(PakLogLevel::Error, "PakReader: Failed to read file: " + entry.filename);
-        return {};
-    }
+size_t PakReader::Resolve(std::span<const std::string_view> filenames,
+                          std::span<PakFileHandle> handles) const
+{
+    size_t resolvedCount = 0;
+    size_t count = std::min(filenames.size(), handles.size());
 
-    EncryptDecrypt(rawData, encryptionKey);
-
-    if (entry.flags & PAK_FLAG_COMPRESSED) {
-        if (entry.originalSize > LZ4_MAX_SAFE_SIZE || rawData.size() > LZ4_MAX_SAFE_SIZE) {
-            Log(PakLogLevel::Error, "PakReader: Entry exceeds LZ4 size limit: " + entry.filename);
-            return {};
+    std::shared_ptr<const RuntimeTable> table;
+    {
+        std::shared_lock lock(mutex_);
+        if (!isOpen_ || !table_) {
+            for (size_t i = 0; i < count; ++i) handles[i] = {};
+            return 0;
         }
-        std::vector<uint8_t> decompressed(entry.originalSize);
-        int result = LZ4_decompress_safe(
-            reinterpret_cast<const char*>(rawData.data()),
-            reinterpret_cast<char*>(decompressed.data()),
-            static_cast<int>(rawData.size()),
-            static_cast<int>(entry.originalSize));
-        if (result < 0 || static_cast<uint64_t>(result) != entry.originalSize) {
-            Log(PakLogLevel::Error, "PakReader: Decompression failed for: " + entry.filename);
-            return {};
-        }
-        return decompressed;
+        table = table_;
     }
 
-    return rawData;
+    for (size_t i = 0; i < count; ++i) {
+        handles[i] = FindInTable(*table, filenames[i]);
+        if (handles[i]) ++resolvedCount;
+    }
+    return resolvedCount;
+}
+
+const PakFileInfo* PakReader::Info(PakFileHandle handle) const
+{
+    std::shared_lock lock(mutex_);
+    if (!isOpen_ || !table_ || !handle || handle.index >= table_->infos.size()) return nullptr;
+    return &table_->infos[handle.index];
 }
 
 // ---------------------------------------------------------------------------
-// ReadEntryFromMmap -- mmap-only path for parallel batch reads
+// Read helpers
 // ---------------------------------------------------------------------------
 
-std::vector<uint8_t> PakReader::ReadEntryFromMmap(const PakInternal::PakEntry& entry,
-    uint64_t fileSize, const std::string& encryptionKey,
-    const std::shared_ptr<PakInternal::MappedFileGuard>& guard) const
+PakStatus PakReader::CaptureReadContext(PakFileHandle handle, ReadContext& context) const
 {
-    uint64_t diskSize = entry.compressedSize;
+    std::shared_lock lock(mutex_);
+    if (!isOpen_ || !table_) return PakStatus::NotOpen;
+    if (!handle || handle.index >= table_->entries.size()) return PakStatus::InvalidHandle;
 
-    if (!guard || entry.offset > fileSize || diskSize > fileSize - entry.offset) {
-        Log(PakLogLevel::Error, "PakReader: Entry exceeds file bounds: " + entry.filename);
-        return {};
+    context.table = table_;
+    context.guard = mappedGuard_;
+    context.useMmap = useMmap_;
+    context.fileSize = pakFileSize_;
+    return PakStatus::Ok;
+}
+
+PakStatus PakReader::ReadEntryToBuffer(const PakInternal::PakEntry& entry,
+    std::span<uint8_t> destination, uint64_t* bytesWritten,
+    const ReadContext& context) const
+{
+    if (bytesWritten) *bytesWritten = 0;
+
+    const uint64_t diskSize = entry.compressedSize;
+    const bool compressed = (entry.flags & PakInternal::PAK_FLAG_COMPRESSED) != 0;
+
+    if (entry.offset > context.fileSize || diskSize > context.fileSize - entry.offset) {
+        Log(PakLogLevel::Error, "PakReader::Read: Entry exceeds file bounds: " + entry.filename);
+        return PakStatus::CorruptArchive;
     }
 
-    const uint8_t* rawPtr = static_cast<const uint8_t*>(guard->mf.data) + entry.offset;
+    if (!compressed && diskSize != entry.originalSize) {
+        Log(PakLogLevel::Error, "PakReader::Read: Uncompressed entry has mismatched disk size: " + entry.filename);
+        return PakStatus::CorruptArchive;
+    }
 
-    if (!encryptionKey.empty()) {
-        std::vector<uint8_t> rawData(rawPtr, rawPtr + diskSize);
-        EncryptDecrypt(rawData, encryptionKey);
+    if (entry.originalSize > static_cast<uint64_t>(destination.size())) {
+        return PakStatus::BufferTooSmall;
+    }
 
-        if (entry.flags & PAK_FLAG_COMPRESSED) {
-            if (entry.originalSize > LZ4_MAX_SAFE_SIZE || rawData.size() > LZ4_MAX_SAFE_SIZE) {
-                Log(PakLogLevel::Error, "PakReader: Entry exceeds LZ4 size limit: " + entry.filename);
-                return {};
+    if (entry.originalSize == 0) {
+        return PakStatus::Ok;
+    }
+
+    if (compressed && (entry.originalSize > LZ4_MAX_SAFE_SIZE || diskSize > LZ4_MAX_SAFE_SIZE)) {
+        Log(PakLogLevel::Error, "PakReader::Read: Entry exceeds LZ4 size limit: " + entry.filename);
+        return PakStatus::CorruptArchive;
+    }
+
+    auto output = destination.first(static_cast<size_t>(entry.originalSize));
+
+    const uint8_t* mappedPtr = nullptr;
+    if (context.useMmap && context.guard && context.guard->mf.data) {
+        mappedPtr = static_cast<const uint8_t*>(context.guard->mf.data) + entry.offset;
+    }
+
+    if (!compressed) {
+        if (mappedPtr) {
+            std::memcpy(output.data(), mappedPtr, output.size());
+        } else {
+            if (diskSize > static_cast<uint64_t>((std::numeric_limits<std::streamsize>::max)())) {
+                return PakStatus::IoError;
             }
-            thread_local std::vector<uint8_t> decompBuf;
-            decompBuf.resize(entry.originalSize);
-            int result = LZ4_decompress_safe(
-                reinterpret_cast<const char*>(rawData.data()),
-                reinterpret_cast<char*>(decompBuf.data()),
-                static_cast<int>(rawData.size()),
-                static_cast<int>(entry.originalSize));
-            if (result < 0 || static_cast<uint64_t>(result) != entry.originalSize) return {};
-            return {decompBuf.begin(), decompBuf.end()};
+            std::lock_guard streamLock(streamMutex_);
+            pakStream_.clear();
+            pakStream_.seekg(entry.offset, std::ios::beg);
+            if (!pakStream_) return PakStatus::IoError;
+            pakStream_.read(reinterpret_cast<char*>(output.data()),
+                            static_cast<std::streamsize>(diskSize));
+            if (!pakStream_) return PakStatus::IoError;
         }
-        return rawData;
+
+        EncryptDecryptSpan(output, encryptionKey_);
+        if (bytesWritten) *bytesWritten = entry.originalSize;
+        return PakStatus::Ok;
     }
 
-    if (entry.flags & PAK_FLAG_COMPRESSED) {
-        if (entry.originalSize > LZ4_MAX_SAFE_SIZE || diskSize > LZ4_MAX_SAFE_SIZE) {
-            Log(PakLogLevel::Error, "PakReader: Entry exceeds LZ4 size limit: " + entry.filename);
-            return {};
+    const uint8_t* compressedData = mappedPtr;
+    std::vector<uint8_t> compressedScratch;
+    if (!compressedData || !encryptionKey_.empty()) {
+        if (diskSize > static_cast<uint64_t>((std::numeric_limits<std::streamsize>::max)())) {
+            return PakStatus::IoError;
         }
-        thread_local std::vector<uint8_t> decompBuf;
-        decompBuf.resize(entry.originalSize);
-        int result = LZ4_decompress_safe(
-            reinterpret_cast<const char*>(rawPtr),
-            reinterpret_cast<char*>(decompBuf.data()),
-            static_cast<int>(diskSize),
-            static_cast<int>(entry.originalSize));
-        if (result < 0 || static_cast<uint64_t>(result) != entry.originalSize) return {};
-        return {decompBuf.begin(), decompBuf.end()};
+
+        compressedScratch.resize(static_cast<size_t>(diskSize));
+        if (mappedPtr) {
+            std::memcpy(compressedScratch.data(), mappedPtr, compressedScratch.size());
+        } else {
+            std::lock_guard streamLock(streamMutex_);
+            pakStream_.clear();
+            pakStream_.seekg(entry.offset, std::ios::beg);
+            if (!pakStream_) return PakStatus::IoError;
+            pakStream_.read(reinterpret_cast<char*>(compressedScratch.data()),
+                            static_cast<std::streamsize>(diskSize));
+            if (!pakStream_) return PakStatus::IoError;
+        }
+
+        EncryptDecryptSpan(compressedScratch, encryptionKey_);
+        compressedData = compressedScratch.data();
     }
 
-    return {rawPtr, rawPtr + diskSize};
+    int result = LZ4_decompress_safe(
+        reinterpret_cast<const char*>(compressedData),
+        reinterpret_cast<char*>(output.data()),
+        static_cast<int>(diskSize),
+        static_cast<int>(entry.originalSize));
+    if (result < 0 || static_cast<uint64_t>(result) != entry.originalSize) {
+        Log(PakLogLevel::Error, "PakReader::Read: Decompression failed for: " + entry.filename);
+        return PakStatus::DecompressionFailed;
+    }
+
+    if (bytesWritten) *bytesWritten = entry.originalSize;
+    return PakStatus::Ok;
 }
 
 // ---------------------------------------------------------------------------
-// Public read methods
+// Engine read API
+// ---------------------------------------------------------------------------
+
+PakStatus PakReader::View(PakFileHandle handle, PakView& outView) const
+{
+    outView = PakView{};
+
+    ReadContext context;
+    PakStatus status = CaptureReadContext(handle, context);
+    if (status != PakStatus::Ok) return status;
+
+    const auto& entry = context.table->entries[handle.index];
+    if ((entry.flags & PakInternal::PAK_FLAG_COMPRESSED) || !encryptionKey_.empty()) {
+        return PakStatus::Unsupported;
+    }
+    if (!context.useMmap || !context.guard || !context.guard->mf.data) {
+        return PakStatus::Unsupported;
+    }
+    if (entry.offset > context.fileSize || entry.originalSize > context.fileSize - entry.offset) {
+        return PakStatus::CorruptArchive;
+    }
+
+    outView.data = static_cast<const uint8_t*>(context.guard->mf.data) + entry.offset;
+    outView.size = entry.originalSize;
+    outView.mapped = true;
+    outView.mappingRef_ = std::move(context.guard);
+    return PakStatus::Ok;
+}
+
+PakStatus PakReader::Read(PakFileHandle handle, std::span<uint8_t> destination,
+                          uint64_t* bytesWritten) const
+{
+    ReadContext context;
+    PakStatus status = CaptureReadContext(handle, context);
+    if (status != PakStatus::Ok) return status;
+
+    const auto& entry = context.table->entries[handle.index];
+    return ReadEntryToBuffer(entry, destination, bytesWritten, context);
+}
+
+PakStatus PakReader::Load(PakFileHandle handle, std::vector<uint8_t>& outData) const
+{
+    ReadContext context;
+    PakStatus status = CaptureReadContext(handle, context);
+    if (status != PakStatus::Ok) {
+        outData.clear();
+        return status;
+    }
+
+    const auto& entry = context.table->entries[handle.index];
+    if (entry.originalSize > static_cast<uint64_t>((std::numeric_limits<size_t>::max)())) {
+        outData.clear();
+        return PakStatus::InvalidArgument;
+    }
+
+    outData.resize(static_cast<size_t>(entry.originalSize));
+    status = ReadEntryToBuffer(entry, outData, nullptr, context);
+    if (status != PakStatus::Ok) outData.clear();
+    return status;
+}
+
+PakStatus PakReader::Prefetch(PakFileHandle handle) const
+{
+    ReadContext context;
+    PakStatus status = CaptureReadContext(handle, context);
+    if (status != PakStatus::Ok) return status;
+
+    const auto& entry = context.table->entries[handle.index];
+    if (entry.compressedSize == 0) return PakStatus::Ok;
+    if (!context.useMmap || !context.guard || !context.guard->mf.data) {
+        return PakStatus::Unsupported;
+    }
+    if (!PakPlatform::PrefetchMappedRange(context.guard->mf, entry.offset, entry.compressedSize)) {
+        return PakStatus::IoError;
+    }
+    return PakStatus::Ok;
+}
+
+// ---------------------------------------------------------------------------
+// Convenience wrappers
 // ---------------------------------------------------------------------------
 
 std::vector<uint8_t> PakReader::ReadFile(const std::string& filename) const
 {
-    PakInternal::PakEntry entryCopy;
-    std::shared_ptr<PakInternal::MappedFileGuard> localGuard;
-    bool localUseMmap;
-    uint64_t localFileSize;
-    std::string localEncryptionKey;
-    {
-        std::shared_lock lock(mutex_);
-        if (!isOpen_) {
-            Log(PakLogLevel::Error, "PakReader::ReadFile: No PAK file is open.");
-            return {};
-        }
-
-        std::string normalized = PakInternal::NormalizePathSeparators(filename);
-        auto it = fileTable_.find(normalized);
-        if (it == fileTable_.end()) {
-            Log(PakLogLevel::Error, "PakReader::ReadFile: File not found: " + filename);
-            return {};
-        }
-        entryCopy = it->second;
-        localGuard = mappedGuard_;
-        localUseMmap = useMmap_;
-        localFileSize = pakFileSize_;
-        localEncryptionKey = encryptionKey_;
+    PakFileHandle handle = Find(filename);
+    if (!handle) {
+        Log(PakLogLevel::Error, "PakReader::ReadFile: File not found: " + filename);
+        return {};
     }
-    // Lock released -- ReadEntry proceeds without blocking Open/Close
-    return ReadEntry(entryCopy, localUseMmap, localFileSize, localEncryptionKey, localGuard);
+
+    std::vector<uint8_t> data;
+    PakStatus status = Load(handle, data);
+    if (status != PakStatus::Ok) {
+        Log(PakLogLevel::Error, "PakReader::ReadFile: " + std::string(PakStatusToString(status)) +
+            " for file: " + filename);
+        return {};
+    }
+    return data;
 }
 
 std::shared_ptr<std::vector<uint8_t>> PakReader::LoadFile(const std::string& filename) const
 {
-    if (!FileExists(filename)) return nullptr;
-    auto data = ReadFile(filename);
-    return std::make_shared<std::vector<uint8_t>>(std::move(data));
+    PakFileHandle handle = Find(filename);
+    if (!handle) return nullptr;
+
+    auto data = std::make_shared<std::vector<uint8_t>>();
+    PakStatus status = Load(handle, *data);
+    return status == PakStatus::Ok ? data : nullptr;
 }
 
 PakSpan PakReader::ReadFileZeroCopy(const std::string& filename) const
 {
     PakSpan span;
-    PakInternal::PakEntry entryCopy;
-    std::shared_ptr<PakInternal::MappedFileGuard> localGuard;
-    bool localUseMmap;
-    uint64_t localFileSize;
-    std::string localEncryptionKey;
-    {
-        std::shared_lock lock(mutex_);
-        if (!isOpen_) {
-            Log(PakLogLevel::Error, "PakReader::ReadFileZeroCopy: No PAK file is open.");
-            return span;
-        }
-
-        std::string normalized = PakInternal::NormalizePathSeparators(filename);
-        auto it = fileTable_.find(normalized);
-        if (it == fileTable_.end()) {
-            Log(PakLogLevel::Error, "PakReader::ReadFileZeroCopy: File not found: " + filename);
-            return span;
-        }
-        entryCopy = it->second;
-        localGuard = mappedGuard_;
-        localUseMmap = useMmap_;
-        localFileSize = pakFileSize_;
-        localEncryptionKey = encryptionKey_;
+    PakFileHandle handle = Find(filename);
+    if (!handle) {
+        Log(PakLogLevel::Error, "PakReader::ReadFileZeroCopy: File not found: " + filename);
+        return span;
     }
-    // Lock released
 
-    // True zero-copy: only possible with mmap + uncompressed + unencrypted
-    if (localUseMmap && localGuard &&
-        !(entryCopy.flags & PakInternal::PAK_FLAG_COMPRESSED) && localEncryptionKey.empty()) {
-        if (entryCopy.offset > localFileSize || entryCopy.originalSize > localFileSize - entryCopy.offset) {
-            PakInternal::Log(PakLogLevel::Error, "PakReader::ReadFileZeroCopy: Entry exceeds file bounds.");
-            return span;
-        }
-        span.data = static_cast<const uint8_t*>(localGuard->mf.data) + entryCopy.offset;
-        span.size = entryCopy.originalSize;
+    PakView view;
+    PakStatus status = View(handle, view);
+    if (status == PakStatus::Ok) {
+        span.data = view.data;
+        span.size = view.size;
         span.ownsData = false;
-        span.mappingRef_ = std::move(localGuard);  // shared ownership keeps mapping alive
+        span.mappingRef_ = std::move(view.mappingRef_);
         return span;
     }
 
-    // Fallback: allocate and read
-    auto vec = ReadEntry(entryCopy, localUseMmap, localFileSize, localEncryptionKey, localGuard);
-    if (vec.empty()) {
-        // Empty file is valid -- return a zero-size owning span to distinguish from error
-        if (entryCopy.originalSize == 0) {
-            span.data = nullptr;
-            span.size = 0;
-            span.ownsData = true;  // signals "found but empty" vs default-constructed "not found"
-        }
+    std::vector<uint8_t> data;
+    status = Load(handle, data);
+    if (status != PakStatus::Ok) return span;
+
+    if (data.empty()) {
+        span.data = nullptr;
+        span.size = 0;
+        span.ownsData = true;
         return span;
     }
 
-    auto* buf = new uint8_t[vec.size()];
-    std::memcpy(buf, vec.data(), vec.size());
-    span.data = buf;
-    span.size = vec.size();
+    auto* buffer = new uint8_t[data.size()];
+    std::memcpy(buffer, data.data(), data.size());
+    span.data = buffer;
+    span.size = data.size();
     span.ownsData = true;
     return span;
 }
 
-bool PakReader::FileExists(const std::string& filename) const
+bool PakReader::FileExists(std::string_view filename) const
 {
-    std::shared_lock lock(mutex_);
-    if (!isOpen_) return false;
-    std::string normalized = NormalizePathSeparators(filename);
-    return fileTable_.count(normalized) > 0;
+    return static_cast<bool>(Find(filename));
 }
 
 uint32_t PakReader::GetFileCount() const
 {
     std::shared_lock lock(mutex_);
-    if (!isOpen_) return 0;
-    return static_cast<uint32_t>(fileTable_.size());
+    if (!isOpen_ || !table_) return 0;
+    return static_cast<uint32_t>(table_->entries.size());
 }
 
 PakReader::FileInfo PakReader::GetFileInfo(const std::string& filename) const
@@ -1553,103 +1619,35 @@ PakReader::FileInfo PakReader::GetFileInfo(const std::string& filename) const
     info.originalSize = 0;
     info.compressedSize = 0;
 
-    if (!isOpen_) return info;
+    if (!isOpen_ || !table_) return info;
 
-    std::string normalized = NormalizePathSeparators(filename);
-    auto it = fileTable_.find(normalized);
-    if (it != fileTable_.end()) {
-        info.filename = it->second.filename;
-        info.originalSize = it->second.originalSize;
-        info.compressedSize = it->second.compressedSize;
-        info.compressed = (it->second.flags & PAK_FLAG_COMPRESSED) != 0;
+    PakFileHandle handle = FindInTable(*table_, filename);
+    if (handle) {
+        const PakFileInfo& runtimeInfo = table_->infos[handle.index];
+        info.filename = std::string(runtimeInfo.filename);
+        info.originalSize = runtimeInfo.originalSize;
+        info.compressedSize = runtimeInfo.compressedSize;
+        info.compressed = runtimeInfo.compressed;
         info.found = true;
     }
     return info;
 }
 
 // ---------------------------------------------------------------------------
-// Batch read -- parallel decompression with mmap
+// Batch read wrapper
 // ---------------------------------------------------------------------------
 
 std::vector<std::pair<std::string, std::vector<uint8_t>>>
 PakReader::ReadFiles(const std::vector<std::string>& filenames) const
 {
-    // Phase 1: resolve entries under shared lock, copy them out
-    struct ResolvedEntry {
-        size_t originalIndex;
-        PakInternal::PakEntry entry;  // copy, not pointer -- safe after lock release
-    };
-    std::vector<ResolvedEntry> resolved;
     std::vector<std::pair<std::string, std::vector<uint8_t>>> results;
-    std::shared_ptr<PakInternal::MappedFileGuard> localGuard;
-    bool localUseMmap;
-    uint64_t localFileSize;
-    std::string localEncryptionKey;
-    {
-        std::shared_lock lock(mutex_);
-        if (!isOpen_ || filenames.empty()) return results;
+    results.resize(filenames.size());
 
-        resolved.reserve(filenames.size());
-        results.resize(filenames.size());
-
-        for (size_t i = 0; i < filenames.size(); ++i) {
-            std::string normalized = PakInternal::NormalizePathSeparators(filenames[i]);
-            auto it = fileTable_.find(normalized);
-            if (it != fileTable_.end()) {
-                resolved.push_back({i, it->second});
-            }
-            results[i].first = filenames[i];
-        }
-        localGuard = mappedGuard_;
-        localUseMmap = useMmap_;
-        localFileSize = pakFileSize_;
-        localEncryptionKey = encryptionKey_;
-    }
-    // Lock released -- I/O proceeds without blocking Open/Close
-
-    // Phase 2: read/decompress (parallel for mmap, sequential for ifstream)
-    if (localUseMmap && localGuard) {
-        unsigned int numThreads = std::thread::hardware_concurrency();
-        if (numThreads == 0) numThreads = 2;
-        if (numThreads > resolved.size()) numThreads = static_cast<unsigned int>(resolved.size());
-
-        if (numThreads <= 1 || resolved.size() <= 2) {
-            for (const auto& r : resolved) {
-                results[r.originalIndex].second = ReadEntryFromMmap(r.entry,
-                    localFileSize, localEncryptionKey, localGuard);
-            }
-        } else {
-            std::vector<std::thread> threads;
-            threads.reserve(numThreads);
-
-            size_t chunkSize = (resolved.size() + numThreads - 1) / numThreads;
-            for (unsigned int t = 0; t < numThreads; ++t) {
-                size_t start = t * chunkSize;
-                size_t end = std::min(start + chunkSize, resolved.size());
-                if (start >= end) break;
-
-                threads.emplace_back([this, &resolved, &results, start, end,
-                                      localFileSize, &localEncryptionKey, &localGuard]() {
-                    for (size_t i = start; i < end; ++i) {
-                        results[resolved[i].originalIndex].second =
-                            ReadEntryFromMmap(resolved[i].entry,
-                                localFileSize, localEncryptionKey, localGuard);
-                    }
-                });
-            }
-
-            for (auto& t : threads) t.join();
-        }
-    } else {
-        // ifstream fallback: read in offset order for sequential I/O
-        std::sort(resolved.begin(), resolved.end(),
-                  [](const ResolvedEntry& a, const ResolvedEntry& b) {
-                      return a.entry.offset < b.entry.offset;
-                  });
-
-        for (const auto& r : resolved) {
-            results[r.originalIndex].second = ReadEntry(r.entry,
-                localUseMmap, localFileSize, localEncryptionKey, localGuard);
+    for (size_t i = 0; i < filenames.size(); ++i) {
+        results[i].first = filenames[i];
+        PakFileHandle handle = Find(filenames[i]);
+        if (handle) {
+            Load(handle, results[i].second);
         }
     }
 

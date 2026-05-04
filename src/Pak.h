@@ -12,6 +12,7 @@
 #include <functional>
 #include <shared_mutex>
 #include <mutex>
+#include <span>
 
 #include "PakPlatform.h"
 
@@ -36,17 +37,15 @@ namespace PakInternal {
 static constexpr size_t MAX_FILENAME_LENGTH = 65535;
 static constexpr size_t MAX_FILES_IN_PAK    = 1000000;
 static constexpr std::string_view PAK_MAGIC = "PAK0";
-static constexpr uint32_t PAK_VERSION_1     = 1;
-static constexpr uint32_t PAK_VERSION_2     = 2; // compression support
-static constexpr uint32_t PAK_VERSION_3     = 3; // alignment + mmap optimizations
+static constexpr uint32_t PAK_VERSION_4     = 4; // v4-only format
 
 #pragma pack(push, 1)
 struct PakHeader {
     char magic[4] = { 'P', 'A', 'K', '0' };
-    uint32_t version   = PAK_VERSION_3;
+    uint32_t version   = PAK_VERSION_4;
     uint32_t numFiles  = 0;
     uint64_t fileTableOffset = 0;
-    uint32_t alignment = 0;         // data alignment in bytes (power of 2); 0 = unaligned (v1/v2)
+    uint32_t alignment = 0;         // data alignment in bytes (power of 2)
     uint32_t reserved[3] = {0, 0, 0};
 };
 #pragma pack(pop)
@@ -56,8 +55,8 @@ struct PakEntry {
     std::string filename;
     uint64_t offset       = 0;
     uint64_t originalSize = 0;
-    uint64_t compressedSize = 0; // == originalSize when uncompressed (v2+)
-    uint8_t  flags        = 0;   // bit 0: compressed (v2+)
+    uint64_t compressedSize = 0; // == originalSize when uncompressed
+    uint8_t  flags        = 0;   // bit 0: LZ4 compressed
 
     PakEntry() = default;
     PakEntry(std::string name, uint64_t off, uint64_t origSz,
@@ -78,15 +77,15 @@ bool ValidateEntry(const PakEntry& entry, uint64_t pakFileSize);
 
 bool ReadPakHeader(std::istream& stream, PakHeader& header);
 bool ReadFileTable(std::istream& stream, uint32_t numFiles,
-                   uint32_t version, std::vector<PakEntry>& entries);
+                   std::vector<PakEntry>& entries);
 bool WritePakHeader(std::ostream& stream, const PakHeader& header);
-bool WriteFileTable(std::ostream& stream, const std::vector<PakEntry>& entries,
-                    uint32_t version);
+bool WriteFileTable(std::ostream& stream, const std::vector<PakEntry>& entries);
 
 void EncryptDecrypt(std::vector<uint8_t>& data, const std::string& key);
 
-// RAII guard for memory-mapped file. Shared between PakReader and PakSpan
-// instances so the mapping stays alive until the last reference is released.
+// RAII guard for memory-mapped file. Shared between PakReader, PakView, and
+// PakSpan instances so the mapping stays alive until the last reference is
+// released.
 struct MappedFileGuard {
     PakPlatform::MappedFile mf{};
     ~MappedFileGuard() { PakPlatform::UnmapFile(mf); }
@@ -95,7 +94,76 @@ struct MappedFileGuard {
     MappedFileGuard& operator=(const MappedFileGuard&) = delete;
 };
 
+struct TransparentStringHash {
+    using is_transparent = void;
+
+    size_t operator()(std::string_view value) const noexcept {
+        return std::hash<std::string_view>{}(value);
+    }
+    size_t operator()(const std::string& value) const noexcept {
+        return (*this)(std::string_view(value));
+    }
+    size_t operator()(const char* value) const noexcept {
+        return (*this)(std::string_view(value));
+    }
+};
+
+struct TransparentStringEqual {
+    using is_transparent = void;
+
+    bool operator()(std::string_view lhs, std::string_view rhs) const noexcept {
+        return lhs == rhs;
+    }
+};
+
 } // namespace PakInternal
+
+// ---------------------------------------------------------------------------
+// Runtime status and handle types
+// ---------------------------------------------------------------------------
+
+enum class PakStatus {
+    Ok,
+    NotOpen,
+    NotFound,
+    InvalidHandle,
+    InvalidArgument,
+    BufferTooSmall,
+    Unsupported,
+    CorruptArchive,
+    IoError,
+    DecompressionFailed,
+};
+
+const char* PakStatusToString(PakStatus status);
+
+struct PakFileHandle {
+    static constexpr uint32_t InvalidIndex = UINT32_MAX;
+
+    uint32_t index = InvalidIndex;
+
+    explicit operator bool() const { return index != InvalidIndex; }
+    friend bool operator==(PakFileHandle a, PakFileHandle b) { return a.index == b.index; }
+    friend bool operator!=(PakFileHandle a, PakFileHandle b) { return !(a == b); }
+};
+
+struct PakFileInfo {
+    std::string_view filename;
+    uint64_t originalSize = 0;
+    uint64_t compressedSize = 0;
+    uint64_t offset = 0;
+    bool compressed = false;
+};
+
+struct PakView {
+    const uint8_t* data = nullptr;
+    uint64_t size = 0;
+    bool mapped = false;
+
+private:
+    friend class PakReader;
+    std::shared_ptr<PakInternal::MappedFileGuard> mappingRef_;
+};
 
 // ---------------------------------------------------------------------------
 // PakOptions -- controls PAK creation behavior
@@ -104,7 +172,6 @@ struct MappedFileGuard {
 struct PakOptions {
     bool compress        = false;  // LZ4 per-file compression
     uint32_t alignment   = 16;    // data alignment in bytes (must be power of 2)
-    uint32_t formatVersion = 3;   // 2 for legacy compat, 3 for aligned
 };
 
 // ---------------------------------------------------------------------------
@@ -169,20 +236,19 @@ public:
     // encryptionKey: pass empty string for no encryption (recommended for shipping)
     explicit Pakker(const std::string& encryptionKey = "");
 
-    // Creates a PAK file with PakOptions for alignment and format control.
+    // Creates a v4 PAK file with PakOptions for alignment and compression control.
     bool CreatePak(const std::string& pakFilename,
                    const std::map<std::string, std::vector<uint8_t>>& files,
                    const PakOptions& options);
-
-    // Legacy overload -- produces v2 format for backward compatibility.
-    bool CreatePak(const std::string& pakFilename,
-                   const std::map<std::string, std::vector<uint8_t>>& files,
-                   bool compress = false);
 
     bool ExtractPak(const std::string& pakFilename,
                     const std::string& outputDir) const;
 
     bool ListPak(const std::string& pakFilename) const;
+
+    std::vector<std::string> ListFiles(const std::string& pakFilename) const;
+    std::vector<std::string> ListFilesWithPrefix(const std::string& pakFilename,
+                                                 const std::string& prefix) const;
 
     std::vector<uint8_t> ReadFileFromPak(const std::string& pakFilename,
                                           const std::string& filename) const;
@@ -195,15 +261,10 @@ public:
                       const std::vector<uint8_t>& data,
                       bool compress = false);
 
-    // Creates a PAK from a folder with PakOptions.
+    // Creates a v4 PAK from a folder with PakOptions.
     bool CreatePakFromFolder(const std::string& pakFilename,
                              const std::string& folderPath,
                              const PakOptions& options);
-
-    // Legacy overload -- produces v2 format.
-    bool CreatePakFromFolder(const std::string& pakFilename,
-                             const std::string& folderPath,
-                             bool compress = false);
 
     uint32_t GetFileCount(const std::string& pakFilename) const;
     bool FileExists(const std::string& pakFilename, const std::string& filename) const;
@@ -238,9 +299,8 @@ private:
 // Thread safety:
 //   - Open() and Close() take exclusive locks. Do not call them concurrently
 //     with any other method on the same PakReader instance.
-//   - All const methods (ReadFile, ReadFileZeroCopy, LoadFile, FileExists,
-//     GetFileCount, GetFileInfo, ReadFiles, IsOpen, IsMapped) are safe to
-//     call concurrently from multiple threads.
+//   - All const methods, including Find/View/Read/Load/Prefetch and
+//     convenience wrappers, are safe to call concurrently from multiple threads.
 //   - Moving a PakReader acquires exclusive locks on the involved instances.
 //     Do not move a PakReader while other threads are reading from it.
 //   - PakReader is non-copyable, movable.
@@ -269,7 +329,18 @@ public:
     void Close();
     bool IsOpen() const;
 
-    // Single file read (allocates result buffer)
+    // Engine runtime API: resolve once, cache handles, and avoid per-read path work.
+    PakFileHandle Find(std::string_view filename) const;
+    size_t Resolve(std::span<const std::string_view> filenames,
+                   std::span<PakFileHandle> handles) const;
+    const PakFileInfo* Info(PakFileHandle handle) const;
+    PakStatus View(PakFileHandle handle, PakView& outView) const;
+    PakStatus Read(PakFileHandle handle, std::span<uint8_t> destination,
+                   uint64_t* bytesWritten = nullptr) const;
+    PakStatus Load(PakFileHandle handle, std::vector<uint8_t>& outData) const;
+    PakStatus Prefetch(PakFileHandle handle) const;
+
+    // Convenience wrappers. Prefer the handle API in runtime engine code.
     std::vector<uint8_t> ReadFile(const std::string& filename) const;
     std::shared_ptr<std::vector<uint8_t>> LoadFile(const std::string& filename) const;
 
@@ -281,7 +352,7 @@ public:
     PakSpan ReadFileZeroCopy(const std::string& filename) const;
 
     // Metadata (no I/O after Open)
-    bool FileExists(const std::string& filename) const;
+    bool FileExists(std::string_view filename) const;
     uint32_t GetFileCount() const;
 
     struct FileInfo {
@@ -293,7 +364,8 @@ public:
     };
     FileInfo GetFileInfo(const std::string& filename) const;
 
-    // Batch read -- reads multiple files. Uses parallel decompression with mmap.
+    // Batch convenience wrapper. Prefer Resolve() and feed handles to
+    // the engine job system for parallel work.
     std::vector<std::pair<std::string, std::vector<uint8_t>>>
         ReadFiles(const std::vector<std::string>& filenames) const;
 
@@ -301,25 +373,42 @@ public:
     bool IsMapped() const;
 
 private:
-    std::vector<uint8_t> ReadEntry(const PakInternal::PakEntry& entry,
-        bool useMmap, uint64_t fileSize, const std::string& encryptionKey,
-        const std::shared_ptr<PakInternal::MappedFileGuard>& guard) const;
-    std::vector<uint8_t> ReadEntryFromMmap(const PakInternal::PakEntry& entry,
-        uint64_t fileSize, const std::string& encryptionKey,
-        const std::shared_ptr<PakInternal::MappedFileGuard>& guard) const;
+    struct RuntimeTable {
+        std::vector<PakInternal::PakEntry> entries;
+        std::vector<PakFileInfo> infos;
+        std::unordered_map<std::string, uint32_t,
+            PakInternal::TransparentStringHash,
+            PakInternal::TransparentStringEqual> indexByName;
+    };
+
+    struct ReadContext {
+        std::shared_ptr<const RuntimeTable> table;
+        std::shared_ptr<PakInternal::MappedFileGuard> guard;
+        bool useMmap = false;
+        uint64_t fileSize = 0;
+    };
+
+    static bool NeedsPathNormalization(std::string_view path);
+    static std::string NormalizePath(std::string_view path);
+    static PakFileHandle FindInTable(const RuntimeTable& table, std::string_view filename);
+
+    PakStatus CaptureReadContext(PakFileHandle handle, ReadContext& context) const;
+    PakStatus ReadEntryToBuffer(const PakInternal::PakEntry& entry,
+        std::span<uint8_t> destination, uint64_t* bytesWritten,
+        const ReadContext& context) const;
 
     std::string encryptionKey_;
     mutable std::ifstream pakStream_;
     std::string pakFilename_;
     PakInternal::PakHeader header_{};
     uint64_t pakFileSize_ = 0;
-    uint32_t formatVersion_ = 0;
     bool isOpen_ = false;
 
-    // O(1) lookup: normalized filename -> entry
-    std::unordered_map<std::string, PakInternal::PakEntry> fileTable_;
+    // Immutable runtime table shared with in-flight reads so Close() can proceed
+    // without invalidating handles that have already been captured.
+    std::shared_ptr<const RuntimeTable> table_;
 
-    // Memory-mapped I/O (shared ownership with PakSpan instances)
+    // Memory-mapped I/O (shared ownership with PakView/PakSpan instances)
     std::shared_ptr<PakInternal::MappedFileGuard> mappedGuard_;
     bool useMmap_ = false;
     uint32_t alignment_ = 1;

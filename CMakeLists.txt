@@ -2,6 +2,7 @@ cmake_minimum_required(VERSION 3.10.0)
 project(Pakker VERSION 0.1.0)
 
 enable_language(C)
+include(CTest)
 
 set(CMAKE_CXX_STANDARD 20)
 
@@ -13,6 +14,7 @@ file(GLOB_RECURSE SOURCES "src/*.cpp" "src/*.h" "src/*.c")
 
 option(BUILD_EXAMPLES "Build examples" ON)
 option(PAK_NO_MMAP "Disable memory-mapped I/O" OFF)
+option(BUILD_BENCHMARKS "Build benchmark executable" ON)
 
 find_package(Threads REQUIRED)
 
@@ -35,4 +37,15 @@ if(BUILD_EXAMPLES)
 file(GLOB EXAMPLE_SOURCES "example/*.cpp" "example/*.h")
 add_executable(PakkerExample ${EXAMPLE_SOURCES})
 target_link_libraries(PakkerExample PRIVATE ${PROJECT_NAME})
+endif()
+
+if(BUILD_TESTING)
+add_executable(PakkerTests tests/PakRuntimeTests.cpp)
+target_link_libraries(PakkerTests PRIVATE ${PROJECT_NAME})
+add_test(NAME PakkerRuntime COMMAND PakkerTests)
+endif()
+
+if(BUILD_BENCHMARKS)
+add_executable(PakkerBenchmark benchmarks/PakRuntimeBenchmark.cpp)
+target_link_libraries(PakkerBenchmark PRIVATE ${PROJECT_NAME})
 endif()
