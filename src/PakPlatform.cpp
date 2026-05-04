@@ -1,21 +1,35 @@
 #include "PakPlatform.h"
 
-#ifndef PAK_NO_MMAP
+#include <cstdlib>
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
-#else
-#include <sys/types.h>
-#include <sys/stat.h>
-#include <sys/mman.h>
-#include <fcntl.h>
-#include <unistd.h>
 #endif
 
+#ifndef _WIN32
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+#ifdef __APPLE__
+#include <sys/uio.h>
+#endif
+#endif
+
+#ifndef PAK_NO_MMAP
+
+#ifndef _WIN32
+#include <sys/mman.h>
+#endif
+
+#endif // PAK_NO_MMAP
+
 namespace PakPlatform {
+
+#ifndef PAK_NO_MMAP
 
 #ifdef _WIN32
 
@@ -144,16 +158,79 @@ bool PrefetchMappedRange(const MappedFile& mf, uint64_t offset, uint64_t size)
 
 #endif // _WIN32
 
-} // namespace PakPlatform
-
 #else // PAK_NO_MMAP
-
-namespace PakPlatform {
 
 MappedFile MapFileReadOnly(const char*) { return {}; }
 void UnmapFile(MappedFile& mf) { mf = {}; }
 bool PrefetchMappedRange(const MappedFile&, uint64_t, uint64_t) { return false; }
 
-} // namespace PakPlatform
-
 #endif // PAK_NO_MMAP
+
+bool PrefetchFileRange(const char* path, uint64_t offset, uint64_t size)
+{
+    if (!path || size == 0) return true;
+
+#if defined(__EMSCRIPTEN__) || defined(_WIN32)
+    (void)offset;
+    return true;
+#elif defined(__APPLE__)
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return false;
+
+    radvisory advice{};
+    advice.ra_offset = static_cast<off_t>(offset);
+    advice.ra_count = static_cast<int>(size > static_cast<uint64_t>(INT32_MAX) ? INT32_MAX : size);
+    int result = fcntl(fd, F_RDADVISE, &advice);
+    close(fd);
+    return result == 0;
+#elif defined(__ANDROID__)
+#if defined(__ANDROID_API__) && __ANDROID_API__ >= 21
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return false;
+
+    int result = posix_fadvise(fd, static_cast<off_t>(offset),
+                               static_cast<off_t>(size), POSIX_FADV_WILLNEED);
+    close(fd);
+    return result == 0;
+#else
+    (void)offset;
+    return true;
+#endif
+#elif defined(__linux__)
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return false;
+
+    int result = posix_fadvise(fd, static_cast<off_t>(offset),
+                               static_cast<off_t>(size), POSIX_FADV_WILLNEED);
+    close(fd);
+    return result == 0;
+#else
+    (void)offset;
+    return true;
+#endif
+}
+
+std::string GetDefaultCacheDirectory()
+{
+#if defined(__EMSCRIPTEN__) || defined(__ANDROID__)
+    return {};
+#elif defined(_WIN32)
+    char buffer[32768];
+    DWORD length = GetEnvironmentVariableA("LOCALAPPDATA", buffer, static_cast<DWORD>(sizeof(buffer)));
+    if (length == 0 || length >= sizeof(buffer)) return {};
+    return std::string(buffer, length) + "\\Pakker\\Cache";
+#elif defined(__APPLE__)
+    const char* home = std::getenv("HOME");
+    if (!home || !*home) return {};
+    return std::string(home) + "/Library/Caches/Pakker";
+#else
+    const char* xdg = std::getenv("XDG_CACHE_HOME");
+    if (xdg && *xdg) return std::string(xdg) + "/Pakker";
+
+    const char* home = std::getenv("HOME");
+    if (!home || !*home) return {};
+    return std::string(home) + "/.cache/Pakker";
+#endif
+}
+
+} // namespace PakPlatform

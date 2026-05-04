@@ -23,6 +23,13 @@ static fs::path TestRoot()
     return root;
 }
 
+static PakCacheOptions TestCacheOptions(const fs::path& root)
+{
+    PakCacheOptions options;
+    options.persistentCacheDirectory = (root / "cache").string();
+    return options;
+}
+
 static void RuntimeHandleApi()
 {
     fs::path root = TestRoot();
@@ -49,6 +56,7 @@ static void RuntimeHandleApi()
     }
 
     PakReader reader;
+    reader.SetCacheOptions(TestCacheOptions(root));
     assert(reader.Open(pakPath.string()));
     assert(reader.GetFileCount() == files.size());
 
@@ -141,6 +149,7 @@ static void ExtensionDoesNotBlockCompression()
     assert(pakker.CreatePak(pakPath.string(), files, options));
 
     PakReader reader;
+    reader.SetCacheOptions(TestCacheOptions(root));
     assert(reader.Open(pakPath.string()));
 
     PakFileHandle handle = reader.Find("textures/fake.png");
@@ -174,6 +183,7 @@ static void OldVersionRejected()
     stream.close();
 
     PakReader reader;
+    reader.SetCacheOptions(TestCacheOptions(root));
     assert(!reader.Open(pakPath.string()));
     assert(!pakker.ValidatePak(pakPath.string()));
 }
@@ -206,6 +216,7 @@ static void CorruptArchiveFailsOpen()
     stream.close();
 
     PakReader reader;
+    reader.SetCacheOptions(TestCacheOptions(root));
     assert(!reader.Open(pakPath.string()));
 }
 
@@ -221,9 +232,178 @@ static void EmptyArchiveOpens()
     assert(pakker.ValidatePak(pakPath.string()));
 
     PakReader reader;
+    reader.SetCacheOptions(TestCacheOptions(root));
     assert(reader.Open(pakPath.string()));
     assert(reader.GetFileCount() == 0);
     assert(!reader.Find("anything.bin"));
+}
+
+static void MemoryCacheStoresDecodedEntries()
+{
+    fs::path root = TestRoot();
+    fs::path pakPath = root / "memory_cache.pak";
+
+    std::map<std::string, std::vector<uint8_t>> files;
+    files["compressed/repeated.bin"] = std::vector<uint8_t>(8192, 9);
+
+    PakOptions pakOptions;
+    pakOptions.compress = true;
+
+    Pakker pakker;
+    assert(pakker.CreatePak(pakPath.string(), files, pakOptions));
+
+    PakCacheOptions cacheOptions = TestCacheOptions(root);
+    cacheOptions.persistentCacheEnabled = false;
+    cacheOptions.memoryBudgetBytes = 1024 * 1024;
+
+    PakReader reader;
+    reader.SetCacheOptions(cacheOptions);
+    assert(reader.Open(pakPath.string()));
+
+    PakFileHandle handle = reader.Find("compressed/repeated.bin");
+    assert(handle);
+
+    std::vector<uint8_t> loaded;
+    assert(reader.Load(handle, loaded) == PakStatus::Ok);
+    assert(loaded == files["compressed/repeated.bin"]);
+
+    PakCacheStats afterFirst = reader.GetCacheStats();
+    assert(afterFirst.sourceReads == 1);
+    assert(afterFirst.memoryStores == 1);
+    assert(afterFirst.memoryBytes == files["compressed/repeated.bin"].size());
+
+    loaded.clear();
+    assert(reader.Load(handle, loaded) == PakStatus::Ok);
+    assert(loaded == files["compressed/repeated.bin"]);
+
+    PakCacheStats afterSecond = reader.GetCacheStats();
+    assert(afterSecond.memoryHits == 1);
+    assert(afterSecond.sourceReads == 1);
+
+    reader.ClearMemoryCache();
+    assert(reader.GetCacheStats().memoryBytes == 0);
+}
+
+static void PersistentCacheSurvivesReaderReopen()
+{
+    fs::path root = TestRoot();
+    fs::path pakPath = root / "persistent_cache.pak";
+
+    std::map<std::string, std::vector<uint8_t>> files;
+    files["compressed/payload.bin"] = std::vector<uint8_t>(8192, 5);
+
+    PakOptions pakOptions;
+    pakOptions.compress = true;
+
+    Pakker pakker;
+    assert(pakker.CreatePak(pakPath.string(), files, pakOptions));
+
+    PakCacheOptions cacheOptions = TestCacheOptions(root);
+    cacheOptions.memoryCacheEnabled = false;
+
+    {
+        PakReader reader;
+        reader.SetCacheOptions(cacheOptions);
+        assert(reader.Open(pakPath.string()));
+        PakFileHandle handle = reader.Find("compressed/payload.bin");
+        assert(handle);
+        std::vector<uint8_t> loaded;
+        assert(reader.Load(handle, loaded) == PakStatus::Ok);
+        assert(loaded == files["compressed/payload.bin"]);
+        PakCacheStats stats = reader.GetCacheStats();
+        assert(stats.sourceReads == 1);
+        assert(stats.persistentStores == 1);
+    }
+
+    {
+        PakReader reader;
+        reader.SetCacheOptions(cacheOptions);
+        assert(reader.Open(pakPath.string()));
+        PakFileHandle handle = reader.Find("compressed/payload.bin");
+        assert(handle);
+        std::vector<uint8_t> loaded;
+        assert(reader.Load(handle, loaded) == PakStatus::Ok);
+        assert(loaded == files["compressed/payload.bin"]);
+        PakCacheStats stats = reader.GetCacheStats();
+        assert(stats.persistentHits == 1);
+        assert(stats.sourceReads == 0);
+    }
+}
+
+static void PersistentCacheInvalidatesWhenSourceChanges()
+{
+    fs::path root = TestRoot();
+    fs::path pakPath = root / "persistent_invalidation.pak";
+
+    PakOptions pakOptions;
+    pakOptions.compress = true;
+
+    PakCacheOptions cacheOptions = TestCacheOptions(root);
+    cacheOptions.memoryCacheEnabled = false;
+
+    Pakker pakker;
+    std::map<std::string, std::vector<uint8_t>> firstFiles;
+    firstFiles["compressed/value.bin"] = std::vector<uint8_t>(8192, 1);
+    assert(pakker.CreatePak(pakPath.string(), firstFiles, pakOptions));
+
+    {
+        PakReader reader;
+        reader.SetCacheOptions(cacheOptions);
+        assert(reader.Open(pakPath.string()));
+        PakFileHandle handle = reader.Find("compressed/value.bin");
+        assert(handle);
+        std::vector<uint8_t> loaded;
+        assert(reader.Load(handle, loaded) == PakStatus::Ok);
+        assert(loaded == firstFiles["compressed/value.bin"]);
+    }
+
+    std::map<std::string, std::vector<uint8_t>> secondFiles;
+    secondFiles["compressed/value.bin"] = std::vector<uint8_t>(8192, 2);
+    assert(pakker.CreatePak(pakPath.string(), secondFiles, pakOptions));
+
+    PakReader reader;
+    reader.SetCacheOptions(cacheOptions);
+    assert(reader.Open(pakPath.string()));
+    PakFileHandle handle = reader.Find("compressed/value.bin");
+    assert(handle);
+    std::vector<uint8_t> loaded;
+    assert(reader.Load(handle, loaded) == PakStatus::Ok);
+    assert(loaded == secondFiles["compressed/value.bin"]);
+
+    PakCacheStats stats = reader.GetCacheStats();
+    assert(stats.persistentHits == 0);
+    assert(stats.sourceReads == 1);
+}
+
+static void ZeroCopyFallbackSpanKeepsCachedDataAlive()
+{
+    fs::path root = TestRoot();
+    fs::path pakPath = root / "span_cache_lifetime.pak";
+
+    std::map<std::string, std::vector<uint8_t>> files;
+    files["compressed/span.bin"] = std::vector<uint8_t>(4096, 11);
+
+    PakOptions pakOptions;
+    pakOptions.compress = true;
+
+    Pakker pakker;
+    assert(pakker.CreatePak(pakPath.string(), files, pakOptions));
+
+    PakSpan span;
+    {
+        PakReader reader;
+        reader.SetCacheOptions(TestCacheOptions(root));
+        assert(reader.Open(pakPath.string()));
+        span = reader.ReadFileZeroCopy("compressed/span.bin");
+        assert(span);
+        assert(span.ownsData);
+        assert(span.size == files["compressed/span.bin"].size());
+        assert(span.data[0] == 11);
+        reader.Close();
+    }
+
+    assert(span.data[0] == 11);
+    assert(span.data[span.size - 1] == 11);
 }
 
 int main()
@@ -233,5 +413,9 @@ int main()
     OldVersionRejected();
     CorruptArchiveFailsOpen();
     EmptyArchiveOpens();
+    MemoryCacheStoresDecodedEntries();
+    PersistentCacheSurvivesReaderReopen();
+    PersistentCacheInvalidatesWhenSourceChanges();
+    ZeroCopyFallbackSpanKeepsCachedDataAlive();
     return 0;
 }

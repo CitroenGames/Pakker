@@ -175,6 +175,37 @@ struct PakOptions {
 };
 
 // ---------------------------------------------------------------------------
+// PakCacheOptions -- runtime decoded asset cache policy
+// ---------------------------------------------------------------------------
+
+struct PakCacheOptions {
+    bool enabled = true;
+    bool memoryCacheEnabled = true;
+    bool persistentCacheEnabled = true;
+    uint64_t memoryBudgetBytes = 64ull * 1024ull * 1024ull;
+    uint64_t persistentBudgetBytes = 512ull * 1024ull * 1024ull;
+    uint64_t maxSingleEntryBytes = 64ull * 1024ull * 1024ull;
+
+    // Empty means use PakPlatform::GetDefaultCacheDirectory(). Android and Web
+    // return no default, so apps should provide their own writable cache path.
+    std::string persistentCacheDirectory;
+};
+
+struct PakCacheStats {
+    uint64_t memoryHits = 0;
+    uint64_t memoryMisses = 0;
+    uint64_t persistentHits = 0;
+    uint64_t persistentMisses = 0;
+    uint64_t sourceReads = 0;
+    uint64_t memoryStores = 0;
+    uint64_t persistentStores = 0;
+    uint64_t memoryEvictions = 0;
+    uint64_t persistentEvictions = 0;
+    uint64_t memoryBytes = 0;
+    uint64_t persistentBytes = 0;
+};
+
+// ---------------------------------------------------------------------------
 // PakSpan -- non-owning or owning view into asset data
 //
 // When PakReader uses memory-mapped I/O and the file is uncompressed +
@@ -195,20 +226,22 @@ struct PakSpan {
     explicit operator bool() const { return data != nullptr && size > 0; }
 
     PakSpan() = default;
-    ~PakSpan() { if (ownsData && data) delete[] data; }
+    ~PakSpan() { if (ownsData && data && !cachedDataRef_) delete[] data; }
 
     PakSpan(PakSpan&& o) noexcept
         : data(o.data), size(o.size), ownsData(o.ownsData),
-          mappingRef_(std::move(o.mappingRef_))
+          mappingRef_(std::move(o.mappingRef_)),
+          cachedDataRef_(std::move(o.cachedDataRef_))
     {
         o.data = nullptr; o.size = 0; o.ownsData = false;
     }
 
     PakSpan& operator=(PakSpan&& o) noexcept {
         if (this != &o) {
-            if (ownsData && data) delete[] data;
+            if (ownsData && data && !cachedDataRef_) delete[] data;
             data = o.data; size = o.size; ownsData = o.ownsData;
             mappingRef_ = std::move(o.mappingRef_);
+            cachedDataRef_ = std::move(o.cachedDataRef_);
             o.data = nullptr; o.size = 0; o.ownsData = false;
         }
         return *this;
@@ -221,6 +254,7 @@ private:
     friend class PakReader;
     // Keeps the mapped file alive for non-owning spans
     std::shared_ptr<PakInternal::MappedFileGuard> mappingRef_;
+    std::shared_ptr<const std::vector<uint8_t>> cachedDataRef_;
 };
 
 // ---------------------------------------------------------------------------
@@ -372,7 +406,40 @@ public:
     // Query whether memory-mapped I/O is active
     bool IsMapped() const;
 
+    // Runtime decoded cache control. Caching is enabled by default with
+    // conservative budgets; View() remains mmap-only and does not return cache
+    // storage.
+    void SetCacheOptions(const PakCacheOptions& options);
+    PakCacheOptions GetCacheOptions() const;
+    PakCacheStats GetCacheStats() const;
+    void ClearMemoryCache();
+    bool ClearPersistentCache();
+    bool ClearCache();
+
 private:
+    struct CacheKey {
+        uint64_t high = 0;
+        uint64_t low = 0;
+
+        friend bool operator==(CacheKey a, CacheKey b) {
+            return a.high == b.high && a.low == b.low;
+        }
+    };
+
+    struct CacheKeyHash {
+        size_t operator()(CacheKey key) const noexcept {
+            uint64_t mixed = key.high ^ (key.low + 0x9e3779b97f4a7c15ull +
+                                         (key.high << 6) + (key.high >> 2));
+            return static_cast<size_t>(mixed);
+        }
+    };
+
+    struct DecodedCacheEntry {
+        std::shared_ptr<const std::vector<uint8_t>> data;
+        uint64_t size = 0;
+        uint64_t lastUse = 0;
+    };
+
     struct RuntimeTable {
         std::vector<PakInternal::PakEntry> entries;
         std::vector<PakFileInfo> infos;
@@ -386,6 +453,8 @@ private:
         std::shared_ptr<PakInternal::MappedFileGuard> guard;
         bool useMmap = false;
         uint64_t fileSize = 0;
+        uint64_t archiveFingerprint = 0;
+        std::string pakFilename;
     };
 
     static bool NeedsPathNormalization(std::string_view path);
@@ -393,9 +462,34 @@ private:
     static PakFileHandle FindInTable(const RuntimeTable& table, std::string_view filename);
 
     PakStatus CaptureReadContext(PakFileHandle handle, ReadContext& context) const;
+    PakStatus ValidateReadRequest(const PakInternal::PakEntry& entry,
+        uint64_t destinationSize, const ReadContext& context) const;
     PakStatus ReadEntryToBuffer(const PakInternal::PakEntry& entry,
         std::span<uint8_t> destination, uint64_t* bytesWritten,
         const ReadContext& context) const;
+    PakStatus ReadEntryWithCache(PakFileHandle handle, const PakInternal::PakEntry& entry,
+        std::span<uint8_t> destination, uint64_t* bytesWritten,
+        const ReadContext& context) const;
+
+    bool ShouldCacheDecoded(const PakInternal::PakEntry& entry,
+        const ReadContext& context, const PakCacheOptions& options) const;
+    CacheKey MakeCacheKey(PakFileHandle handle, const PakInternal::PakEntry& entry,
+        const ReadContext& context, uint64_t sourceHash) const;
+    PakStatus HashEntrySourceBytes(const PakInternal::PakEntry& entry,
+        const ReadContext& context, uint64_t& outHash) const;
+    bool TryGetMemoryCache(CacheKey key,
+        std::shared_ptr<const std::vector<uint8_t>>& outData) const;
+    void StoreMemoryCache(CacheKey key,
+        std::shared_ptr<const std::vector<uint8_t>> data) const;
+    bool TryLoadPersistentCache(CacheKey key,
+        std::shared_ptr<const std::vector<uint8_t>>& outData) const;
+    void StorePersistentCache(CacheKey key,
+        const std::vector<uint8_t>& data) const;
+    void ResolvePersistentCacheDirectoryLocked() const;
+    void TrimMemoryCacheLocked() const;
+    void TrimPersistentCache() const;
+    std::string PersistentCachePathLocked(CacheKey key) const;
+    bool HasPersistentCacheDirectoryLocked() const;
 
     std::string encryptionKey_;
     mutable std::ifstream pakStream_;
@@ -412,10 +506,18 @@ private:
     std::shared_ptr<PakInternal::MappedFileGuard> mappedGuard_;
     bool useMmap_ = false;
     uint32_t alignment_ = 1;
+    uint64_t archiveFingerprint_ = 0;
 
     // Thread safety
     mutable std::shared_mutex mutex_;
     mutable std::mutex streamMutex_;
+    mutable std::mutex cacheMutex_;
+    mutable PakCacheOptions cacheOptions_{};
+    mutable PakCacheStats cacheStats_{};
+    mutable std::unordered_map<CacheKey, DecodedCacheEntry, CacheKeyHash> memoryCache_;
+    mutable uint64_t memoryCacheBytes_ = 0;
+    mutable uint64_t cacheUseCounter_ = 0;
+    mutable std::string effectivePersistentCacheDirectory_;
 };
 
 #endif // PAK_H

@@ -10,6 +10,7 @@ Pakker is a high-performance asset archive library designed for 3D game engines.
 - **Caller-owned reads** -- `Read(handle, span)` fills engine-owned buffers and reports precise `PakStatus` errors
 - **Page-aligned data** (v4 format) -- file data aligned to configurable boundaries (16 B, 4 KB, 64 KB) for efficient page faults and GPU upload
 - **Thread-safe PakReader** -- `shared_mutex` allows concurrent reads from multiple threads; ideal for asset streaming on worker threads
+- **Hybrid decoded caching** -- OS page cache/mmap remains the fast path, with default in-memory and persistent decoded caches for compressed, encrypted, and non-mmap reads
 - **O(1) file lookup** via hash map -- no linear scanning
 - **LZ4 per-file compression** -- fast decompression (~4 GB/s); each entry records whether it needs decompression
 - **Silent by default** -- no console output unless you set a log callback
@@ -54,6 +55,12 @@ reader.Open("assets.pak");
 // Check if mmap is active
 if (reader.IsMapped())
     std::cout << "Using memory-mapped I/O" << std::endl;
+
+// Optional tuning: caching is enabled by default with conservative budgets.
+PakCacheOptions cacheOptions;
+cacheOptions.memoryBudgetBytes = 128ull * 1024ull * 1024ull;
+cacheOptions.persistentCacheDirectory = "my/game/cache"; // useful on Android/Web
+reader.SetCacheOptions(cacheOptions);
 
 // Resolve once during asset registration/loading
 PakFileHandle texture = reader.Find("textures/diffuse.dds");
@@ -191,6 +198,7 @@ void AssetStreamWorker(PakReader& reader, AssetQueue& queue) {
 | `GetFileCount()` | Returns cached count, no disk I/O |
 | `GetFileInfo(name)` | Convenience lookup for size, compression info |
 | `ReadFile`, `LoadFile`, `ReadFileZeroCopy`, `ReadFiles` | Convenience wrappers |
+| `SetCacheOptions`, `GetCacheStats`, `ClearCache` | Tune and inspect decoded asset caching |
 
 ### PakView
 
@@ -208,6 +216,25 @@ void AssetStreamWorker(PakReader& reader, AssetQueue& queue) {
 |-------|------|---------|-------------|
 | `compress` | `bool` | `false` | Enable LZ4 per-file compression |
 | `alignment` | `uint32_t` | `16` | Data alignment in bytes (must be power of 2) |
+
+### PakCacheOptions
+
+Runtime decoded caching is enabled by default:
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | `bool` | `true` | Master switch for decoded caching |
+| `memoryCacheEnabled` | `bool` | `true` | Keep decoded entries in process memory |
+| `persistentCacheEnabled` | `bool` | `true` | Store decoded entries in a platform cache directory |
+| `memoryBudgetBytes` | `uint64_t` | `64 MiB` | LRU memory cache budget |
+| `persistentBudgetBytes` | `uint64_t` | `512 MiB` | LRU persistent cache budget |
+| `maxSingleEntryBytes` | `uint64_t` | `64 MiB` | Largest decoded entry eligible for caching |
+| `persistentCacheDirectory` | `std::string` | empty | Empty uses the OS default when available |
+
+`View()` remains mmap-only and never returns decoded cache storage. `Read()` and
+`Load()` cache decoded data for compressed, encrypted, and non-mmap reads. On
+Android and Web, set `persistentCacheDirectory` to an app-owned writable path if
+you want persistent caching; otherwise memory caching still works.
 
 ## PAK Format
 
@@ -270,6 +297,7 @@ Internally:
 | Batch resolve | O(1) handle lookup per name | O(1) handle lookup per name |
 | Parallel reads | Dispatch cached handles through engine jobs | Serialized by stream mutex |
 | Concurrent reads | Fully parallel | Serialized through mutex |
+| Repeated compressed/encrypted reads | Decoded memory/persistent cache | Decoded memory/persistent cache |
 
 ## Build Options
 
