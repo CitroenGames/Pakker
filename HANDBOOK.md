@@ -18,7 +18,11 @@ The current archive format is v4-only.
 | Path | Purpose |
 |------|---------|
 | `src/Pak.h` | Public API, archive structures, runtime handles, cache options, and thread-safety contract |
-| `src/Pak.cpp` | Core implementation for archive creation, extraction, lookup, reading, decompression, encryption, and caching |
+| `src/PakInternal.h` | Private implementation header: LZ4 size limit and FNV fingerprint/hash helpers shared across the files below |
+| `src/PakCommon.cpp` | Shared archive-format contract: logging, path/filename validation, header and file-table I/O, encryption |
+| `src/PakBuilder.cpp` | `Pakker` build-time API: create, extract, list, validate, and modify PAK files |
+| `src/PakReaderCore.cpp` | `PakReader` lifecycle, handle lookup, core read dispatch, and convenience wrappers |
+| `src/PakReaderCache.cpp` | `PakReader` decoded-cache subsystem: memory LRU, persistent disk cache, cache-key generation |
 | `src/PakPlatform.h` | Small platform abstraction for mmap, prefetch hints, and default cache directory discovery |
 | `src/PakPlatform.cpp` | Windows/POSIX platform implementation and `PAK_NO_MMAP` fallback |
 | `src/vendor/lz4.c`, `src/vendor/lz4.h` | Vendored LZ4 dependency used for per-file compression |
@@ -265,7 +269,8 @@ For platform changes, verify:
 ### Add A Runtime API
 
 1. Add the public declaration to `src/Pak.h`.
-2. Implement in `src/Pak.cpp`.
+2. Implement in `src/PakReaderCore.cpp` (or `src/PakReaderCache.cpp` for
+   cache-related runtime APIs).
 3. Decide whether it is handle-based, path-based, or both.
 4. Preserve thread-safety by capturing immutable read context before I/O.
 5. Add or extend tests in `tests/PakRuntimeTests.cpp`.
