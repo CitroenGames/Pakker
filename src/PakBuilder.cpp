@@ -1,11 +1,10 @@
 #include "Pak.h"
 #include "PakInternal.h"
+#include "PakCompression.h"
 #include <filesystem>
 #include <algorithm>
 #include <unordered_set>
 #include <sstream>
-
-#include "vendor/lz4.h"
 
 namespace fs = std::filesystem;
 
@@ -86,7 +85,7 @@ bool Pakker::CreatePak(const std::string& pakFilename,
     }
 
     PakHeader header;
-    header.version = PAK_VERSION_5;
+    header.version = PAK_VERSION_6;
     header.numFiles = static_cast<uint32_t>(files.size());
     header.fileTableOffset = 0;
     header.alignment = alignment;
@@ -122,25 +121,15 @@ bool Pakker::CreatePak(const std::string& pakFilename,
         uint8_t flags = 0;
         uint64_t originalSize = data.size();
 
-        if (options.compress && !data.empty()) {
-            if (data.size() > LZ4_MAX_SAFE_SIZE) {
-                Log(PakLogLevel::Warning, "CreatePak: File too large for LZ4, storing uncompressed: " + normalizedFilename);
-            } else {
-                int maxCompressed = LZ4_compressBound(static_cast<int>(data.size()));
-                compressBuffer.resize(maxCompressed);
-                int compressedSize = LZ4_compress_default(
-                    reinterpret_cast<const char*>(data.data()),
-                    reinterpret_cast<char*>(compressBuffer.data()),
-                    static_cast<int>(data.size()),
-                    maxCompressed);
-
-                if (compressedSize > 0 &&
-                    static_cast<uint64_t>(compressedSize) < originalSize) {
-                    compressBuffer.resize(compressedSize);
-                    writePtr = compressBuffer.data();
-                    writeSize = compressedSize;
-                    flags = PAK_FLAG_COMPRESSED;
-                }
+        if (options.compression != PakCompression::None && !data.empty()) {
+            if (!CompressBuffer(options.compression, options.zstdLevel,
+                                data.data(), data.size(), compressBuffer, flags)) {
+                Log(PakLogLevel::Error, "CreatePak: Compression failed for: " + normalizedFilename);
+                return false;
+            }
+            if (flags != 0) {
+                writePtr = compressBuffer.data();
+                writeSize = compressBuffer.size();
             }
         }
 
@@ -240,18 +229,11 @@ bool Pakker::ExtractPak(const std::string& pakFilename, const std::string& outpu
 
         EncryptDecrypt(fileData, encryptionKey_);
 
-        if (entry.flags & PAK_FLAG_COMPRESSED) {
-            if (entry.originalSize > LZ4_MAX_SAFE_SIZE || fileData.size() > LZ4_MAX_SAFE_SIZE) {
-                Log(PakLogLevel::Error, "ExtractPak: Entry exceeds LZ4 size limit: " + entry.filename);
-                return false;
-            }
+        if (IsCompressed(entry.flags)) {
             std::vector<uint8_t> decompressed(entry.originalSize);
-            int result = LZ4_decompress_safe(
-                reinterpret_cast<const char*>(fileData.data()),
-                reinterpret_cast<char*>(decompressed.data()),
-                static_cast<int>(fileData.size()),
-                static_cast<int>(entry.originalSize));
-            if (result < 0 || static_cast<uint64_t>(result) != entry.originalSize) {
+            PakStatus status = DecompressBuffer(entry.flags, fileData.data(), fileData.size(),
+                                                decompressed.data(), entry.originalSize);
+            if (status != PakStatus::Ok) {
                 Log(PakLogLevel::Error, "ExtractPak: Decompression failed for: " + entry.filename);
                 return false;
             }
@@ -302,8 +284,9 @@ bool Pakker::ListPak(const std::string& pakFilename) const
         oss << " - " << entry.filename
             << " (Offset: " << entry.offset
             << ", Size: " << entry.originalSize << " bytes";
-        if (entry.flags & PAK_FLAG_COMPRESSED) {
-            oss << ", Compressed: " << entry.compressedSize << " bytes";
+        if (IsCompressed(entry.flags)) {
+            oss << ", Compressed (" << (entry.flags & PAK_FLAG_ZSTD_COMPRESSED ? "Zstd" : "LZ4")
+                << "): " << entry.compressedSize << " bytes";
         }
         oss << ")";
         Log(PakLogLevel::Info, oss.str());
@@ -394,18 +377,11 @@ std::vector<uint8_t> Pakker::ReadFileFromPak(const std::string& pakFilename,
 
             EncryptDecrypt(fileData, encryptionKey_);
 
-            if (entry.flags & PAK_FLAG_COMPRESSED) {
-                if (entry.originalSize > LZ4_MAX_SAFE_SIZE || fileData.size() > LZ4_MAX_SAFE_SIZE) {
-                    Log(PakLogLevel::Error, "ReadFileFromPak: Entry exceeds LZ4 size limit: " + entry.filename);
-                    return {};
-                }
+            if (IsCompressed(entry.flags)) {
                 std::vector<uint8_t> decompressed(entry.originalSize);
-                int result = LZ4_decompress_safe(
-                    reinterpret_cast<const char*>(fileData.data()),
-                    reinterpret_cast<char*>(decompressed.data()),
-                    static_cast<int>(fileData.size()),
-                    static_cast<int>(entry.originalSize));
-                if (result < 0 || static_cast<uint64_t>(result) != entry.originalSize) {
+                PakStatus status = DecompressBuffer(entry.flags, fileData.data(), fileData.size(),
+                                                    decompressed.data(), entry.originalSize);
+                if (status != PakStatus::Ok) {
                     Log(PakLogLevel::Error, "ReadFileFromPak: Decompression failed for: " + entry.filename);
                     return {};
                 }
@@ -430,7 +406,8 @@ std::shared_ptr<std::vector<uint8_t>> Pakker::LoadFile(const std::string& pakFil
 bool Pakker::AddFileToPak(const std::string& pakFilename,
                           const std::string& filename,
                           const std::vector<uint8_t>& data,
-                          bool compress)
+                          PakCompression compression,
+                          int zstdLevel)
 {
     std::string normalizedFilename = NormalizePathSeparators(filename);
     if (!IsValidFilename(normalizedFilename)) {
@@ -493,25 +470,14 @@ bool Pakker::AddFileToPak(const std::string& pakFilename,
     std::vector<uint8_t> compressBuffer;
 
     // Compress if requested and the file is compressible
-    if (compress && !data.empty()) {
-        if (data.size() > LZ4_MAX_SAFE_SIZE) {
-            Log(PakLogLevel::Warning, "AddFileToPak: File too large for LZ4, storing uncompressed: " + normalizedFilename);
-        } else {
-            int maxCompressed = LZ4_compressBound(static_cast<int>(data.size()));
-            compressBuffer.resize(maxCompressed);
-            int compressedSize = LZ4_compress_default(
-                reinterpret_cast<const char*>(data.data()),
-                reinterpret_cast<char*>(compressBuffer.data()),
-                static_cast<int>(data.size()),
-                maxCompressed);
-
-            if (compressedSize > 0 &&
-                static_cast<uint64_t>(compressedSize) < originalSize) {
-                compressBuffer.resize(compressedSize);
-                writePtr = compressBuffer.data();
-                writeSize = compressedSize;
-                flags = PAK_FLAG_COMPRESSED;
-            }
+    if (compression != PakCompression::None && !data.empty()) {
+        if (!CompressBuffer(compression, zstdLevel, data.data(), data.size(), compressBuffer, flags)) {
+            Log(PakLogLevel::Error, "AddFileToPak: Compression failed for: " + normalizedFilename);
+            return false;
+        }
+        if (flags != 0) {
+            writePtr = compressBuffer.data();
+            writeSize = compressBuffer.size();
         }
     }
 
@@ -606,7 +572,7 @@ bool Pakker::CreatePakFromFolder(const std::string& pakFilename,
     }
 
     PakHeader header;
-    header.version = PAK_VERSION_5;
+    header.version = PAK_VERSION_6;
     header.numFiles = static_cast<uint32_t>(filePaths.size());
     header.fileTableOffset = 0;
     header.alignment = alignment;
@@ -653,25 +619,15 @@ bool Pakker::CreatePakFromFolder(const std::string& pakFilename,
         uint8_t flags = 0;
         uint64_t originalSize = data.size();
 
-        if (options.compress && !data.empty()) {
-            if (data.size() > LZ4_MAX_SAFE_SIZE) {
-                Log(PakLogLevel::Warning, "CreatePakFromFolder: File too large for LZ4, storing uncompressed: " + normalizedName);
-            } else {
-                int maxCompressed = LZ4_compressBound(static_cast<int>(data.size()));
-                compressBuffer.resize(maxCompressed);
-                int compressedSize = LZ4_compress_default(
-                    reinterpret_cast<const char*>(data.data()),
-                    reinterpret_cast<char*>(compressBuffer.data()),
-                    static_cast<int>(data.size()),
-                    maxCompressed);
-
-                if (compressedSize > 0 &&
-                    static_cast<uint64_t>(compressedSize) < originalSize) {
-                    compressBuffer.resize(compressedSize);
-                    writePtr = compressBuffer.data();
-                    writeSize = compressedSize;
-                    flags = PAK_FLAG_COMPRESSED;
-                }
+        if (options.compression != PakCompression::None && !data.empty()) {
+            if (!CompressBuffer(options.compression, options.zstdLevel,
+                                data.data(), data.size(), compressBuffer, flags)) {
+                Log(PakLogLevel::Error, "CreatePakFromFolder: Compression failed for: " + normalizedName);
+                return false;
+            }
+            if (flags != 0) {
+                writePtr = compressBuffer.data();
+                writeSize = compressBuffer.size();
             }
         }
 

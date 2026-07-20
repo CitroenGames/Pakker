@@ -1,5 +1,6 @@
 #include "Pak.h"
 #include "PakInternal.h"
+#include "PakLooseOverlay.h"
 
 // This suite uses assert() to both exercise (call) and verify library
 // behavior in the same expression, e.g. assert(reader.Open(path)). NDEBUG
@@ -59,6 +60,23 @@ static PakInternal::PakEntry ReadSingleEntry(const fs::path& pakPath)
     return entries[0];
 }
 
+// Reads back a named entry from a multi-entry archive's file table.
+static PakInternal::PakEntry ReadEntryByName(const fs::path& pakPath, const std::string& name)
+{
+    std::ifstream stream(pakPath, std::ios::binary);
+    assert(stream);
+    PakInternal::PakHeader header;
+    assert(PakInternal::ReadPakHeader(stream, header));
+    stream.seekg(header.fileTableOffset, std::ios::beg);
+    std::vector<PakInternal::PakEntry> entries;
+    assert(PakInternal::ReadFileTable(stream, header.numFiles, entries));
+    for (auto& e : entries) {
+        if (e.filename == name) return e;
+    }
+    assert(false && "entry not found");
+    return {};
+}
+
 // Flips one bit of the first on-disk byte of an entry, simulating bit-rot /
 // a bad patch without touching the file table (so structural bounds checks
 // still pass -- only content-hash verification should catch this).
@@ -88,7 +106,7 @@ static void RuntimeHandleApi()
     files["compressed/raw.bin"] = std::vector<uint8_t>(4096, 7);
 
     PakOptions options;
-    options.compress = true;
+    options.compression = PakCompression::LZ4;
     options.alignment = 4096;
 
     Pakker pakker;
@@ -98,7 +116,7 @@ static void RuntimeHandleApi()
         std::ifstream stream(pakPath, std::ios::binary);
         PakInternal::PakHeader header;
         assert(PakInternal::ReadPakHeader(stream, header));
-        assert(header.version == PakInternal::PAK_VERSION_5);
+        assert(header.version == PakInternal::PAK_VERSION_6);
     }
 
     PakReader reader;
@@ -189,7 +207,7 @@ static void ExtensionDoesNotBlockCompression()
     files["textures/fake.png"] = std::vector<uint8_t>(4096, 3);
 
     PakOptions options;
-    options.compress = true;
+    options.compression = PakCompression::LZ4;
 
     Pakker pakker;
     assert(pakker.CreatePak(pakPath.string(), files, options));
@@ -221,19 +239,22 @@ static void OldVersionRejected()
     PakOptions options;
     assert(pakker.CreatePak(pakPath.string(), files, options));
 
-    std::fstream stream(pakPath, std::ios::in | std::ios::out | std::ios::binary);
-    assert(stream);
-    stream.seekp(4, std::ios::beg);
-    // PAK_VERSION_4 is the immediately-prior format (no contentHash field) --
-    // confirm it's cleanly rejected now that v5 is the only accepted version.
-    uint32_t oldVersion = PakInternal::PAK_VERSION_4;
-    stream.write(reinterpret_cast<const char*>(&oldVersion), sizeof(oldVersion));
-    stream.close();
+    // PAK_VERSION_4 (no contentHash field) and PAK_VERSION_5 (no Zstd flag
+    // bit) are both immediately-prior formats -- confirm both are cleanly
+    // rejected now that v6 is the only accepted version, same "rebuild from
+    // source" remediation for either.
+    for (uint32_t oldVersion : {PakInternal::PAK_VERSION_4, PakInternal::PAK_VERSION_5}) {
+        std::fstream stream(pakPath, std::ios::in | std::ios::out | std::ios::binary);
+        assert(stream);
+        stream.seekp(4, std::ios::beg);
+        stream.write(reinterpret_cast<const char*>(&oldVersion), sizeof(oldVersion));
+        stream.close();
 
-    PakReader reader;
-    reader.SetCacheOptions(TestCacheOptions(root));
-    assert(!reader.Open(pakPath.string()));
-    assert(!pakker.ValidatePak(pakPath.string()));
+        PakReader reader;
+        reader.SetCacheOptions(TestCacheOptions(root));
+        assert(!reader.Open(pakPath.string()));
+        assert(!pakker.ValidatePak(pakPath.string()));
+    }
 }
 
 static void CorruptArchiveFailsOpen()
@@ -295,7 +316,7 @@ static void MemoryCacheStoresDecodedEntries()
     files["compressed/repeated.bin"] = std::vector<uint8_t>(8192, 9);
 
     PakOptions pakOptions;
-    pakOptions.compress = true;
+    pakOptions.compression = PakCompression::LZ4;
 
     Pakker pakker;
     assert(pakker.CreatePak(pakPath.string(), files, pakOptions));
@@ -332,6 +353,55 @@ static void MemoryCacheStoresDecodedEntries()
     assert(reader.GetCacheStats().memoryBytes == 0);
 }
 
+static void MemoryCacheEvictsLeastRecentlyUsedEntry()
+{
+    fs::path root = TestRoot();
+    fs::path pakPath = root / "memory_cache_lru.pak";
+
+    constexpr size_t entrySize = 4096;
+    std::map<std::string, std::vector<uint8_t>> files;
+    files["a.bin"] = std::vector<uint8_t>(entrySize, 1);
+    files["b.bin"] = std::vector<uint8_t>(entrySize, 2);
+    files["c.bin"] = std::vector<uint8_t>(entrySize, 3);
+
+    PakOptions pakOptions;
+    pakOptions.compression = PakCompression::LZ4;
+
+    Pakker pakker;
+    assert(pakker.CreatePak(pakPath.string(), files, pakOptions));
+
+    PakCacheOptions cacheOptions = TestCacheOptions(root);
+    cacheOptions.persistentCacheEnabled = false;
+    cacheOptions.memoryBudgetBytes = entrySize * 2;
+    cacheOptions.maxSingleEntryBytes = entrySize;
+
+    PakReader reader;
+    reader.SetCacheOptions(cacheOptions);
+    assert(reader.Open(pakPath.string()));
+
+    const PakFileHandle a = reader.Find("a.bin");
+    const PakFileHandle b = reader.Find("b.bin");
+    const PakFileHandle c = reader.Find("c.bin");
+    assert(a && b && c);
+
+    std::vector<uint8_t> loaded;
+    assert(reader.Load(a, loaded) == PakStatus::Ok);
+    assert(reader.Load(b, loaded) == PakStatus::Ok);
+    assert(reader.Load(a, loaded) == PakStatus::Ok); // a is now most recent
+    assert(reader.Load(c, loaded) == PakStatus::Ok); // evicts b
+    assert(reader.Load(a, loaded) == PakStatus::Ok); // must still be cached
+
+    PakCacheStats beforeReloadingB = reader.GetCacheStats();
+    assert(beforeReloadingB.memoryHits == 2);
+    assert(beforeReloadingB.sourceReads == 3);
+    assert(beforeReloadingB.memoryEvictions == 1);
+
+    assert(reader.Load(b, loaded) == PakStatus::Ok);
+    PakCacheStats afterReloadingB = reader.GetCacheStats();
+    assert(afterReloadingB.sourceReads == 4);
+    assert(afterReloadingB.memoryEvictions == 2);
+}
+
 static void PersistentCacheSurvivesReaderReopen()
 {
     fs::path root = TestRoot();
@@ -341,7 +411,7 @@ static void PersistentCacheSurvivesReaderReopen()
     files["compressed/payload.bin"] = std::vector<uint8_t>(8192, 5);
 
     PakOptions pakOptions;
-    pakOptions.compress = true;
+    pakOptions.compression = PakCompression::LZ4;
 
     Pakker pakker;
     assert(pakker.CreatePak(pakPath.string(), files, pakOptions));
@@ -384,7 +454,7 @@ static void PersistentCacheInvalidatesWhenSourceChanges()
     fs::path pakPath = root / "persistent_invalidation.pak";
 
     PakOptions pakOptions;
-    pakOptions.compress = true;
+    pakOptions.compression = PakCompression::LZ4;
 
     PakCacheOptions cacheOptions = TestCacheOptions(root);
     cacheOptions.memoryCacheEnabled = false;
@@ -432,7 +502,7 @@ static void ZeroCopyFallbackSpanKeepsCachedDataAlive()
     files["compressed/span.bin"] = std::vector<uint8_t>(4096, 11);
 
     PakOptions pakOptions;
-    pakOptions.compress = true;
+    pakOptions.compression = PakCompression::LZ4;
 
     Pakker pakker;
     assert(pakker.CreatePak(pakPath.string(), files, pakOptions));
@@ -497,14 +567,14 @@ static void ValidatePakDeepVerifyCatchesCorruptedCompressedEntry()
     files["compressed/data.bin"] = std::vector<uint8_t>(4096, 42);
 
     PakOptions options;
-    options.compress = true;
+    options.compression = PakCompression::LZ4;
 
     Pakker pakker;
     assert(pakker.CreatePak(pakPath.string(), files, options));
     assert(pakker.ValidatePak(pakPath.string(), /*deepVerify=*/true));
 
     PakInternal::PakEntry entry = ReadSingleEntry(pakPath);
-    assert(entry.flags & PakInternal::PAK_FLAG_COMPRESSED);
+    assert(PakInternal::IsCompressed(entry.flags));
     FlipByteAtFileOffset(pakPath, entry.offset);
 
     // Structural validation alone doesn't inspect content bytes.
@@ -527,7 +597,7 @@ static void ValidatePakDeepVerifyCatchesCorruptedUncompressedEntry()
     assert(pakker.ValidatePak(pakPath.string(), /*deepVerify=*/true));
 
     PakInternal::PakEntry entry = ReadSingleEntry(pakPath);
-    assert(!(entry.flags & PakInternal::PAK_FLAG_COMPRESSED));
+    assert(!PakInternal::IsCompressed(entry.flags));
     FlipByteAtFileOffset(pakPath, entry.offset);
 
     assert(pakker.ValidatePak(pakPath.string(), /*deepVerify=*/false));
@@ -545,7 +615,7 @@ static void ValidatePakDeepVerifyPassesOnCleanArchive()
     files["c/empty.bin"] = {};
 
     PakOptions options;
-    options.compress = true;
+    options.compression = PakCompression::LZ4;
 
     Pakker pakker;
     assert(pakker.CreatePak(pakPath.string(), files, options));
@@ -561,7 +631,7 @@ static void VerifyEntryDetectsCorruption()
     files["asset.bin"] = std::vector<uint8_t>(2048, 77);
 
     PakOptions options;
-    options.compress = true;
+    options.compression = PakCompression::LZ4;
 
     Pakker pakker;
     assert(pakker.CreatePak(pakPath.string(), files, options));
@@ -617,7 +687,7 @@ static void VerifyOnReadModeFailsClosedOnMismatch()
     files["asset.bin"] = std::vector<uint8_t>(2048, 55);
 
     PakOptions options;
-    options.compress = true;
+    options.compression = PakCompression::LZ4;
 
     Pakker pakker;
     assert(pakker.CreatePak(pakPath.string(), files, options));
@@ -642,6 +712,40 @@ static void VerifyOnReadModeFailsClosedOnMismatch()
 
     std::vector<uint8_t> loaded;
     assert(reader.Load(handle, loaded) == PakStatus::HashMismatch);
+}
+
+static void VerifyOnReadBypassesDecodedCache()
+{
+    fs::path root = TestRoot();
+    fs::path pakPath = root / "verify_on_read_bypasses_cache.pak";
+
+    std::map<std::string, std::vector<uint8_t>> files;
+    files["asset.bin"] = std::vector<uint8_t>(4096, 27);
+
+    PakOptions options;
+    options.compression = PakCompression::LZ4;
+    Pakker pakker;
+    assert(pakker.CreatePak(pakPath.string(), files, options));
+
+    PakOpenOptions openOptions;
+    openOptions.verifyOnRead = true;
+
+    PakReader reader;
+    reader.SetCacheOptions(TestCacheOptions(root));
+    assert(reader.Open(pakPath.string(), openOptions));
+    PakFileHandle handle = reader.Find("asset.bin");
+    assert(handle);
+
+    std::vector<uint8_t> loaded;
+    assert(reader.Load(handle, loaded) == PakStatus::Ok);
+    assert(reader.Load(handle, loaded) == PakStatus::Ok);
+
+    PakCacheStats stats = reader.GetCacheStats();
+    assert(stats.sourceReads == 2);
+    assert(stats.memoryHits == 0);
+    assert(stats.memoryStores == 0);
+    assert(stats.persistentHits == 0);
+    assert(stats.persistentStores == 0);
 }
 
 static void VerifyOnReadModeOffByDefaultAllowsCorruptedReadThrough()
@@ -892,7 +996,7 @@ static void MountConcurrentReadsAcrossLayers()
     patchFiles["patch_only.bin"] = std::vector<uint8_t>(1024, 4);
 
     PakOptions options;
-    options.compress = true;
+    options.compression = PakCompression::LZ4;
     Pakker pakker;
     assert(pakker.CreatePak(basePak.string(), baseFiles, options));
     assert(pakker.CreatePak(patchPak.string(), patchFiles, options));
@@ -928,6 +1032,405 @@ static void MountConcurrentReadsAcrossLayers()
     assert(!failed.load());
 }
 
+// ---------------------------------------------------------------------------
+// Zstd compression
+// ---------------------------------------------------------------------------
+
+static void ZstdCompressionRoundTrips()
+{
+    fs::path root = TestRoot();
+    fs::path pakPath = root / "zstd_round_trip.pak";
+
+    std::map<std::string, std::vector<uint8_t>> files;
+    files["compressed/data.bin"] = std::vector<uint8_t>(8192, 42);
+
+    PakOptions options;
+    options.compression = PakCompression::Zstd;
+
+    Pakker pakker;
+    assert(pakker.CreatePak(pakPath.string(), files, options));
+
+    PakInternal::PakEntry entry = ReadSingleEntry(pakPath);
+    assert(entry.flags & PakInternal::PAK_FLAG_ZSTD_COMPRESSED);
+    assert(!(entry.flags & PakInternal::PAK_FLAG_LZ4_COMPRESSED));
+    assert(entry.compressedSize < entry.originalSize);
+
+    PakReader reader;
+    reader.SetCacheOptions(TestCacheOptions(root));
+    assert(reader.Open(pakPath.string()));
+    PakFileHandle handle = reader.Find("compressed/data.bin");
+    assert(handle);
+    const PakFileInfo* info = reader.Info(handle);
+    assert(info && info->compressed);
+
+    std::vector<uint8_t> loaded;
+    assert(reader.Load(handle, loaded) == PakStatus::Ok);
+    assert(loaded == files["compressed/data.bin"]);
+}
+
+static void MixedLz4AndZstdEntriesInSameArchive()
+{
+    fs::path root = TestRoot();
+    fs::path pakPath = root / "mixed_codecs.pak";
+
+    std::map<std::string, std::vector<uint8_t>> files;
+    files["lz4.bin"] = std::vector<uint8_t>(4096, 11);
+
+    PakOptions options;
+    options.compression = PakCompression::LZ4;
+
+    Pakker pakker;
+    assert(pakker.CreatePak(pakPath.string(), files, options));
+
+    std::vector<uint8_t> zstdData(4096, 22);
+    assert(pakker.AddFileToPak(pakPath.string(), "zstd.bin", zstdData, PakCompression::Zstd));
+
+    PakInternal::PakEntry lz4Entry = ReadEntryByName(pakPath, "lz4.bin");
+    assert(lz4Entry.flags & PakInternal::PAK_FLAG_LZ4_COMPRESSED);
+    PakInternal::PakEntry zstdEntry = ReadEntryByName(pakPath, "zstd.bin");
+    assert(zstdEntry.flags & PakInternal::PAK_FLAG_ZSTD_COMPRESSED);
+
+    PakReader reader;
+    reader.SetCacheOptions(TestCacheOptions(root));
+    assert(reader.Open(pakPath.string()));
+
+    auto loadedLz4 = reader.LoadFile("lz4.bin");
+    assert(loadedLz4 && *loadedLz4 == files["lz4.bin"]);
+    auto loadedZstd = reader.LoadFile("zstd.bin");
+    assert(loadedZstd && *loadedZstd == zstdData);
+}
+
+static void ValidatePakDeepVerifyCatchesCorruptedZstdEntry()
+{
+    fs::path root = TestRoot();
+    fs::path pakPath = root / "deep_verify_zstd.pak";
+
+    std::map<std::string, std::vector<uint8_t>> files;
+    files["zstd/data.bin"] = std::vector<uint8_t>(4096, 9);
+
+    PakOptions options;
+    options.compression = PakCompression::Zstd;
+
+    Pakker pakker;
+    assert(pakker.CreatePak(pakPath.string(), files, options));
+    assert(pakker.ValidatePak(pakPath.string(), /*deepVerify=*/true));
+
+    PakInternal::PakEntry entry = ReadSingleEntry(pakPath);
+    assert(entry.flags & PakInternal::PAK_FLAG_ZSTD_COMPRESSED);
+    FlipByteAtFileOffset(pakPath, entry.offset);
+
+    assert(pakker.ValidatePak(pakPath.string(), /*deepVerify=*/false));
+    assert(!pakker.ValidatePak(pakPath.string(), /*deepVerify=*/true));
+}
+
+static void VerifyOnReadModeFailsClosedOnZstdMismatch()
+{
+    fs::path root = TestRoot();
+    fs::path pakPath = root / "verify_on_read_zstd_mismatch.pak";
+
+    std::map<std::string, std::vector<uint8_t>> files;
+    files["asset.bin"] = std::vector<uint8_t>(2048, 66);
+
+    PakOptions options;
+    options.compression = PakCompression::Zstd;
+
+    Pakker pakker;
+    assert(pakker.CreatePak(pakPath.string(), files, options));
+
+    PakInternal::PakEntry entry = ReadSingleEntry(pakPath);
+    FlipByteAtFileOffset(pakPath, entry.offset);
+
+    PakOpenOptions openOptions;
+    openOptions.verifyOnRead = true;
+
+    PakReader reader;
+    reader.SetCacheOptions(TestCacheOptions(root));
+    assert(reader.Open(pakPath.string(), openOptions));
+
+    PakFileHandle handle = reader.Find("asset.bin");
+    assert(handle);
+
+    std::vector<uint8_t> loaded;
+    assert(reader.Load(handle, loaded) == PakStatus::HashMismatch);
+}
+
+// ---------------------------------------------------------------------------
+// PakReader enumeration
+// ---------------------------------------------------------------------------
+
+static void ReaderListFilesEnumeratesAllEntries()
+{
+    fs::path root = TestRoot();
+    fs::path pakPath = root / "reader_list_files.pak";
+
+    std::map<std::string, std::vector<uint8_t>> files;
+    files["a/one.bin"] = Bytes("one");
+    files["a/two.bin"] = Bytes("two");
+    files["b/three.bin"] = Bytes("three");
+
+    Pakker pakker;
+    PakOptions options;
+    assert(pakker.CreatePak(pakPath.string(), files, options));
+
+    PakReader reader;
+    reader.SetCacheOptions(TestCacheOptions(root));
+    assert(reader.Open(pakPath.string()));
+
+    std::vector<std::string> listed = reader.ListFiles();
+    std::vector<std::string> expected = pakker.ListFiles(pakPath.string());
+    assert(listed == expected);
+    assert(listed.size() == 3);
+}
+
+static void ReaderListFilesWithPrefixFilters()
+{
+    fs::path root = TestRoot();
+    fs::path pakPath = root / "reader_list_files_prefix.pak";
+
+    std::map<std::string, std::vector<uint8_t>> files;
+    files["a/one.bin"] = Bytes("one");
+    files["a/two.bin"] = Bytes("two");
+    files["b/three.bin"] = Bytes("three");
+
+    Pakker pakker;
+    PakOptions options;
+    assert(pakker.CreatePak(pakPath.string(), files, options));
+
+    PakReader reader;
+    reader.SetCacheOptions(TestCacheOptions(root));
+    assert(reader.Open(pakPath.string()));
+
+    std::vector<std::string> aFiles = reader.ListFilesWithPrefix("a/");
+    assert(aFiles.size() == 2);
+    for (const auto& f : aFiles) assert(f.starts_with("a/"));
+
+    std::vector<std::string> none = reader.ListFilesWithPrefix("missing/");
+    assert(none.empty());
+}
+
+// ---------------------------------------------------------------------------
+// PakReader::ReadRange
+// ---------------------------------------------------------------------------
+
+static void ReadRangeUncompressedMatchesFullReadSlice()
+{
+    fs::path root = TestRoot();
+    fs::path pakPath = root / "read_range_uncompressed.pak";
+
+    std::vector<uint8_t> content(4096);
+    for (size_t i = 0; i < content.size(); ++i) content[i] = static_cast<uint8_t>(i & 0xff);
+
+    std::map<std::string, std::vector<uint8_t>> files;
+    files["asset.bin"] = content;
+
+    PakOptions options; // compression = None
+    Pakker pakker;
+    assert(pakker.CreatePak(pakPath.string(), files, options));
+
+    PakReader reader;
+    reader.SetCacheOptions(TestCacheOptions(root));
+    assert(reader.Open(pakPath.string()));
+    PakFileHandle handle = reader.Find("asset.bin");
+    assert(handle);
+
+    const uint64_t rangeOffset = 100;
+    const size_t rangeLength = 256;
+    std::vector<uint8_t> slice(rangeLength);
+    uint64_t written = 0;
+    assert(reader.ReadRange(handle, rangeOffset, slice, &written) == PakStatus::Ok);
+    assert(written == rangeLength);
+    assert(std::equal(slice.begin(), slice.end(), content.begin() + rangeOffset));
+}
+
+static void ReadRangeCompressedReturnsUnsupported()
+{
+    fs::path root = TestRoot();
+    fs::path pakPath = root / "read_range_compressed.pak";
+
+    std::map<std::string, std::vector<uint8_t>> files;
+    files["asset.bin"] = std::vector<uint8_t>(4096, 5);
+
+    PakOptions options;
+    options.compression = PakCompression::LZ4;
+    Pakker pakker;
+    assert(pakker.CreatePak(pakPath.string(), files, options));
+
+    PakReader reader;
+    reader.SetCacheOptions(TestCacheOptions(root));
+    assert(reader.Open(pakPath.string()));
+    PakFileHandle handle = reader.Find("asset.bin");
+    assert(handle);
+
+    std::vector<uint8_t> slice(16);
+    assert(reader.ReadRange(handle, 0, slice) == PakStatus::Unsupported);
+}
+
+static void ReadRangeEncryptedMatchesFullDecryptSlice()
+{
+    fs::path root = TestRoot();
+    fs::path pakPath = root / "read_range_encrypted.pak";
+    const std::string key = "range-read-secret-key";
+
+    std::vector<uint8_t> content(2048);
+    for (size_t i = 0; i < content.size(); ++i) content[i] = static_cast<uint8_t>((i * 7) & 0xff);
+
+    std::map<std::string, std::vector<uint8_t>> files;
+    files["asset.bin"] = content;
+
+    PakOptions options; // compression = None -- encrypted-but-uncompressed range reads are supported
+    Pakker pakker(key);
+    assert(pakker.CreatePak(pakPath.string(), files, options));
+
+    PakReader reader(key);
+    reader.SetCacheOptions(TestCacheOptions(root));
+    assert(reader.Open(pakPath.string()));
+    PakFileHandle handle = reader.Find("asset.bin");
+    assert(handle);
+
+    const uint64_t rangeOffset = 513; // deliberately not key-length-aligned
+    const size_t rangeLength = 300;
+    std::vector<uint8_t> slice(rangeLength);
+    uint64_t written = 0;
+    assert(reader.ReadRange(handle, rangeOffset, slice, &written) == PakStatus::Ok);
+    assert(written == rangeLength);
+    assert(std::equal(slice.begin(), slice.end(), content.begin() + rangeOffset));
+}
+
+static void ReadRangeOutOfBoundsRejected()
+{
+    fs::path root = TestRoot();
+    fs::path pakPath = root / "read_range_oob.pak";
+
+    std::map<std::string, std::vector<uint8_t>> files;
+    files["asset.bin"] = std::vector<uint8_t>(64, 1);
+
+    PakOptions options;
+    Pakker pakker;
+    assert(pakker.CreatePak(pakPath.string(), files, options));
+
+    PakReader reader;
+    reader.SetCacheOptions(TestCacheOptions(root));
+    assert(reader.Open(pakPath.string()));
+    PakFileHandle handle = reader.Find("asset.bin");
+    assert(handle);
+
+    std::vector<uint8_t> slice(32);
+    assert(reader.ReadRange(handle, 48, slice) == PakStatus::InvalidArgument); // 48+32 > 64
+    assert(reader.ReadRange(handle, 1000, slice) == PakStatus::InvalidArgument);
+}
+
+// ---------------------------------------------------------------------------
+// PakLooseOverlay
+// ---------------------------------------------------------------------------
+
+static void LooseOverlayPrefersLooseFileOverArchive()
+{
+    fs::path root = TestRoot();
+    fs::path pakPath = root / "loose_overlay_prefers.pak";
+    fs::path looseDir = root / "loose";
+    fs::create_directories(looseDir / "textures");
+
+    std::map<std::string, std::vector<uint8_t>> files;
+    files["textures/diffuse.dds"] = Bytes("archive-content");
+
+    Pakker pakker;
+    PakOptions options;
+    assert(pakker.CreatePak(pakPath.string(), files, options));
+
+    std::ofstream looseFile(looseDir / "textures" / "diffuse.dds", std::ios::binary);
+    looseFile << "loose-content";
+    looseFile.close();
+
+    auto reader = std::make_shared<PakReader>();
+    reader->SetCacheOptions(TestCacheOptions(root));
+    assert(reader->Open(pakPath.string()));
+
+    PakLooseOverlay overlay(reader, looseDir.string());
+    assert(overlay.FileExists("textures/diffuse.dds"));
+
+    std::vector<uint8_t> loaded;
+    assert(overlay.Load("textures/diffuse.dds", loaded) == PakStatus::Ok);
+    assert(loaded == Bytes("loose-content"));
+}
+
+static void LooseOverlayFallsBackToWrappedReader()
+{
+    fs::path root = TestRoot();
+    fs::path pakPath = root / "loose_overlay_fallback.pak";
+    fs::path looseDir = root / "loose_empty";
+    fs::create_directories(looseDir);
+
+    std::map<std::string, std::vector<uint8_t>> files;
+    files["archive_only.bin"] = Bytes("archive-only-content");
+
+    Pakker pakker;
+    PakOptions options;
+    assert(pakker.CreatePak(pakPath.string(), files, options));
+
+    auto reader = std::make_shared<PakReader>();
+    reader->SetCacheOptions(TestCacheOptions(root));
+    assert(reader->Open(pakPath.string()));
+
+    PakLooseOverlay overlay(reader, looseDir.string());
+    assert(overlay.FileExists("archive_only.bin"));
+
+    std::vector<uint8_t> loaded;
+    assert(overlay.Load("archive_only.bin", loaded) == PakStatus::Ok);
+    assert(loaded == Bytes("archive-only-content"));
+
+    assert(!overlay.FileExists("missing.bin"));
+    std::vector<uint8_t> missing;
+    assert(overlay.Load("missing.bin", missing) == PakStatus::NotFound);
+}
+
+static void LooseOverlayFileExistsChecksBoth()
+{
+    fs::path root = TestRoot();
+    fs::path pakPath = root / "loose_overlay_exists.pak";
+    fs::path looseDir = root / "loose_exists";
+    fs::create_directories(looseDir);
+
+    std::map<std::string, std::vector<uint8_t>> files;
+    files["archive_only.bin"] = Bytes("archive");
+
+    Pakker pakker;
+    PakOptions options;
+    assert(pakker.CreatePak(pakPath.string(), files, options));
+
+    std::ofstream looseFile(looseDir / "loose_only.bin", std::ios::binary);
+    looseFile << "loose";
+    looseFile.close();
+
+    auto reader = std::make_shared<PakReader>();
+    reader->SetCacheOptions(TestCacheOptions(root));
+    assert(reader->Open(pakPath.string()));
+
+    PakLooseOverlay overlay(reader, looseDir.string());
+    assert(overlay.FileExists("archive_only.bin"));
+    assert(overlay.FileExists("loose_only.bin"));
+    assert(!overlay.FileExists("neither.bin"));
+}
+
+static void LooseOverlayRejectsPathTraversal()
+{
+    fs::path root = TestRoot();
+    fs::path looseDir = root / "loose_traversal" / "inner";
+    fs::create_directories(looseDir);
+
+    // A real file one level above the loose directory -- if the traversal
+    // guard were absent, "../secret.bin" would resolve straight to it.
+    std::ofstream outsideFile(looseDir.parent_path() / "secret.bin", std::ios::binary);
+    outsideFile << "should-not-be-readable";
+    outsideFile.close();
+
+    auto reader = std::make_shared<PakReader>(); // not open -- no wrapped-reader fallback possible
+    PakLooseOverlay overlay(reader, looseDir.string());
+
+    assert(!overlay.FileExists("../secret.bin"));
+    std::vector<uint8_t> loaded;
+    assert(overlay.Load("../secret.bin", loaded) == PakStatus::NotFound);
+}
+
 int main()
 {
     RuntimeHandleApi();
@@ -936,6 +1439,7 @@ int main()
     CorruptArchiveFailsOpen();
     EmptyArchiveOpens();
     MemoryCacheStoresDecodedEntries();
+    MemoryCacheEvictsLeastRecentlyUsedEntry();
     PersistentCacheSurvivesReaderReopen();
     PersistentCacheInvalidatesWhenSourceChanges();
     ZeroCopyFallbackSpanKeepsCachedDataAlive();
@@ -946,6 +1450,7 @@ int main()
     VerifyEntryDetectsCorruption();
     VerifyEntryPropagatesInvalidHandleAndNotOpen();
     VerifyOnReadModeFailsClosedOnMismatch();
+    VerifyOnReadBypassesDecodedCache();
     VerifyOnReadModeOffByDefaultAllowsCorruptedReadThrough();
     MountTwoLayersOverrideAndFallback();
     MountReaderSharesExternallyOwnedReader();
@@ -954,5 +1459,19 @@ int main()
     MountClearRemovesAllLayers();
     MountEnumerationDeduplicatesAcrossLayers();
     MountConcurrentReadsAcrossLayers();
+    ZstdCompressionRoundTrips();
+    MixedLz4AndZstdEntriesInSameArchive();
+    ValidatePakDeepVerifyCatchesCorruptedZstdEntry();
+    VerifyOnReadModeFailsClosedOnZstdMismatch();
+    ReaderListFilesEnumeratesAllEntries();
+    ReaderListFilesWithPrefixFilters();
+    ReadRangeUncompressedMatchesFullReadSlice();
+    ReadRangeCompressedReturnsUnsupported();
+    ReadRangeEncryptedMatchesFullDecryptSlice();
+    ReadRangeOutOfBoundsRejected();
+    LooseOverlayPrefersLooseFileOverArchive();
+    LooseOverlayFallsBackToWrappedReader();
+    LooseOverlayFileExistsChecksBoth();
+    LooseOverlayRejectsPathTraversal();
     return 0;
 }

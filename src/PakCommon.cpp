@@ -107,7 +107,7 @@ bool ReadPakHeader(std::istream& stream, PakHeader& header)
         Log(PakLogLevel::Error, "ReadPakHeader: Invalid magic number.");
         return false;
     }
-    if (header.version != PAK_VERSION_5) {
+    if (header.version != PAK_VERSION_6) {
         Log(PakLogLevel::Error, "ReadPakHeader: Unsupported PAK version: " + std::to_string(header.version));
         return false;
     }
@@ -220,8 +220,10 @@ void EncryptDecrypt(std::vector<uint8_t>& data, const std::string& key)
 {
     if (data.empty() || key.empty()) return;
     const size_t keyLength = key.length();
+    size_t keyIndex = 0;
     for (size_t i = 0; i < data.size(); ++i) {
-        data[i] ^= static_cast<uint8_t>(key[i % keyLength]);
+        data[i] ^= static_cast<uint8_t>(key[keyIndex]);
+        if (++keyIndex == keyLength) keyIndex = 0;
     }
 }
 

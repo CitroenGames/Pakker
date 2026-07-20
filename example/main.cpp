@@ -58,7 +58,7 @@ int main() {
 
     // Page-aligned PAK for optimal mmap performance and GPU upload
     PakOptions opts;
-    opts.compress = true;       // LZ4 per-file compression
+    opts.compression = PakCompression::LZ4;   // or PakCompression::Zstd for a smaller, still-fast-to-decode archive
     opts.alignment = 4096;      // 4KB page alignment for memory-mapped I/O
 
     if (!pakker.CreatePak("assets.pak", files, opts)) {

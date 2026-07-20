@@ -5,6 +5,7 @@
 #include <vector>
 #include <map>
 #include <unordered_map>
+#include <list>
 #include <memory>
 #include <cstdint>
 #include <string_view>
@@ -12,6 +13,7 @@
 #include <functional>
 #include <shared_mutex>
 #include <mutex>
+#include <atomic>
 #include <span>
 
 #include "PakPlatform.h"
@@ -38,12 +40,13 @@ static constexpr size_t MAX_FILENAME_LENGTH = 65535;
 static constexpr size_t MAX_FILES_IN_PAK    = 1000000;
 static constexpr std::string_view PAK_MAGIC = "PAK0";
 static constexpr uint32_t PAK_VERSION_4     = 4; // rejected legacy format, no contentHash field
-static constexpr uint32_t PAK_VERSION_5     = 5; // v5-only format: entries carry a content hash
+static constexpr uint32_t PAK_VERSION_5     = 5; // rejected legacy format, no Zstd flag bit
+static constexpr uint32_t PAK_VERSION_6     = 6; // v6-only format: entries may be LZ4- or Zstd-compressed
 
 #pragma pack(push, 1)
 struct PakHeader {
     char magic[4] = { 'P', 'A', 'K', '0' };
-    uint32_t version   = PAK_VERSION_5;
+    uint32_t version   = PAK_VERSION_6;
     uint32_t numFiles  = 0;
     uint64_t fileTableOffset = 0;
     uint32_t alignment = 0;         // data alignment in bytes (power of 2)
@@ -57,7 +60,7 @@ struct PakEntry {
     uint64_t offset       = 0;
     uint64_t originalSize = 0;
     uint64_t compressedSize = 0; // == originalSize when uncompressed
-    uint8_t  flags        = 0;   // bit 0: LZ4 compressed
+    uint8_t  flags        = 0;   // bit 0: LZ4 compressed, bit 1: Zstd compressed (mutually exclusive)
     uint64_t contentHash   = 0;  // FNV-1a-64 of the on-disk (compressed+encrypted) bytes
 
     PakEntry() = default;
@@ -67,7 +70,13 @@ struct PakEntry {
           compressedSize(compSz == 0 ? origSz : compSz), flags(f), contentHash(hash) {}
 };
 
-static constexpr uint8_t PAK_FLAG_COMPRESSED = 0x01;
+static constexpr uint8_t PAK_FLAG_LZ4_COMPRESSED  = 0x01;
+static constexpr uint8_t PAK_FLAG_ZSTD_COMPRESSED = 0x02;
+
+inline bool IsCompressed(uint8_t flags)
+{
+    return (flags & (PAK_FLAG_LZ4_COMPRESSED | PAK_FLAG_ZSTD_COMPRESSED)) != 0;
+}
 
 // Internal helpers shared by Pakker and PakReader
 void Log(PakLogLevel level, const std::string& msg);
@@ -169,11 +178,22 @@ private:
 };
 
 // ---------------------------------------------------------------------------
+// PakCompression -- per-file compression method selection
+// ---------------------------------------------------------------------------
+
+enum class PakCompression {
+    None,
+    LZ4,   // fast decode, ~2:1 ratio -- prefer for latency-sensitive hot-reload style reads
+    Zstd,  // better ratio at similar decode cost -- prefer for install/patch size
+};
+
+// ---------------------------------------------------------------------------
 // PakOptions -- controls PAK creation behavior
 // ---------------------------------------------------------------------------
 
 struct PakOptions {
-    bool compress        = false;  // LZ4 per-file compression
+    PakCompression compression = PakCompression::None;
+    int zstdLevel        = 19;    // 1-19; only consulted when compression == Zstd
     uint32_t alignment   = 16;    // data alignment in bytes (must be power of 2)
 };
 
@@ -289,7 +309,7 @@ public:
     // encryptionKey: pass empty string for no encryption (recommended for shipping)
     explicit Pakker(const std::string& encryptionKey = "");
 
-    // Creates a v5 PAK file with PakOptions for alignment and compression control.
+    // Creates a v6 PAK file with PakOptions for alignment and compression control.
     bool CreatePak(const std::string& pakFilename,
                    const std::map<std::string, std::vector<uint8_t>>& files,
                    const PakOptions& options);
@@ -312,9 +332,10 @@ public:
     bool AddFileToPak(const std::string& pakFilename,
                       const std::string& filename,
                       const std::vector<uint8_t>& data,
-                      bool compress = false);
+                      PakCompression compression = PakCompression::None,
+                      int zstdLevel = 19);
 
-    // Creates a v5 PAK from a folder with PakOptions.
+    // Creates a v6 PAK from a folder with PakOptions.
     bool CreatePakFromFolder(const std::string& pakFilename,
                              const std::string& folderPath,
                              const PakOptions& options);
@@ -403,6 +424,19 @@ public:
     PakStatus Load(PakFileHandle handle, std::vector<uint8_t>& outData) const;
     PakStatus Prefetch(PakFileHandle handle) const;
 
+    // Partial read into decoded/original-content offset space, for large
+    // single assets (video/audio) that shouldn't be fully materialized just
+    // to read a slice. Supported for uncompressed entries (mapped or
+    // streamed, encrypted or not -- XOR-with-repeating-key is range-safe).
+    // Compressed entries (LZ4 or Zstd) return PakStatus::Unsupported: this
+    // archive format's compressed frames have no internal chunk index, so a
+    // true seekable-compressed-range-read would need a block-compression
+    // format change, which is out of scope here. Engines needing partial
+    // reads on large compressed-in-codec media (already-compressed video/
+    // audio) should store those entries uncompressed at the archive level.
+    PakStatus ReadRange(PakFileHandle handle, uint64_t rangeOffset,
+                        std::span<uint8_t> destination, uint64_t* bytesWritten = nullptr) const;
+
     // Off-hot-path integrity check: re-hashes the entry's on-disk bytes and
     // compares against its stored content hash, without decompressing or
     // decrypting. Intended for QA sweeps / "verify game files" flows, not
@@ -424,6 +458,11 @@ public:
     // Metadata (no I/O after Open)
     bool FileExists(std::string_view filename) const;
     uint32_t GetFileCount() const;
+
+    // Enumeration, mirroring PakMount's ListFiles()/ListFilesWithPrefix()
+    // for the single-archive case. Built from the cached file table -- no I/O.
+    std::vector<std::string> ListFiles() const;
+    std::vector<std::string> ListFilesWithPrefix(const std::string& prefix) const;
 
     struct FileInfo {
         std::string filename;
@@ -470,10 +509,12 @@ private:
         }
     };
 
+    using CacheLru = std::list<CacheKey>;
+
     struct DecodedCacheEntry {
         std::shared_ptr<const std::vector<uint8_t>> data;
         uint64_t size = 0;
-        uint64_t lastUse = 0;
+        CacheLru::iterator lruPosition;
     };
 
     struct RuntimeTable {
@@ -482,6 +523,9 @@ private:
         std::unordered_map<std::string, uint32_t,
             PakInternal::TransparentStringHash,
             PakInternal::TransparentStringEqual> indexByName;
+        // Kept in the immutable snapshot so in-flight prefetches do not need
+        // to copy the archive path on every handle operation.
+        std::string pakFilename;
     };
 
     struct ReadContext {
@@ -491,7 +535,6 @@ private:
         bool verifyOnRead = false;
         uint64_t fileSize = 0;
         uint64_t archiveFingerprint = 0;
-        std::string pakFilename;
     };
 
     static bool NeedsPathNormalization(std::string_view path);
@@ -510,8 +553,10 @@ private:
 
     bool ShouldCacheDecoded(const PakInternal::PakEntry& entry,
         const ReadContext& context, const PakCacheOptions& options) const;
-    CacheKey MakeCacheKey(PakFileHandle handle, const PakInternal::PakEntry& entry,
-        const ReadContext& context, uint64_t sourceHash) const;
+    static CacheKey MakeMemoryCacheKey(PakFileHandle handle,
+        const ReadContext& context) noexcept;
+    CacheKey MakePersistentCacheKey(PakFileHandle handle,
+        const PakInternal::PakEntry& entry, const ReadContext& context) const;
     PakStatus HashEntrySourceBytes(const PakInternal::PakEntry& entry,
         const ReadContext& context, uint64_t& outHash) const;
     bool TryGetMemoryCache(CacheKey key,
@@ -552,9 +597,13 @@ private:
     mutable std::mutex cacheMutex_;
     mutable PakCacheOptions cacheOptions_{};
     mutable PakCacheStats cacheStats_{};
+    // Source reads include the uncached mmap fast path. Keep this counter
+    // lock-free so independent mapped reads are not serialized just to
+    // maintain diagnostics.
+    mutable std::atomic<uint64_t> sourceReads_{0};
+    mutable CacheLru memoryCacheLru_;
     mutable std::unordered_map<CacheKey, DecodedCacheEntry, CacheKeyHash> memoryCache_;
     mutable uint64_t memoryCacheBytes_ = 0;
-    mutable uint64_t cacheUseCounter_ = 0;
     mutable std::string effectivePersistentCacheDirectory_;
 };
 

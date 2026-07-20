@@ -8,16 +8,18 @@ Pakker is a high-performance asset archive library designed for 3D game engines.
 - **Zero-copy mapped views** (`PakView`) -- returns a direct pointer into mapped memory for uncompressed assets, eliminating heap allocation entirely
 - **Handle-based runtime API** -- resolve paths once with `Find()`/`Resolve()`, cache `PakFileHandle`, then read without repeated path normalization or lookup allocation
 - **Caller-owned reads** -- `Read(handle, span)` fills engine-owned buffers and reports precise `PakStatus` errors
-- **Page-aligned data** (v5 format) -- file data aligned to configurable boundaries (16 B, 4 KB, 64 KB) for efficient page faults and GPU upload
+- **Page-aligned data** (v6 format) -- file data aligned to configurable boundaries (16 B, 4 KB, 64 KB) for efficient page faults and GPU upload
 - **Per-entry content integrity hashing** -- FNV-1a-64 checksum of each entry's on-disk bytes, with opt-in deep verification (`ValidatePak(deepVerify)`, `PakReader::VerifyEntry()`, `PakOpenOptions::verifyOnRead`) to catch corrupted or tampered archives before they reach the engine
 - **Layered archives** (`PakMount`) -- mount a base archive plus patch/DLC/language archives with override semantics, resolved through one composed namespace
+- **Loose-file hot-reload override** (`PakLooseOverlay`) -- dev-only wrapper that serves an edited-on-disk asset over the archive's copy, for iteration without repacking
 - **Thread-safe PakReader** -- `shared_mutex` allows concurrent reads from multiple threads; ideal for asset streaming on worker threads
 - **Hybrid decoded caching** -- OS page cache/mmap remains the fast path, with default in-memory and persistent decoded caches for compressed, encrypted, and non-mmap reads
 - **O(1) file lookup** via hash map -- no linear scanning
-- **LZ4 per-file compression** -- fast decompression (~4 GB/s); each entry records whether it needs decompression
+- **LZ4 or Zstd per-file compression** -- LZ4 for latency-sensitive hot-reload style reads (~4 GB/s decode), Zstd for a better ratio at similar decode cost; selected per-file, both pluggable side by side in the same archive
+- **Partial/streaming reads** (`PakReader::ReadRange`) -- read a slice of a large uncompressed asset (video/audio) without materializing the whole entry
 - **Silent by default** -- no console output unless you set a log callback
 - **Optional XOR encryption** -- disabled by default for best performance; this is lightweight obfuscation, not a security boundary -- see Encryption below
-- **No external dependencies** -- LZ4 is vendored, only needs C++20 and a C compiler
+- **No external dependencies** -- LZ4 and Zstd are vendored, only needs C++20 and a C compiler
 
 ## Dependencies
 
@@ -37,8 +39,8 @@ std::map<std::string, std::vector<uint8_t>> files;
 
 // Page-aligned PAK for optimal mmap and GPU upload
 PakOptions opts;
-opts.compress = true;       // LZ4 per-file compression
-opts.alignment = 4096;      // 4 KB page alignment
+opts.compression = PakCompression::LZ4;   // or PakCompression::Zstd for a smaller archive
+opts.alignment = 4096;                    // 4 KB page alignment
 
 pakker.CreatePak("assets.pak", files, opts);
 
@@ -154,6 +156,50 @@ layer). The dominant mount pattern is "mount everything once at a load-screen
 boundary," which `Clear()` + re-`Mount()` covers; selective removal is a
 natural follow-up if a use case needs it.
 
+### Partial reads for large assets
+
+`PakReader::ReadRange()` reads a slice of an entry's decoded content without
+materializing the whole thing -- useful for large single assets like video or
+audio that only need a chunk streamed in at a time:
+
+```cpp
+PakFileHandle handle = reader.Find("video/intro.h264");
+std::vector<uint8_t> chunk(64 * 1024);
+uint64_t written = 0;
+PakStatus status = reader.ReadRange(handle, /*rangeOffset=*/1'048'576, chunk, &written);
+```
+
+Only supported for uncompressed entries (encrypted or not) -- this archive
+format's compressed frames have no internal chunk index, so a compressed
+entry returns `PakStatus::Unsupported` rather than silently decoding the
+whole entry to fake partial-read semantics. Media that's already compressed
+in its own codec (most video/audio) should be stored uncompressed at the
+archive level if streaming reads are needed.
+
+### Loose-file hot-reload override: PakLooseOverlay
+
+`PakLooseOverlay` wraps an already-open `PakReader` plus a directory on disk.
+Lookups check the loose directory first and serve from there when present,
+else fall back to the archive -- so an artist/programmer can edit an asset on
+disk and see the change without repacking:
+
+```cpp
+#include "PakLooseOverlay.h"
+
+auto reader = std::make_shared<PakReader>();
+reader->Open("assets.pak");
+
+PakLooseOverlay overlay(reader, "path/to/loose/override/dir");
+
+std::vector<uint8_t> data;
+overlay.Load("textures/diffuse.dds", data); // loose copy if present, else the archive's
+```
+
+This is a **dev-only convenience, not a shipping-path optimization**: every
+lookup does a filesystem stat, which doesn't belong in a shipping hot path
+(unlike `PakReader`/`PakMount`, which are handle-based specifically to avoid
+this). Loose files are read raw -- no compression or encryption.
+
 ### Integrity verification
 
 Every entry stores an FNV-1a-64 hash of its on-disk (post-compression,
@@ -248,11 +294,11 @@ void AssetStreamWorker(PakReader& reader, AssetQueue& queue) {
 
 | Method | Description |
 |--------|-------------|
-| `CreatePak(filename, files, PakOptions)` | Create v5 PAK with alignment and compression control |
+| `CreatePak(filename, files, PakOptions)` | Create v6 PAK with alignment and compression control |
 | `CreatePakFromFolder(filename, folder, PakOptions)` | Create PAK from directory with options |
 | `ExtractPak(filename, outputDir)` | Extract all files to a directory |
 | `ListPak(filename)` | Log all file entries via the log callback |
-| `AddFileToPak(filename, name, data)` | Append a file to an existing PAK |
+| `AddFileToPak(filename, name, data, compression=None, zstdLevel=19)` | Append a file to an existing PAK |
 | `ValidatePak(filename, deepVerify=false)` | Validate header/entry bounds; `deepVerify` additionally re-hashes every entry against its stored content hash (O(archive size)) |
 | `ReadFileFromPak(filename, name)` | Read a single file (one-shot, no caching) |
 | `GetFileCount(filename)` | Get file count from header |
@@ -274,11 +320,13 @@ void AssetStreamWorker(PakReader& reader, AssetQueue& queue) {
 | `View(handle, view)` | Zero-copy mapped view for uncompressed, unencrypted data; never content-hash verified, even under `verifyOnRead` |
 | `Read(handle, span)` | Fill caller-owned memory, returns `PakStatus` |
 | `Load(handle, vector)` | Allocating convenience read into a vector |
+| `ReadRange(handle, rangeOffset, span)` | Partial read of an uncompressed entry's decoded content; `PakStatus::Unsupported` for compressed entries |
 | `Prefetch(handle)` | Best-effort mapped range prefetch hint |
 | `VerifyEntry(handle)` | Off-hot-path integrity check: re-hashes on-disk bytes against the stored content hash, returns `PakStatus::HashMismatch` on failure |
 | `FileExists(name)` | O(1) hash lookup, no disk I/O |
 | `GetFileCount()` | Returns cached count, no disk I/O |
 | `GetFileInfo(name)` | Convenience lookup for size, compression info |
+| `ListFiles()`, `ListFilesWithPrefix(prefix)` | Enumerate all entries from the cached file table, no disk I/O |
 | `ReadFile`, `LoadFile`, `ReadFileZeroCopy`, `ReadFiles` | Convenience wrappers |
 | `SetCacheOptions`, `GetCacheStats`, `ClearCache` | Tune and inspect decoded asset caching |
 
@@ -311,11 +359,27 @@ void AssetStreamWorker(PakReader& reader, AssetQueue& queue) {
 whichever layer's `PakReader` owns the winning entry, and that reader's own
 decoded cache applies transparently.
 
+## Runtime API (PakLooseOverlay)
+
+| Method | Description |
+|--------|-------------|
+| `PakLooseOverlay(reader, looseDirectory)` | Wraps an already-open `shared_ptr<PakReader>` plus a loose directory path |
+| `FileExists(name)` | True if the file exists in the loose directory or the wrapped reader |
+| `Read(name, span)` | Serves from the loose directory when present (`BufferTooSmall` if the buffer is too small), else delegates to the wrapped reader |
+| `Load(name, vector)` | Same precedence as `Read`, into an owned resized buffer |
+| `WrappedReader()`, `LooseDirectory()` | Accessors |
+
+Filename-keyed, not handle-based -- every lookup stats the filesystem by
+design (that's what makes hot-reload work), so a pre-resolved handle would
+just cache a stale answer. No `View()`/zero-copy equivalent: a loose file
+read from disk has no mapping to back that contract.
+
 ### PakOptions
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `compress` | `bool` | `false` | Enable LZ4 per-file compression |
+| `compression` | `PakCompression` | `None` | Per-file compression method: `None`, `LZ4`, or `Zstd` |
+| `zstdLevel` | `int` | `19` | Zstd compression level (1-19); only consulted when `compression == Zstd` |
 | `alignment` | `uint32_t` | `16` | Data alignment in bytes (must be power of 2) |
 
 ### PakOpenOptions
@@ -333,7 +397,7 @@ Runtime decoded caching is enabled by default:
 | `enabled` | `bool` | `true` | Master switch for decoded caching |
 | `memoryCacheEnabled` | `bool` | `true` | Keep decoded entries in process memory |
 | `persistentCacheEnabled` | `bool` | `true` | Store decoded entries in a platform cache directory |
-| `memoryBudgetBytes` | `uint64_t` | `64 MiB` | LRU memory cache budget |
+| `memoryBudgetBytes` | `uint64_t` | `64 MiB` | O(1) LRU memory cache budget |
 | `persistentBudgetBytes` | `uint64_t` | `512 MiB` | LRU persistent cache budget |
 | `maxSingleEntryBytes` | `uint64_t` | `64 MiB` | Largest decoded entry eligible for caching |
 | `persistentCacheDirectory` | `std::string` | empty | Empty uses the OS default when available |
@@ -342,6 +406,8 @@ Runtime decoded caching is enabled by default:
 `Load()` cache decoded data for compressed, encrypted, and non-mmap reads. On
 Android and Web, set `persistentCacheDirectory` to an app-owned writable path if
 you want persistent caching; otherwise memory caching still works.
+`PakOpenOptions::verifyOnRead` bypasses decoded caches so every read verifies
+the current archive bytes.
 
 ## PAK Format
 
@@ -350,13 +416,13 @@ you want persistent caching; otherwise memory caching still works.
 | Field | Type | Description |
 |-------|------|-------------|
 | magic | char[4] | `"PAK0"` |
-| version | uint32_t | 5 |
+| version | uint32_t | 6 |
 | numFiles | uint32_t | Number of files |
 | fileTableOffset | uint64_t | Byte offset to file table |
 | alignment | uint32_t | Data alignment in bytes |
 | reserved | uint32_t[3] | Reserved for future use |
 
-### File table entry (v5)
+### File table entry (v6)
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -365,15 +431,16 @@ you want persistent caching; otherwise memory caching still works.
 | offset | uint64_t | Byte offset to file data |
 | originalSize | uint64_t | Uncompressed size |
 | compressedSize | uint64_t | Size on disk |
-| flags | uint8_t | Bit 0: LZ4 compressed |
+| flags | uint8_t | Bit 0: LZ4 compressed. Bit 1: Zstd compressed (mutually exclusive with bit 0) |
 | contentHash | uint64_t | FNV-1a-64 hash of the on-disk (compressed+encrypted) bytes |
 
 File data offsets are padded to the alignment boundary specified in the header. This ensures page-aligned access when memory-mapped.
 
-Archives are v5-only: `PakReader::Open()` and `Pakker::ValidatePak()` reject
-any other version, including the prior v4 format (no `contentHash` field).
-There is no in-place upgrade tool -- rebuild v4 archives with `CreatePak()`/
-`CreatePakFromFolder()` under the current library version.
+Archives are v6-only: `PakReader::Open()` and `Pakker::ValidatePak()` reject
+any other version, including the prior v5 format (no Zstd flag bit) and v4
+(no `contentHash` field). There is no in-place upgrade tool -- rebuild older
+archives with `CreatePak()`/`CreatePakFromFolder()` under the current library
+version.
 
 ## Thread Safety
 
@@ -414,7 +481,7 @@ Internally:
 | Operation | mmap | ifstream fallback |
 |-----------|------|-------------------|
 | File lookup | O(1) hash, no I/O | O(1) hash, no I/O |
-| Uncompressed read | Zero-copy pointer | seek + read |
+| Uncompressed read | `View()`: zero-copy; `Read()`: mapped memcpy | seek + read |
 | Compressed read | Decompress from mmap (no read syscall) | seek + read + decompress |
 | Batch resolve | O(1) handle lookup per name | O(1) handle lookup per name |
 | Parallel reads | Dispatch cached handles through engine jobs | Serialized by stream mutex |

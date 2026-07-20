@@ -17,9 +17,13 @@
 
 namespace PakInternal {
 
-// Maximum input size for LZ4 functions (from LZ4_MAX_INPUT_SIZE). Shared by
-// the builder's compress path and the reader's decompress path.
-static constexpr uint64_t LZ4_MAX_SAFE_SIZE = 0x7E000000;
+// Sanity ceiling for a single entry's compressible size, shared by both the
+// LZ4 and Zstd paths. Originally derived from LZ4_MAX_INPUT_SIZE (LZ4's
+// block API is bounded by a 32-bit int); Zstd's one-shot API isn't subject
+// to that same limit, but reusing one documented ceiling keeps
+// oversized-entry rejection behavior consistent across codecs rather than
+// letting it silently diverge per codec.
+static constexpr uint64_t MAX_COMPRESSIBLE_ENTRY_SIZE = 0x7E000000;
 
 // FNV-1a fingerprint helpers used by PakReader for its archive fingerprint
 // (Open()) and its decoded-cache-key generation (MakeCacheKey,

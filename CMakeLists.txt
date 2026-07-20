@@ -59,6 +59,14 @@ if(PAK_NO_MMAP)
     target_compile_definitions(${PROJECT_NAME} PUBLIC PAK_NO_MMAP)
 endif()
 
+# The vendored zstd decompressor optionally emits extern declarations for an
+# x86_64 GNU-assembler Huffman fast path (huf_decompress_amd64.S) on
+# Linux/macOS + gcc/clang. That .S file is deliberately not vendored (this
+# project's source glob doesn't compile assembler, and MSVC can't either), so
+# disable the asm path via zstd's own supported opt-out to avoid an
+# undefined-reference link error and fall back to portable C.
+target_compile_definitions(${PROJECT_NAME} PRIVATE ZSTD_DISABLE_ASM)
+
 if(BUILD_EXAMPLES)
 # Example executable
 file(GLOB EXAMPLE_SOURCES "example/*.cpp" "example/*.h")
@@ -89,7 +97,7 @@ if(CMAKE_PROJECT_NAME STREQUAL PROJECT_NAME)
         LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
     )
-    install(FILES src/Pak.h src/PakPlatform.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+    install(FILES src/Pak.h src/PakPlatform.h src/PakLooseOverlay.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 
     write_basic_package_version_file(
         "${CMAKE_CURRENT_BINARY_DIR}/PakkerConfigVersion.cmake"

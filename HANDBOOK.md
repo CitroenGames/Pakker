@@ -11,24 +11,27 @@ Its main job is to build `.pak` archives offline, then serve assets at runtime
 with predictable lookup cost, memory-mapped I/O when available, zero-copy views
 for eligible files, and thread-safe concurrent reads.
 
-The current archive format is v5-only.
+The current archive format is v6-only.
 
 ## Repository Map
 
 | Path | Purpose |
 |------|---------|
 | `src/Pak.h` | Public API, archive structures, runtime handles, cache options, `PakMount`, and thread-safety contract |
-| `src/PakInternal.h` | Private implementation header: LZ4 size limit and FNV fingerprint/hash helpers shared across the files below |
+| `src/PakInternal.h` | Private implementation header: codec-neutral size ceiling and FNV fingerprint/hash helpers shared across the files below |
 | `src/PakCommon.cpp` | Shared archive-format contract: logging, path/filename validation, header and file-table I/O, encryption |
+| `src/PakCompression.h`, `src/PakCompression.cpp` | Shared LZ4/Zstd compress+decompress dispatch; the only translation unit that includes the vendor codec headers |
 | `src/PakBuilder.cpp` | `Pakker` build-time API: create, extract, list, validate (incl. deep content-hash verification), and modify PAK files |
-| `src/PakReaderCore.cpp` | `PakReader` lifecycle, handle lookup, core read dispatch, content-hash verification, and convenience wrappers |
-| `src/PakReaderCache.cpp` | `PakReader` decoded-cache subsystem: memory LRU, persistent disk cache, cache-key generation, source-byte hashing |
+| `src/PakReaderCore.cpp` | `PakReader` lifecycle, handle lookup, core read dispatch, range reads, enumeration, content-hash verification, and convenience wrappers |
+| `src/PakReaderCache.cpp` | `PakReader` decoded-cache subsystem: O(1) memory LRU, persistent disk cache, cache-key generation, and source-byte verification |
 | `src/PakMount.cpp` | `PakMount`: layered virtual filesystem composing multiple `PakReader` instances with override semantics |
+| `src/PakLooseOverlay.h`, `src/PakLooseOverlay.cpp` | `PakLooseOverlay`: dev-only loose-file hot-reload override wrapping a `PakReader` |
 | `src/PakPlatform.h` | Small platform abstraction for mmap, prefetch hints, and default cache directory discovery |
 | `src/PakPlatform.cpp` | Windows/POSIX platform implementation and `PAK_NO_MMAP` fallback |
 | `src/vendor/lz4.c`, `src/vendor/lz4.h` | Vendored LZ4 dependency used for per-file compression |
+| `src/vendor/zstd/` | Vendored Zstd core (`common/`, `compress/`, `decompress/`, `zstd.h`, `zstd_errors.h`), mirroring upstream's `lib/` layout so its relative includes resolve. `huf_decompress_amd64.S` (optional x86_64 asm fast path) is deliberately not vendored -- `ZSTD_DISABLE_ASM` is set instead (see CMakeLists.txt) |
 | `tests/PakRuntimeTests.cpp` | Assertion-based runtime regression tests registered through CTest |
-| `benchmarks/PakRuntimeBenchmark.cpp` | Simple runtime benchmark for resolve, mapped view, and copied reads |
+| `benchmarks/PakRuntimeBenchmark.cpp` | Repeatable runtime benchmark for resolve, mapped view, copied reads, cache churn, and hot-cache reads |
 | `example/main.cpp` | End-to-end demo using Pakker plus miniaudio |
 | `CMakeLists.txt` | Static library, example, tests, benchmark, feature options, and install/export package |
 | `cmake/PakkerConfig.cmake.in` | Template for the installed `find_package(Pakker)` config |
@@ -73,7 +76,7 @@ guard, or replicate it if you ever split tests into a new file.
 
 ## Architecture
 
-Pakker has three public roles:
+Pakker has four public roles:
 
 - `Pakker` is the build-time writer and archive utility API. It creates,
   extracts, lists, validates (structural and, optionally, deep content-hash),
@@ -85,6 +88,15 @@ Pakker has three public roles:
   via `shared_ptr`) into a single override-aware namespace -- base archive
   plus patch/DLC/language layers -- without introducing its own caching or
   I/O. It purely re-dispatches to the winning layer's `PakReader`.
+- `PakLooseOverlay` is a dev-only wrapper around one `PakReader` plus a loose
+  directory on disk, for hot-reload iteration. It is not part of the shipping
+  read path -- see PakLooseOverlay below.
+
+`Pakker`/`PakReader`/`PakMount` share compression through
+`PakInternal::CompressBuffer`/`DecompressBuffer` (`src/PakCompression.h/.cpp`)
+rather than calling LZ4/Zstd directly -- that keeps the two vendored codec
+headers confined to one translation unit instead of leaking into
+`PakInternal.h`, which is included much more widely.
 
 The platform layer is intentionally narrow. `PakPlatform` owns file mapping,
 unmapping, prefetch hints, and cache-directory discovery. Keep OS-specific code
@@ -92,10 +104,10 @@ there unless the public API truly needs to know about it.
 
 ## Archive Format
 
-The current format is v5:
+The current format is v6:
 
 - Header magic is `PAK0`.
-- Header version is `5`.
+- Header version is `6`.
 - The header stores file count, file-table offset, data alignment, and reserved
   fields.
 - Each file-table entry stores UTF-8 path, data offset, original size,
@@ -103,13 +115,18 @@ The current format is v5:
   on-disk, post-compression/post-encryption bytes).
 - File data is written before the file table.
 - File data offsets are padded to `PakOptions::alignment`.
-- Bit `0x01` in entry flags means the on-disk data is LZ4-compressed.
+- Bit `0x01` in entry flags means the on-disk data is LZ4-compressed. Bit
+  `0x02` means Zstd-compressed. The two are mutually exclusive; helper
+  `PakInternal::IsCompressed(flags)` checks either.
 
 Format invariants:
 
-- Only v5 archives are accepted. v4 (no `contentHash` field) is rejected with
-  no dual-format read path and no in-place upgrade tool -- rebuild from
-  source with the current library.
+- Only v6 archives are accepted. v5 (no Zstd flag bit) and v4 (no
+  `contentHash` field) are both rejected with no dual-format read path and no
+  in-place upgrade tool -- rebuild from source with the current library. This
+  is the third hard version cutover in this project's history (v3->v4,
+  v4->v5, v5->v6) -- keep following that precedent rather than introducing a
+  dual-format reader unless there's a strong reason to break it.
 - File names are normalized to forward slashes.
 - Empty, invalid, too-long, duplicate-after-normalization, or traversal-like
   names must be rejected.
@@ -152,8 +169,20 @@ archive memory only when all of these are true:
 - The file bounds are valid.
 
 `Read()` and `Load()` are the general read paths. They support compressed and
-encrypted entries, validate destination sizes, decompress with LZ4 when needed,
-and use decoded caching when the entry is eligible.
+encrypted entries, validate destination sizes, decompress with LZ4 or Zstd
+(dispatched by `PakInternal::DecompressBuffer` based on entry flags) when
+needed, and use decoded caching when the entry is eligible.
+
+`ReadRange()` is a partial-read path for large uncompressed entries (video/
+audio) that shouldn't be fully materialized just to read a slice. It operates
+in decoded/original-offset space, supports encrypted-but-uncompressed entries
+(XOR-with-repeating-key is range-safe -- the key index is offset by
+`rangeOffset`), and returns `PakStatus::Unsupported` immediately for
+compressed entries rather than decoding the whole entry to fake partial-read
+semantics -- this format's compressed frames have no internal chunk index.
+
+`ListFiles()`/`ListFilesWithPrefix()` enumerate the cached file table, no
+disk I/O -- the single-archive equivalent of `PakMount`'s enumeration.
 
 `ReadFileZeroCopy()` is a convenience wrapper. It returns a mapped span for
 eligible files and falls back to an owned buffer for compressed, encrypted, or
@@ -171,8 +200,7 @@ default hot path pays nothing for it:
   additionally re-hashes every entry's on-disk bytes -- O(archive size), meant
   for build/QA/patch-verification pipelines, not a hot path.
 - `PakReader::VerifyEntry(handle)` -- re-hashes one entry's on-disk bytes via
-  `HashEntrySourceBytes()` (the same helper the persistent cache uses for its
-  own key derivation) and compares against the stored hash. Off the hot path
+  `HashEntrySourceBytes()` and compares against the stored hash. Off the hot path
   by design -- call it from a QA sweep or a "verify game files" flow, not from
   `Read()`/`Load()` call sites.
 - `PakOpenOptions::verifyOnRead` -- opt-in, set at `Open()` time. When on,
@@ -193,10 +221,11 @@ Decoded caching applies to `Read()` and `Load()`, not to `View()`.
 
 The default policy enables:
 
-- In-memory decoded cache with an LRU budget.
+- In-memory decoded cache with O(1) LRU promotion and eviction.
 - Persistent decoded cache when a writable cache directory is available.
 - Source reads counted in `PakCacheStats`.
-- Persistent cache invalidation using archive fingerprint plus source-byte hash.
+- Persistent cache invalidation using the archive fingerprint plus each entry's
+  stored on-disk content hash; cache lookup does not re-hash source bytes.
 
 Important constraints:
 
@@ -205,24 +234,24 @@ Important constraints:
 - Persistent cache paths must stay inside the resolved cache directory.
 - Android and Web do not provide a default cache directory; callers should set
   `PakCacheOptions::persistentCacheDirectory` if they want persistent caching.
-- Content-hash verification (when `verifyOnRead` is enabled) happens in
-  `ReadEntryToBuffer()` before a decoded result is ever handed to
-  `StoreMemoryCache()`/`StorePersistentCache()` in `ReadEntryWithCache()` -- a
-  hash mismatch is never cached in either tier.
+- `verifyOnRead` bypasses both decoded-cache tiers so every call hashes the
+  current source bytes as promised; verified reads never load from or store to
+  memory/persistent decoded caches.
 
 ## Thread Safety And Lifetimes
 
 `PakReader` is thread-safe for concurrent reads.
 
 - `Find()`, `Resolve()`, `Info()`, `InfoByIndex()`, `View()`, `Read()`,
-  `Load()`, `Prefetch()`, `VerifyEntry()`, and convenience wrappers may run
-  concurrently.
+  `Load()`, `ReadRange()`, `Prefetch()`, `VerifyEntry()`, `ListFiles()`,
+  `ListFilesWithPrefix()`, and convenience wrappers may run concurrently.
 - `Open()` and `Close()` take exclusive locks.
 - The runtime table is immutable and shared with in-flight reads.
 - `PakView` and `PakSpan` keep the mapped file alive through shared ownership,
   so a view/span can remain valid after `Close()`.
 - The ifstream fallback serializes file I/O with `streamMutex_`.
-- The decoded cache is protected by `cacheMutex_`.
+- The decoded cache is protected by `cacheMutex_`; the source-read diagnostic
+  counter is relaxed-atomic so uncached mapped reads do not serialize on it.
 
 Do not move a `PakReader` while other threads are using it.
 
@@ -245,6 +274,13 @@ Do not move a `PakReader` while other threads are using it.
   `PakStatus::InvalidHandle`/`nullptr` afterward (bounds-checked against
   `layers_.size()`), it does not dereference a dangling layer.
 - Do not move a `PakMount` while other threads are using it.
+
+`PakLooseOverlay` has no mutable state after construction (the wrapped
+`shared_ptr<PakReader>` and loose directory path are fixed for the object's
+lifetime), so `FileExists()`/`Read()`/`Load()` are safe to call concurrently
+from multiple threads, to the same extent the wrapped `PakReader`'s own
+concurrent-read contract holds. Every call still does a filesystem stat --
+this is a dev-only convenience, not a shipping hot path.
 
 ## Platform Behavior
 
@@ -286,8 +322,15 @@ Preserve the public split:
   should stay a pure consumer of `PakReader`'s public API -- avoid adding
   `PakMount`-specific state or friend access into `PakReader` beyond what's
   already there (`InfoByIndex()` for enumeration).
+- Dev-only hot-reload override behavior belongs in `PakLooseOverlay`, which
+  should stay a pure consumer of `PakReader`'s public API for the same
+  reason `PakMount` does -- do not make `PakMount`'s layer type polymorphic
+  to absorb loose-directory support instead of a standalone class.
 - OS behavior belongs in `PakPlatform`.
-- Compression behavior should stay isolated behind the vendored LZ4 calls.
+- Compression behavior should stay isolated behind
+  `PakInternal::CompressBuffer`/`DecompressBuffer` (`src/PakCompression.h/.cpp`)
+  rather than calling the vendored LZ4/Zstd APIs directly from `PakBuilder.cpp`
+  or `PakReaderCore.cpp`.
 
 Keep the hot runtime path allocation-conscious:
 
@@ -299,7 +342,7 @@ Keep the hot runtime path allocation-conscious:
 Keep compatibility explicit:
 
 - If a change breaks old archives, make the version boundary obvious.
-- If a change only affects v5 internals, add tests that prove old v5 behavior
+- If a change only affects v6 internals, add tests that prove old v6 behavior
   still works.
 - If adding a new public API, update `src/Pak.h`, `README.MD`, examples or tests
   as appropriate.
@@ -310,7 +353,16 @@ Known limitations (deliberate, revisitable scope cuts, not oversights):
   layer). Layer identity is ambiguous for `MountReader()`-mounted layers that
   may carry no filename, and the dominant mount pattern -- mount everything
   once at a load-screen boundary -- doesn't need selective removal.
-- There is no in-place v4-to-v5 archive upgrade tool. Rebuild from source.
+- There is no in-place archive upgrade tool between any format version.
+  Rebuild from source with the current library.
+- `PakReader::ReadRange()` only supports uncompressed entries (encrypted or
+  not); compressed entries return `PakStatus::Unsupported`. This format's
+  compressed frames have no internal chunk index, so a true seekable
+  compressed-range-read would need a block-compression format change (chunk
+  table), which is out of scope for now.
+- `PakLooseOverlay` is dev-only: every lookup stats the filesystem, has no
+  `View()`/zero-copy equivalent, and loose files are read raw (no
+  compression or encryption). Not intended for a shipping hot path.
 
 ## Verification Checklist
 
@@ -332,7 +384,10 @@ ctest --test-dir build_no_mmap -C Release --output-on-failure
 For format or writer changes, verify at least:
 
 - Creating an archive with compression off.
-- Creating an archive with compression on.
+- Creating an archive with LZ4 compression on.
+- Creating an archive with Zstd compression on.
+- An archive containing both LZ4- and Zstd-compressed entries (e.g. via
+  `AddFileToPak` with a different method than the archive's `CreatePak` used).
 - Empty archive handling.
 - Invalid archive rejection.
 - Extraction and validation.
@@ -355,15 +410,16 @@ For platform changes, verify:
 For integrity-hash changes, verify at least:
 
 - Creating an archive and confirming `ValidatePak(deepVerify=true)` passes.
-- Corrupting a single byte in a compressed entry and an uncompressed entry,
-  and confirming both `ValidatePak(deepVerify=true)` and `VerifyEntry()`
-  catch it, while `ValidatePak(deepVerify=false)` does not.
+- Corrupting a single byte in an LZ4-compressed entry, a Zstd-compressed
+  entry, and an uncompressed entry, and confirming both
+  `ValidatePak(deepVerify=true)` and `VerifyEntry()` catch it in each case,
+  while `ValidatePak(deepVerify=false)` does not.
 - `PakOpenOptions::verifyOnRead=true` fails closed with
   `PakStatus::HashMismatch`; `verifyOnRead=false` (default) still reads
   corrupted bytes through unchanged.
 - `View()` remains unverified by design, under any option.
-- Old v4 archives (no `contentHash` field) are rejected by `Open()` and
-  `ValidatePak()`.
+- Old v5 (no Zstd flag bit) and v4 (no `contentHash` field) archives are both
+  rejected by `Open()` and `ValidatePak()`.
 
 For `PakMount` changes, verify at least:
 
@@ -378,6 +434,26 @@ For `PakMount` changes, verify at least:
 - `ListFiles()`/`ListFilesWithPrefix()` deduplicate across layers with the
   highest-priority layer's content winning.
 - Concurrent reads across layers from multiple threads.
+
+For `PakReader::ReadRange()` changes, verify at least:
+
+- A partial read of an uncompressed entry matches the corresponding slice of
+  a full `Load()`.
+- A compressed entry (LZ4 or Zstd) returns `PakStatus::Unsupported`.
+- An encrypted-but-uncompressed entry's range read matches the corresponding
+  slice of a full decrypted `Load()`, including a range that doesn't start
+  at a key-length-aligned offset.
+- Out-of-bounds ranges (offset beyond `originalSize`, or offset+length
+  overflowing it) are rejected.
+- Both the mapped and `PAK_NO_MMAP` streaming paths.
+
+For `PakLooseOverlay` changes, verify at least:
+
+- A file present in the loose directory is served over the archive's copy.
+- A file absent from the loose directory falls back to the wrapped reader.
+- `FileExists()` checks both the loose directory and the wrapped reader.
+- A path-traversal filename (e.g. `../secret.bin`) cannot escape the loose
+  directory, even when a real file exists at the resolved location.
 
 ## Common Workflows
 
@@ -399,6 +475,25 @@ For `PakMount` changes, verify at least:
 4. Keep compression optional and per-file.
 5. Re-run runtime tests because writer bugs usually surface at reader open/read.
 
+### Change Compression Support
+
+1. Start from `PakInternal::CompressBuffer()`/`DecompressBuffer()`
+   (`src/PakCompression.h/.cpp`) -- the single dispatch point both
+   `PakBuilder.cpp` and `PakReaderCore.cpp` call into. Do not call a vendored
+   codec API directly from either of those files.
+2. A new codec needs its own `PAK_FLAG_*_COMPRESSED` bit (`src/Pak.h`) and a
+   branch in both functions. Flags are mutually exclusive; `IsCompressed()`
+   already checks the union of all compression bits, so new callers using it
+   don't need updating.
+3. If the on-disk semantics of `PakEntry::flags` change in a way an older
+   reader would silently misinterpret (rather than cleanly reject), that's an
+   archive-format change -- see Archive Format's version-cutover precedent,
+   don't rely on flag bits alone to signal a reader-compatibility boundary.
+4. Keep the codec's vendored sources isolated (their own `src/vendor/<name>/`
+   directory) and confined to `PakCompression.cpp`'s includes.
+5. Add tests covering: round-trip, corruption caught by `deepVerify`/
+   `VerifyEntry()`, and an archive mixing the new codec with existing ones.
+
 ### Change Decoded Cache Behavior
 
 1. Start from `ReadEntryWithCache()`, `ShouldCacheDecoded()`, and cache key
@@ -418,12 +513,12 @@ For `PakMount` changes, verify at least:
 ### Change Integrity Verification
 
 1. Start from `ReadEntryToBuffer()` (on-read-path `verifyOnRead` check),
-   `VerifyEntry()`, `HashEntrySourceBytes()` (shared hashing helper, also used
-   for persistent cache keys), and `Pakker::ValidatePak()`'s `deepVerify` loop.
+   `VerifyEntry()`, `HashEntrySourceBytes()`, and `Pakker::ValidatePak()`'s
+   `deepVerify` loop. Persistent cache keys reuse the stored `contentHash`.
 2. Keep hashing on-disk bytes (post-compression, post-encryption), not
    logical/decoded content -- this lets verification run without decrypting
    or decompressing first, and keeps `contentHash` consistent with what
-   `HashEntrySourceBytes()` already computes for cache-key purposes.
+   `HashEntrySourceBytes()` computes when verification is explicitly requested.
 3. Never let a hash mismatch reach the decoded cache; check before storing.
 4. `View()` stays unverified, always -- do not add a verification path to it.
 5. Add tests for both the compressed and uncompressed entry paths, since they
@@ -445,6 +540,23 @@ For `PakMount` changes, verify at least:
 5. If adding per-layer `Unmount()`, decide layer identity for
    `MountReader()`-mounted layers (which may carry no filename) before
    settling on an API shape.
+
+### Change PakLooseOverlay Behavior
+
+1. Start from `PakLooseOverlay::ResolveLooseFilePath()` -- the single
+   traversal-guarded path-resolution point every method routes through.
+2. Keep the filename-keyed API (no handles): the whole point of this class is
+   that the loose/not-loose answer can change between calls as a file is
+   saved, so a pre-resolved handle would just cache a stale answer.
+3. Do not add a `View()`/zero-copy equivalent; a loose file read from disk
+   has no mapping to back that contract. If a use case truly needs it, mmap
+   the individual loose file rather than faking `PakView` over a heap buffer.
+4. Keep it a pure `PakReader` consumer, same rule as `PakMount` -- do not make
+   `PakReader` aware of loose overrides.
+5. Add tests for: loose-file precedence, fallback to the wrapped reader, and
+   path traversal rejection with a real file present at the resolved
+   out-of-bounds location (a missing file at that path wouldn't distinguish
+   "correctly rejected" from "just didn't happen to exist").
 
 ## Release Checklist
 
