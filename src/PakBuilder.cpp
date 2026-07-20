@@ -86,7 +86,7 @@ bool Pakker::CreatePak(const std::string& pakFilename,
     }
 
     PakHeader header;
-    header.version = PAK_VERSION_4;
+    header.version = PAK_VERSION_5;
     header.numFiles = static_cast<uint32_t>(files.size());
     header.fileTableOffset = 0;
     header.alignment = alignment;
@@ -163,8 +163,9 @@ bool Pakker::CreatePak(const std::string& pakFilename,
             Log(PakLogLevel::Error, "CreatePak: Failed to get stream position.");
             return false;
         }
+        uint64_t contentHash = HashBuffer(writePtr, writeSize);
         entries.emplace_back(normalizedFilename, currentOffset, originalSize,
-                             static_cast<uint64_t>(writeSize), flags);
+                             static_cast<uint64_t>(writeSize), flags, contentHash);
 
         pakStream.write(reinterpret_cast<const char*>(writePtr),
                        static_cast<std::streamsize>(writeSize));
@@ -527,8 +528,9 @@ bool Pakker::AddFileToPak(const std::string& pakFilename,
                    static_cast<std::streamsize>(writeSize));
     if (!pakStream) return false;
 
+    uint64_t contentHash = HashBuffer(writePtr, writeSize);
     entries.emplace_back(normalizedFilename, newOffset, originalSize,
-                         static_cast<uint64_t>(writeSize), flags);
+                         static_cast<uint64_t>(writeSize), flags, contentHash);
     header.numFiles += 1;
     header.fileTableOffset = SafeStreamPos(pakStream, pakStream.tellp());
     if (!pakStream) {
@@ -604,7 +606,7 @@ bool Pakker::CreatePakFromFolder(const std::string& pakFilename,
     }
 
     PakHeader header;
-    header.version = PAK_VERSION_4;
+    header.version = PAK_VERSION_5;
     header.numFiles = static_cast<uint32_t>(filePaths.size());
     header.fileTableOffset = 0;
     header.alignment = alignment;
@@ -688,8 +690,9 @@ bool Pakker::CreatePakFromFolder(const std::string& pakFilename,
             Log(PakLogLevel::Error, "CreatePakFromFolder: Failed to get stream position.");
             return false;
         }
+        uint64_t contentHash = HashBuffer(writePtr, writeSize);
         entries.emplace_back(normalizedName, currentOffset, originalSize,
-                             static_cast<uint64_t>(writeSize), flags);
+                             static_cast<uint64_t>(writeSize), flags, contentHash);
 
         pakStream.write(reinterpret_cast<const char*>(writePtr),
                        static_cast<std::streamsize>(writeSize));
@@ -777,7 +780,7 @@ bool Pakker::ExtractSingleFile(const std::string& pakFilename,
     return WriteFile(outputPath, fileData);
 }
 
-bool Pakker::ValidatePak(const std::string& pakFilename) const
+bool Pakker::ValidatePak(const std::string& pakFilename, bool deepVerify) const
 {
     std::ifstream pakStream(pakFilename, std::ios::binary);
     if (!pakStream) {
@@ -807,6 +810,33 @@ bool Pakker::ValidatePak(const std::string& pakFilename) const
         if (!ValidateEntry(entry, pakFileSize)) {
             Log(PakLogLevel::Error, "ValidatePak: Invalid entry: " + entry.filename);
             return false;
+        }
+    }
+
+    if (deepVerify) {
+        std::vector<uint8_t> diskBytes;
+        for (const auto& entry : entries) {
+            uint64_t diskSize = entry.compressedSize;
+            diskBytes.assign(static_cast<size_t>(diskSize), 0);
+            if (diskSize > 0) {
+                pakStream.seekg(entry.offset, std::ios::beg);
+                if (!pakStream) {
+                    Log(PakLogLevel::Error, "ValidatePak: Failed to seek to offset for file: " + entry.filename);
+                    return false;
+                }
+                pakStream.read(reinterpret_cast<char*>(diskBytes.data()),
+                              static_cast<std::streamsize>(diskSize));
+                if (!pakStream) {
+                    Log(PakLogLevel::Error, "ValidatePak: Failed to read data for file: " + entry.filename);
+                    return false;
+                }
+            }
+
+            uint64_t hash = HashBuffer(diskBytes.data(), diskBytes.size());
+            if (hash != entry.contentHash) {
+                Log(PakLogLevel::Error, "ValidatePak: Content hash mismatch: " + entry.filename);
+                return false;
+            }
         }
     }
 

@@ -53,6 +53,7 @@ PakReader::PakReader(PakReader&& other) noexcept
     useMmap_ = other.useMmap_;
     alignment_ = other.alignment_;
     archiveFingerprint_ = other.archiveFingerprint_;
+    verifyOnRead_ = other.verifyOnRead_;
     cacheOptions_ = other.cacheOptions_;
     cacheStats_ = other.cacheStats_;
     memoryCache_ = std::move(other.memoryCache_);
@@ -65,6 +66,7 @@ PakReader::PakReader(PakReader&& other) noexcept
     other.useMmap_ = false;
     other.alignment_ = 1;
     other.archiveFingerprint_ = 0;
+    other.verifyOnRead_ = false;
     other.memoryCacheBytes_ = 0;
     other.cacheUseCounter_ = 0;
 }
@@ -94,6 +96,7 @@ PakReader& PakReader::operator=(PakReader&& other) noexcept
             isOpen_ = false;
             alignment_ = 1;
             archiveFingerprint_ = 0;
+            verifyOnRead_ = false;
             pakFilename_.clear();
         }
         memoryCache_.clear();
@@ -111,6 +114,7 @@ PakReader& PakReader::operator=(PakReader&& other) noexcept
         useMmap_ = other.useMmap_;
         alignment_ = other.alignment_;
         archiveFingerprint_ = other.archiveFingerprint_;
+        verifyOnRead_ = other.verifyOnRead_;
         cacheOptions_ = other.cacheOptions_;
         cacheStats_ = other.cacheStats_;
         memoryCache_ = std::move(other.memoryCache_);
@@ -124,6 +128,7 @@ PakReader& PakReader::operator=(PakReader&& other) noexcept
         other.useMmap_ = false;
         other.alignment_ = 1;
         other.archiveFingerprint_ = 0;
+        other.verifyOnRead_ = false;
         other.memoryCacheBytes_ = 0;
         other.cacheUseCounter_ = 0;
     }
@@ -131,6 +136,11 @@ PakReader& PakReader::operator=(PakReader&& other) noexcept
 }
 
 bool PakReader::Open(const std::string& pakFilename)
+{
+    return Open(pakFilename, PakOpenOptions{});
+}
+
+bool PakReader::Open(const std::string& pakFilename, const PakOpenOptions& options)
 {
     std::unique_lock lock(mutex_);
     if (isOpen_) {
@@ -144,6 +154,7 @@ bool PakReader::Open(const std::string& pakFilename)
         isOpen_ = false;
         alignment_ = 1;
         archiveFingerprint_ = 0;
+        verifyOnRead_ = false;
         {
             std::lock_guard cacheLock(cacheMutex_);
             memoryCache_.clear();
@@ -254,6 +265,7 @@ bool PakReader::Open(const std::string& pakFilename)
 
     table_ = std::move(table);
     isOpen_ = true;
+    verifyOnRead_ = options.verifyOnRead;
     {
         std::lock_guard cacheLock(cacheMutex_);
         ResolvePersistentCacheDirectoryLocked();
@@ -277,6 +289,7 @@ void PakReader::Close()
         isOpen_ = false;
         alignment_ = 1;
         archiveFingerprint_ = 0;
+        verifyOnRead_ = false;
         pakFilename_.clear();
         {
             std::lock_guard cacheLock(cacheMutex_);
@@ -369,6 +382,13 @@ const PakFileInfo* PakReader::Info(PakFileHandle handle) const
     return &table_->infos[handle.index];
 }
 
+const PakFileInfo* PakReader::InfoByIndex(uint32_t index) const
+{
+    std::shared_lock lock(mutex_);
+    if (!isOpen_ || !table_ || index >= table_->infos.size()) return nullptr;
+    return &table_->infos[index];
+}
+
 // ---------------------------------------------------------------------------
 // Read helpers
 // ---------------------------------------------------------------------------
@@ -382,6 +402,7 @@ PakStatus PakReader::CaptureReadContext(PakFileHandle handle, ReadContext& conte
     context.table = table_;
     context.guard = mappedGuard_;
     context.useMmap = useMmap_;
+    context.verifyOnRead = verifyOnRead_;
     context.fileSize = pakFileSize_;
     context.archiveFingerprint = archiveFingerprint_;
     context.pakFilename = pakFilename_;
@@ -455,6 +476,16 @@ PakStatus PakReader::ReadEntryToBuffer(const PakInternal::PakEntry& entry,
             if (!pakStream_) return PakStatus::IoError;
         }
 
+        // output currently holds the raw on-disk bytes (pre-decrypt) -- verify
+        // here, before EncryptDecryptSpan mutates them in place.
+        if (context.verifyOnRead) {
+            uint64_t hash = HashBuffer(output.data(), output.size());
+            if (hash != entry.contentHash) {
+                Log(PakLogLevel::Error, "PakReader::Read: Content hash mismatch: " + entry.filename);
+                return PakStatus::HashMismatch;
+            }
+        }
+
         EncryptDecryptSpan(output, encryptionKey_);
         if (bytesWritten) *bytesWritten = entry.originalSize;
         return PakStatus::Ok;
@@ -480,8 +511,25 @@ PakStatus PakReader::ReadEntryToBuffer(const PakInternal::PakEntry& entry,
             if (!pakStream_) return PakStatus::IoError;
         }
 
+        // compressedScratch currently holds the raw on-disk bytes (pre-decrypt,
+        // still compressed) -- verify before EncryptDecryptSpan mutates them.
+        if (context.verifyOnRead) {
+            uint64_t hash = HashBuffer(compressedScratch.data(), compressedScratch.size());
+            if (hash != entry.contentHash) {
+                Log(PakLogLevel::Error, "PakReader::Read: Content hash mismatch: " + entry.filename);
+                return PakStatus::HashMismatch;
+            }
+        }
+
         EncryptDecryptSpan(compressedScratch, encryptionKey_);
         compressedData = compressedScratch.data();
+    } else if (context.verifyOnRead) {
+        // compressedData points directly at mapped, unencrypted on-disk bytes.
+        uint64_t hash = HashBuffer(compressedData, diskSize);
+        if (hash != entry.contentHash) {
+            Log(PakLogLevel::Error, "PakReader::Read: Content hash mismatch: " + entry.filename);
+            return PakStatus::HashMismatch;
+        }
     }
 
     int result = LZ4_decompress_safe(
@@ -558,6 +606,21 @@ PakStatus PakReader::Load(PakFileHandle handle, std::vector<uint8_t>& outData) c
     status = ReadEntryWithCache(handle, entry, outData, nullptr, context);
     if (status != PakStatus::Ok) outData.clear();
     return status;
+}
+
+PakStatus PakReader::VerifyEntry(PakFileHandle handle) const
+{
+    ReadContext context;
+    PakStatus status = CaptureReadContext(handle, context);
+    if (status != PakStatus::Ok) return status;
+
+    const auto& entry = context.table->entries[handle.index];
+
+    uint64_t hash = 0;
+    status = HashEntrySourceBytes(entry, context, hash);
+    if (status != PakStatus::Ok) return status;
+
+    return hash == entry.contentHash ? PakStatus::Ok : PakStatus::HashMismatch;
 }
 
 PakStatus PakReader::Prefetch(PakFileHandle handle) const

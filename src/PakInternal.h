@@ -27,7 +27,7 @@ static constexpr uint64_t LZ4_MAX_SAFE_SIZE = 0x7E000000;
 static constexpr uint64_t FNV_OFFSET_BASIS = 14695981039346656037ull;
 static constexpr uint64_t FNV_PRIME = 1099511628211ull;
 
-static void HashBytes(uint64_t& hash, const void* data, size_t size)
+inline void HashBytes(uint64_t& hash, const void* data, size_t size)
 {
     const auto* bytes = static_cast<const uint8_t*>(data);
     for (size_t i = 0; i < size; ++i) {
@@ -37,33 +37,33 @@ static void HashBytes(uint64_t& hash, const void* data, size_t size)
 }
 
 template <typename T>
-static void HashValue(uint64_t& hash, const T& value)
+inline void HashValue(uint64_t& hash, const T& value)
 {
     HashBytes(hash, &value, sizeof(value));
 }
 
-static void HashString(uint64_t& hash, std::string_view value)
+inline void HashString(uint64_t& hash, std::string_view value)
 {
     uint64_t size = static_cast<uint64_t>(value.size());
     HashValue(hash, size);
     if (!value.empty()) HashBytes(hash, value.data(), value.size());
 }
 
-static uint64_t HashBuffer(const uint8_t* data, uint64_t size)
+inline uint64_t HashBuffer(const uint8_t* data, uint64_t size)
 {
     uint64_t hash = FNV_OFFSET_BASIS;
     if (data && size > 0) HashBytes(hash, data, static_cast<size_t>(size));
     return hash;
 }
 
-static std::string Hex64(uint64_t value)
+inline std::string Hex64(uint64_t value)
 {
     std::ostringstream stream;
     stream << std::hex << std::setw(16) << std::setfill('0') << value;
     return stream.str();
 }
 
-static uint64_t FileTimeFingerprint(const std::filesystem::path& path)
+inline uint64_t FileTimeFingerprint(const std::filesystem::path& path)
 {
     std::error_code ec;
     auto time = std::filesystem::last_write_time(path, ec);

@@ -37,12 +37,13 @@ namespace PakInternal {
 static constexpr size_t MAX_FILENAME_LENGTH = 65535;
 static constexpr size_t MAX_FILES_IN_PAK    = 1000000;
 static constexpr std::string_view PAK_MAGIC = "PAK0";
-static constexpr uint32_t PAK_VERSION_4     = 4; // v4-only format
+static constexpr uint32_t PAK_VERSION_4     = 4; // rejected legacy format, no contentHash field
+static constexpr uint32_t PAK_VERSION_5     = 5; // v5-only format: entries carry a content hash
 
 #pragma pack(push, 1)
 struct PakHeader {
     char magic[4] = { 'P', 'A', 'K', '0' };
-    uint32_t version   = PAK_VERSION_4;
+    uint32_t version   = PAK_VERSION_5;
     uint32_t numFiles  = 0;
     uint64_t fileTableOffset = 0;
     uint32_t alignment = 0;         // data alignment in bytes (power of 2)
@@ -57,12 +58,13 @@ struct PakEntry {
     uint64_t originalSize = 0;
     uint64_t compressedSize = 0; // == originalSize when uncompressed
     uint8_t  flags        = 0;   // bit 0: LZ4 compressed
+    uint64_t contentHash   = 0;  // FNV-1a-64 of the on-disk (compressed+encrypted) bytes
 
     PakEntry() = default;
     PakEntry(std::string name, uint64_t off, uint64_t origSz,
-             uint64_t compSz = 0, uint8_t f = 0)
+             uint64_t compSz = 0, uint8_t f = 0, uint64_t hash = 0)
         : filename(std::move(name)), offset(off), originalSize(origSz),
-          compressedSize(compSz == 0 ? origSz : compSz), flags(f) {}
+          compressedSize(compSz == 0 ? origSz : compSz), flags(f), contentHash(hash) {}
 };
 
 static constexpr uint8_t PAK_FLAG_COMPRESSED = 0x01;
@@ -133,6 +135,7 @@ enum class PakStatus {
     CorruptArchive,
     IoError,
     DecompressionFailed,
+    HashMismatch,       // on-disk bytes do not match the entry's stored content hash
 };
 
 const char* PakStatusToString(PakStatus status);
@@ -172,6 +175,22 @@ private:
 struct PakOptions {
     bool compress        = false;  // LZ4 per-file compression
     uint32_t alignment   = 16;    // data alignment in bytes (must be power of 2)
+};
+
+// ---------------------------------------------------------------------------
+// PakOpenOptions -- controls PakReader::Open() runtime behavior
+// ---------------------------------------------------------------------------
+
+struct PakOpenOptions {
+    // When true, Read()/Load() re-hash each entry's on-disk bytes against its
+    // stored content hash and fail closed with PakStatus::HashMismatch on a
+    // mismatch instead of returning corrupted data. Off by default: it forces
+    // a full read+hash pass even on the mmap zero-copy path underneath
+    // Read()/Load(), so it costs real throughput. Prefer PakReader::VerifyEntry()
+    // for off-hot-path verification (QA sweeps, "verify game files" flows).
+    // View() is never verified, even when this is enabled -- see View()'s doc
+    // comment below.
+    bool verifyOnRead = false;
 };
 
 // ---------------------------------------------------------------------------
@@ -270,7 +289,7 @@ public:
     // encryptionKey: pass empty string for no encryption (recommended for shipping)
     explicit Pakker(const std::string& encryptionKey = "");
 
-    // Creates a v4 PAK file with PakOptions for alignment and compression control.
+    // Creates a v5 PAK file with PakOptions for alignment and compression control.
     bool CreatePak(const std::string& pakFilename,
                    const std::map<std::string, std::vector<uint8_t>>& files,
                    const PakOptions& options);
@@ -295,7 +314,7 @@ public:
                       const std::vector<uint8_t>& data,
                       bool compress = false);
 
-    // Creates a v4 PAK from a folder with PakOptions.
+    // Creates a v5 PAK from a folder with PakOptions.
     bool CreatePakFromFolder(const std::string& pakFilename,
                              const std::string& folderPath,
                              const PakOptions& options);
@@ -315,7 +334,11 @@ public:
                            const std::string& filename,
                            const std::string& outputPath) const;
 
-    bool ValidatePak(const std::string& pakFilename) const;
+    // Structural validation is always performed (header, bounds, filenames).
+    // deepVerify additionally re-hashes every entry's on-disk bytes against
+    // its stored content hash -- O(archive size), off by default so routine
+    // validation stays fast on multi-GB archives.
+    bool ValidatePak(const std::string& pakFilename, bool deepVerify = false) const;
 
 private:
     bool WriteFile(const std::string& filename,
@@ -360,6 +383,7 @@ public:
 
     // Lifecycle
     bool Open(const std::string& pakFilename);
+    bool Open(const std::string& pakFilename, const PakOpenOptions& options);
     void Close();
     bool IsOpen() const;
 
@@ -368,11 +392,23 @@ public:
     size_t Resolve(std::span<const std::string_view> filenames,
                    std::span<PakFileHandle> handles) const;
     const PakFileInfo* Info(PakFileHandle handle) const;
+    // Returns metadata for the file at [0, GetFileCount()), independent of
+    // FindInTable path normalization. Intended for enumeration/composition
+    // layers (e.g. a multi-archive VFS) that need to iterate all entries.
+    // Returns nullptr if index is out of range or the reader is not open.
+    const PakFileInfo* InfoByIndex(uint32_t index) const;
     PakStatus View(PakFileHandle handle, PakView& outView) const;
     PakStatus Read(PakFileHandle handle, std::span<uint8_t> destination,
                    uint64_t* bytesWritten = nullptr) const;
     PakStatus Load(PakFileHandle handle, std::vector<uint8_t>& outData) const;
     PakStatus Prefetch(PakFileHandle handle) const;
+
+    // Off-hot-path integrity check: re-hashes the entry's on-disk bytes and
+    // compares against its stored content hash, without decompressing or
+    // decrypting. Intended for QA sweeps / "verify game files" flows, not
+    // per-read hot paths -- see PakOpenOptions::verifyOnRead for a fail-closed
+    // on-read-path alternative.
+    PakStatus VerifyEntry(PakFileHandle handle) const;
 
     // Convenience wrappers. Prefer the handle API in runtime engine code.
     std::vector<uint8_t> ReadFile(const std::string& filename) const;
@@ -452,6 +488,7 @@ private:
         std::shared_ptr<const RuntimeTable> table;
         std::shared_ptr<PakInternal::MappedFileGuard> guard;
         bool useMmap = false;
+        bool verifyOnRead = false;
         uint64_t fileSize = 0;
         uint64_t archiveFingerprint = 0;
         std::string pakFilename;
@@ -507,6 +544,7 @@ private:
     bool useMmap_ = false;
     uint32_t alignment_ = 1;
     uint64_t archiveFingerprint_ = 0;
+    bool verifyOnRead_ = false;
 
     // Thread safety
     mutable std::shared_mutex mutex_;
@@ -518,6 +556,143 @@ private:
     mutable uint64_t memoryCacheBytes_ = 0;
     mutable uint64_t cacheUseCounter_ = 0;
     mutable std::string effectivePersistentCacheDirectory_;
+};
+
+// ---------------------------------------------------------------------------
+// PakMountHandle -- runtime handle into a PakMount's composed namespace
+//
+// Captures both the winning layer and that layer's own PakFileHandle so
+// reads dispatch straight to the owning PakReader with no re-lookup.
+// ---------------------------------------------------------------------------
+
+struct PakMountHandle {
+    static constexpr uint32_t InvalidLayer = UINT32_MAX;
+
+    uint32_t layerIndex = InvalidLayer;
+    PakFileHandle fileHandle{};
+
+    explicit operator bool() const {
+        return layerIndex != InvalidLayer && static_cast<bool>(fileHandle);
+    }
+    friend bool operator==(PakMountHandle a, PakMountHandle b) {
+        return a.layerIndex == b.layerIndex && a.fileHandle == b.fileHandle;
+    }
+    friend bool operator!=(PakMountHandle a, PakMountHandle b) { return !(a == b); }
+};
+
+// ---------------------------------------------------------------------------
+// PakMount -- layered virtual filesystem over multiple PakReader archives
+//
+// Composes multiple already-open (or opened-on-mount) PakReader instances
+// into one logical asset namespace with override semantics: later-mounted
+// layers take priority over earlier ones for files that exist in more than
+// one layer. This mirrors "install base, then apply patch/DLC on top."
+//
+// PakMount does not read archive bytes itself and does not implement its own
+// decoded cache -- it dispatches to the winning layer's PakReader, whose own
+// cache (see PakCacheOptions, PakReader::SetCacheOptions) applies
+// transparently. Use GetLayerReader() to tune cache budgets per layer.
+//
+// v1 has no per-layer Unmount(): only Clear() (drop every layer). The
+// dominant mount pattern -- mount everything once at a load-screen boundary
+// -- doesn't need selective removal, and layer identity is ambiguous for
+// MountReader()-mounted layers that may carry no filename. This is a
+// deliberate, revisitable scope cut, not an oversight.
+//
+// Thread safety:
+//   - Mount(), MountReader(), and Clear() take an exclusive lock and rebuild
+//     the merged lookup index. Do not call them concurrently with any other
+//     PakMount method on the same instance -- same rule as PakReader's
+//     Open()/Close().
+//   - Find(), Resolve(), Info(), View(), Read(), Load(), Prefetch(),
+//     ListFiles(), ListFilesWithPrefix(), FileExists(), GetFileCount(),
+//     LayerCount(), GetLayerReader(), and convenience wrappers are safe to
+//     call concurrently from multiple threads, and safe to call concurrently
+//     with reads issued directly against a shared_ptr<PakReader> an engine
+//     also holds outside the mount (e.g. one obtained via GetLayerReader()
+//     or passed into MountReader()).
+//   - PakMount is non-copyable, movable. Moving a PakMount acquires an
+//     exclusive lock on the instance being moved from.
+//   - PakMountHandle values remain valid as long as the layer they reference
+//     is still mounted; do not use a handle resolved before a Clear() call.
+// ---------------------------------------------------------------------------
+
+class PakMount {
+public:
+    PakMount() = default;
+    ~PakMount() = default;
+
+    PakMount(const PakMount&) = delete;
+    PakMount& operator=(const PakMount&) = delete;
+    PakMount(PakMount&& other) noexcept;
+    PakMount& operator=(PakMount&& other) noexcept;
+
+    // Opens a new PakReader(encryptionKey) on pakFilename and mounts it as
+    // the highest-priority layer so far. Returns false (mounting nothing) if
+    // Open() fails.
+    bool Mount(const std::string& pakFilename, const std::string& encryptionKey = "");
+
+    // Mounts an externally-owned/managed reader as the highest-priority
+    // layer so far. `reader` must already be open (IsOpen() == true), or
+    // this returns false. Ownership is shared -- the caller may keep using
+    // `reader` directly (e.g. for per-layer cache tuning) concurrently with
+    // PakMount reads.
+    bool MountReader(std::shared_ptr<PakReader> reader);
+
+    // Unmounts every layer and clears the merged index.
+    void Clear();
+
+    size_t LayerCount() const;
+
+    // Layer 0 is the first-mounted (lowest-priority) layer; LayerCount()-1
+    // is the most-recently-mounted (highest-priority) layer. Returns nullptr
+    // if layerIndex is out of range.
+    std::shared_ptr<PakReader> GetLayerReader(size_t layerIndex) const;
+
+    // Engine runtime API: same ergonomics as PakReader -- resolve once,
+    // cache the handle, dispatch reads without repeated path lookups.
+    PakMountHandle Find(std::string_view filename) const;
+    size_t Resolve(std::span<const std::string_view> filenames,
+                   std::span<PakMountHandle> handles) const;
+    const PakFileInfo* Info(PakMountHandle handle) const;
+    PakStatus View(PakMountHandle handle, PakView& outView) const;
+    PakStatus Read(PakMountHandle handle, std::span<uint8_t> destination,
+                   uint64_t* bytesWritten = nullptr) const;
+    PakStatus Load(PakMountHandle handle, std::vector<uint8_t>& outData) const;
+    PakStatus Prefetch(PakMountHandle handle) const;
+
+    // Convenience wrappers. Prefer the handle API in runtime engine code.
+    std::vector<uint8_t> ReadFile(const std::string& filename) const;
+    std::shared_ptr<std::vector<uint8_t>> LoadFile(const std::string& filename) const;
+    PakSpan ReadFileZeroCopy(const std::string& filename) const;
+
+    bool FileExists(std::string_view filename) const;
+    uint32_t GetFileCount() const; // size of the deduplicated merged namespace
+
+    // VFS-aware enumeration: deduplicated by name, highest-priority layer
+    // wins on conflicts. Built from the same merged index as Find().
+    std::vector<std::string> ListFiles() const;
+    std::vector<std::string> ListFilesWithPrefix(const std::string& prefix) const;
+
+private:
+    struct MergedEntry {
+        uint32_t layerIndex = PakMountHandle::InvalidLayer;
+        PakFileHandle fileHandle{};
+    };
+
+    struct MergedIndex {
+        std::unordered_map<std::string, MergedEntry,
+            PakInternal::TransparentStringHash,
+            PakInternal::TransparentStringEqual> byName;
+        std::vector<std::string> sortedNames;
+    };
+
+    void RebuildMergedIndexLocked();
+    static PakMountHandle FindInIndex(const MergedIndex& index, std::string_view filename);
+
+    mutable std::shared_mutex mutex_;
+    std::vector<std::shared_ptr<PakReader>> layers_; // index 0 = lowest priority
+    std::shared_ptr<const MergedIndex> index_;
 };
 
 #endif // PAK_H

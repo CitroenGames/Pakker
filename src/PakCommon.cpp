@@ -24,6 +24,7 @@ const char* PakStatusToString(PakStatus status)
         case PakStatus::CorruptArchive: return "CorruptArchive";
         case PakStatus::IoError: return "IoError";
         case PakStatus::DecompressionFailed: return "DecompressionFailed";
+        case PakStatus::HashMismatch: return "HashMismatch";
     }
     return "Unknown";
 }
@@ -106,7 +107,7 @@ bool ReadPakHeader(std::istream& stream, PakHeader& header)
         Log(PakLogLevel::Error, "ReadPakHeader: Invalid magic number.");
         return false;
     }
-    if (header.version != PAK_VERSION_4) {
+    if (header.version != PAK_VERSION_5) {
         Log(PakLogLevel::Error, "ReadPakHeader: Unsupported PAK version: " + std::to_string(header.version));
         return false;
     }
@@ -169,7 +170,14 @@ bool ReadFileTable(std::istream& stream, uint32_t numFiles,
             return false;
         }
 
-        PakEntry entry(std::move(filename), offset, originalSize, compressedSize, flags);
+        uint64_t contentHash = 0;
+        stream.read(reinterpret_cast<char*>(&contentHash), sizeof(contentHash));
+        if (!stream) {
+            Log(PakLogLevel::Error, "ReadFileTable: Failed to read content hash for: " + filename);
+            return false;
+        }
+
+        PakEntry entry(std::move(filename), offset, originalSize, compressedSize, flags, contentHash);
         if (!IsValidFilename(entry.filename)) {
             Log(PakLogLevel::Error, "ReadFileTable: Invalid filename: " + entry.filename);
             return false;
@@ -194,6 +202,7 @@ bool WriteFileTable(std::ostream& stream, const std::vector<PakEntry>& entries)
         stream.write(reinterpret_cast<const char*>(&entry.originalSize), sizeof(entry.originalSize));
         stream.write(reinterpret_cast<const char*>(&entry.compressedSize), sizeof(entry.compressedSize));
         stream.write(reinterpret_cast<const char*>(&entry.flags), sizeof(entry.flags));
+        stream.write(reinterpret_cast<const char*>(&entry.contentHash), sizeof(entry.contentHash));
 
         if (!stream) {
             Log(PakLogLevel::Error, "WriteFileTable: Failed to write file entry for: " + entry.filename);
