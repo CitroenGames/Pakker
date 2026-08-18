@@ -19,6 +19,7 @@
 #include <fstream>
 #include <map>
 #include <memory>
+#include <random>
 #include <string_view>
 #include <thread>
 #include <vector>
@@ -114,7 +115,7 @@ static void RuntimeHandleApi()
         std::ifstream stream(pakPath, std::ios::binary);
         PakInternal::PakHeader header;
         assert(PakInternal::ReadPakHeader(stream, header));
-        assert(header.version == PakInternal::PAK_VERSION_7);
+        assert(header.version == PakInternal::PAK_VERSION_8);
     }
 
     PakReader reader;
@@ -237,12 +238,12 @@ static void OldVersionRejected()
     PakOptions options;
     assert(pakker.CreatePak(pakPath.string(), files, options));
 
-    // v4 (no contentHash field), v5 (no Zstd flag bit) and v6
-    // (variable-length file table) are all prior formats -- confirm each is
-    // cleanly rejected now that v7 is the only accepted version, with the
-    // same "rebuild from source" remediation for any of them.
+    // v4 (no contentHash field), v5 (no Zstd flag bit), v6 (variable-length
+    // file table) and v7 (no chunked-entry flag) are all prior formats --
+    // confirm each is cleanly rejected now that v8 is the only accepted
+    // version, with the same "rebuild from source" remediation for any.
     for (uint32_t oldVersion : {PakInternal::PAK_VERSION_4, PakInternal::PAK_VERSION_5,
-                                PakInternal::PAK_VERSION_6}) {
+                                PakInternal::PAK_VERSION_6, PakInternal::PAK_VERSION_7}) {
         std::fstream stream(pakPath, std::ios::in | std::ios::out | std::ios::binary);
         assert(stream);
         stream.seekp(4, std::ios::beg);
@@ -1594,6 +1595,525 @@ static void PathHashIsStableAndCaseSensitive()
 }
 
 
+// ---------------------------------------------------------------------------
+// Parallel build pipeline
+// ---------------------------------------------------------------------------
+
+static std::vector<uint8_t> ReadWholeFile(const fs::path& path)
+{
+    std::ifstream stream(path, std::ios::binary | std::ios::ate);
+    assert(stream);
+    const auto size = stream.tellg();
+    stream.seekg(0, std::ios::beg);
+    std::vector<uint8_t> data(static_cast<size_t>(size));
+    if (size > 0) stream.read(reinterpret_cast<char*>(data.data()), size);
+    assert(stream);
+    return data;
+}
+
+// Entries are encoded on worker threads but written in input order, so worker
+// count must not be observable in the output at all.
+static void ParallelBuildMatchesSequentialByteForByte()
+{
+    fs::path root = TestRoot();
+
+    std::map<std::string, std::vector<uint8_t>> files;
+    for (int i = 0; i < 64; ++i) {
+        // Mixed sizes and compressibility, so entries finish out of order.
+        std::vector<uint8_t> data(static_cast<size_t>(256 + i * 733));
+        for (size_t j = 0; j < data.size(); ++j) {
+            data[j] = static_cast<uint8_t>((i * 31 + j / (1 + (i % 5))) & 0xff);
+        }
+        files["assets/set_" + std::to_string(i % 7) + "/item_" + std::to_string(i) + ".bin"] =
+            std::move(data);
+    }
+
+    for (PakCompression compression : {PakCompression::None, PakCompression::LZ4,
+                                       PakCompression::Zstd}) {
+        fs::path sequentialPak = root / "seq.pak";
+        fs::path parallelPak = root / "par.pak";
+
+        PakOptions sequentialOptions;
+        sequentialOptions.compression = compression;
+        sequentialOptions.zstdLevel = 3;
+        sequentialOptions.alignment = 64;
+        sequentialOptions.workerThreads = 1;
+
+        PakOptions parallelOptions = sequentialOptions;
+        parallelOptions.workerThreads = 8;
+
+        Pakker pakker;
+        assert(pakker.CreatePak(sequentialPak.string(), files, sequentialOptions));
+        assert(pakker.CreatePak(parallelPak.string(), files, parallelOptions));
+        assert(ReadWholeFile(sequentialPak) == ReadWholeFile(parallelPak));
+
+        // And the parallel archive must actually read back correctly.
+        PakReader reader;
+        reader.SetCacheOptions(TestCacheOptions(root));
+        assert(reader.Open(parallelPak.string()));
+        assert(reader.GetFileCount() == files.size());
+        for (const auto& [name, expected] : files) {
+            PakFileHandle handle = reader.Find(name);
+            assert(handle);
+            std::vector<uint8_t> loaded;
+            assert(reader.Load(handle, loaded) == PakStatus::Ok);
+            assert(loaded == expected);
+            assert(reader.VerifyEntry(handle) == PakStatus::Ok);
+        }
+        reader.Close();
+
+        fs::remove(sequentialPak);
+        fs::remove(parallelPak);
+    }
+}
+
+static void ParallelFolderBuildMatchesSequential()
+{
+    fs::path root = TestRoot();
+    fs::path contentRoot = root / "content";
+
+    std::map<std::string, std::vector<uint8_t>> expected;
+    for (int i = 0; i < 48; ++i) {
+        std::vector<uint8_t> data(static_cast<size_t>(128 + i * 521), static_cast<uint8_t>(i));
+        const std::string name = "tree/branch_" + std::to_string(i % 5) + "/leaf_" +
+                                 std::to_string(i) + ".bin";
+        fs::path filePath = contentRoot / name;
+        fs::create_directories(filePath.parent_path());
+        std::ofstream out(filePath, std::ios::binary);
+        out.write(reinterpret_cast<const char*>(data.data()),
+                  static_cast<std::streamsize>(data.size()));
+        out.close();
+        expected[name] = std::move(data);
+    }
+
+    fs::path sequentialPak = root / "folder_seq.pak";
+    fs::path parallelPak = root / "folder_par.pak";
+
+    PakOptions sequentialOptions;
+    sequentialOptions.compression = PakCompression::Zstd;
+    sequentialOptions.zstdLevel = 3;
+    sequentialOptions.workerThreads = 1;
+
+    PakOptions parallelOptions = sequentialOptions;
+    parallelOptions.workerThreads = 8;
+
+    Pakker pakker;
+    assert(pakker.CreatePakFromFolder(sequentialPak.string(), contentRoot.string(),
+                                      sequentialOptions));
+    assert(pakker.CreatePakFromFolder(parallelPak.string(), contentRoot.string(),
+                                      parallelOptions));
+    assert(ReadWholeFile(sequentialPak) == ReadWholeFile(parallelPak));
+
+    PakReader reader;
+    reader.SetCacheOptions(TestCacheOptions(root));
+    assert(reader.Open(parallelPak.string()));
+    assert(reader.GetFileCount() == expected.size());
+    for (const auto& [name, contents] : expected) {
+        PakFileHandle handle = reader.Find(name);
+        assert(handle);
+        std::vector<uint8_t> loaded;
+        assert(reader.Load(handle, loaded) == PakStatus::Ok);
+        assert(loaded == contents);
+    }
+}
+
+
+// ---------------------------------------------------------------------------
+// Chunked compressed entries
+// ---------------------------------------------------------------------------
+
+// Mixed compressible and incompressible runs, so some chunks compress and
+// some are stored raw -- both paths need exercising.
+static std::vector<uint8_t> ChunkTestPayload(size_t bytes, uint64_t seed)
+{
+    std::vector<uint8_t> data(bytes);
+    std::mt19937_64 rng(seed);
+    size_t i = 0;
+    while (i < bytes) {
+        const size_t run = (std::min)(static_cast<size_t>(1024), bytes - i);
+        if ((i / 1024) % 2 == 0) {
+            for (size_t j = 0; j < run; ++j) data[i + j] = static_cast<uint8_t>(rng() & 0xff);
+        } else {
+            for (size_t j = 0; j < run; ++j) data[i + j] = static_cast<uint8_t>((i + j) % 7);
+        }
+        i += run;
+    }
+    return data;
+}
+
+static void ChunkedEntriesRoundTripAndReportChunkSize()
+{
+    fs::path root = TestRoot();
+
+    for (PakCompression compression : {PakCompression::LZ4, PakCompression::Zstd}) {
+        fs::path pakPath = root / "chunked.pak";
+
+        std::map<std::string, std::vector<uint8_t>> files;
+        // Larger than one chunk, so it gets chunked.
+        files["big.bin"] = ChunkTestPayload(300 * 1024, 1);
+        // Exactly one chunk boundary.
+        files["exact.bin"] = ChunkTestPayload(8192, 2);
+        // Smaller than the chunk size: must NOT be chunked.
+        files["small.bin"] = ChunkTestPayload(1024, 3);
+
+        PakOptions options;
+        options.compression = compression;
+        options.zstdLevel = 3;
+        options.compressionChunkSize = 8192;
+
+        Pakker pakker;
+        assert(pakker.CreatePak(pakPath.string(), files, options));
+
+        PakReader reader;
+        reader.SetCacheOptions(TestCacheOptions(root));
+        assert(reader.Open(pakPath.string()));
+
+        for (const auto& [name, expected] : files) {
+            PakFileHandle handle = reader.Find(name);
+            assert(handle);
+
+            std::vector<uint8_t> loaded;
+            assert(reader.Load(handle, loaded) == PakStatus::Ok);
+            assert(loaded == expected);
+            assert(reader.VerifyEntry(handle) == PakStatus::Ok);
+        }
+
+        const PakFileInfo* big = reader.Info(reader.Find("big.bin"));
+        assert(big);
+        assert(big->chunkSize == 8192);
+
+        const PakFileInfo* small = reader.Info(reader.Find("small.bin"));
+        assert(small);
+        // Below the chunk size, so chunking would only cost ratio.
+        assert(small->chunkSize == 0);
+
+        reader.Close();
+        fs::remove(pakPath);
+    }
+}
+
+static void ChunkedReadRangeMatchesFullRead()
+{
+    fs::path root = TestRoot();
+    fs::path pakPath = root / "chunked_range.pak";
+
+    const size_t payloadSize = 300 * 1024;
+    std::map<std::string, std::vector<uint8_t>> files;
+    files["video/clip.bin"] = ChunkTestPayload(payloadSize, 42);
+    const std::vector<uint8_t>& expected = files["video/clip.bin"];
+
+    PakOptions options;
+    options.compression = PakCompression::Zstd;
+    options.zstdLevel = 3;
+    options.compressionChunkSize = 8192;
+
+    Pakker pakker;
+    assert(pakker.CreatePak(pakPath.string(), files, options));
+
+    PakReader reader;
+    reader.SetCacheOptions(TestCacheOptions(root));
+    assert(reader.Open(pakPath.string()));
+
+    PakFileHandle handle = reader.Find("video/clip.bin");
+    assert(handle);
+
+    // Ranges that start and end mid-chunk, span chunk boundaries, cover a
+    // single whole chunk, and run to the very end of the entry.
+    const std::pair<uint64_t, uint64_t> ranges[] = {
+        {0, 1},
+        {0, 64},
+        {0, 8192},
+        {1, 8191},
+        {8192, 8192},
+        {100, 20000},
+        {8191, 2},
+        {payloadSize - 1, 1},
+        {payloadSize - 9000, 9000},
+        {0, payloadSize},
+    };
+
+    for (const auto& [offset, size] : ranges) {
+        std::vector<uint8_t> slice(static_cast<size_t>(size));
+        uint64_t written = 0;
+        assert(reader.ReadRange(handle, offset, slice, &written) == PakStatus::Ok);
+        assert(written == size);
+        assert(std::equal(slice.begin(), slice.end(),
+                          expected.begin() + static_cast<ptrdiff_t>(offset)));
+    }
+
+    // Out-of-bounds ranges are still rejected.
+    std::vector<uint8_t> overrun(16);
+    assert(reader.ReadRange(handle, payloadSize - 8, overrun) == PakStatus::InvalidArgument);
+    assert(reader.ReadRange(handle, payloadSize + 1, overrun) == PakStatus::InvalidArgument);
+}
+
+static void UnchunkedCompressedReadRangeStillUnsupported()
+{
+    fs::path root = TestRoot();
+    fs::path pakPath = root / "unchunked_range.pak";
+
+    std::map<std::string, std::vector<uint8_t>> files;
+    files["blob.bin"] = ChunkTestPayload(100 * 1024, 7);
+
+    PakOptions options;
+    options.compression = PakCompression::Zstd;
+    options.zstdLevel = 3;
+    options.compressionChunkSize = 0; // chunking off
+
+    Pakker pakker;
+    assert(pakker.CreatePak(pakPath.string(), files, options));
+
+    PakReader reader;
+    reader.SetCacheOptions(TestCacheOptions(root));
+    assert(reader.Open(pakPath.string()));
+
+    PakFileHandle handle = reader.Find("blob.bin");
+    assert(handle);
+    const PakFileInfo* info = reader.Info(handle);
+    assert(info && info->chunkSize == 0);
+
+    // A whole-entry frame has no index to seek into, so this must keep
+    // failing closed rather than quietly decoding the entire entry.
+    std::vector<uint8_t> slice(64);
+    assert(reader.ReadRange(handle, 0, slice) == PakStatus::Unsupported);
+}
+
+static void ChunkedEncryptedEntriesRoundTrip()
+{
+    fs::path root = TestRoot();
+    fs::path pakPath = root / "chunked_encrypted.pak";
+    const std::string key = "chunk-key";
+
+    std::map<std::string, std::vector<uint8_t>> files;
+    files["secret.bin"] = ChunkTestPayload(70 * 1024, 11);
+    const std::vector<uint8_t>& expected = files["secret.bin"];
+
+    PakOptions options;
+    options.compression = PakCompression::LZ4;
+    options.compressionChunkSize = 8192;
+
+    Pakker pakker(key);
+    assert(pakker.CreatePak(pakPath.string(), files, options));
+
+    PakReader reader(key);
+    reader.SetCacheOptions(TestCacheOptions(root));
+    assert(reader.Open(pakPath.string()));
+
+    PakFileHandle handle = reader.Find("secret.bin");
+    assert(handle);
+
+    std::vector<uint8_t> loaded;
+    assert(reader.Load(handle, loaded) == PakStatus::Ok);
+    assert(loaded == expected);
+
+    // Encryption forces the payload to be materialized and decrypted before
+    // the chunk table can be read; the range result must still be identical.
+    std::vector<uint8_t> slice(5000);
+    assert(reader.ReadRange(handle, 12345, slice) == PakStatus::Ok);
+    assert(std::equal(slice.begin(), slice.end(), expected.begin() + 12345));
+}
+
+static void ChunkedArchiveRejectsCorruptChunkTable()
+{
+    fs::path root = TestRoot();
+    fs::path pakPath = root / "chunked_corrupt.pak";
+
+    std::map<std::string, std::vector<uint8_t>> files;
+    files["blob.bin"] = ChunkTestPayload(64 * 1024, 13);
+
+    PakOptions options;
+    options.compression = PakCompression::Zstd;
+    options.zstdLevel = 3;
+    options.compressionChunkSize = 8192;
+
+    Pakker pakker;
+    assert(pakker.CreatePak(pakPath.string(), files, options));
+
+    const PakInternal::PakEntry entry = ReadSingleEntry(pakPath);
+    assert(PakInternal::IsChunked(entry.flags));
+
+    // Corrupt the first chunk's recorded compressed size. The table must not
+    // be trusted to steer a decode past the end of the payload.
+    {
+        std::fstream stream(pakPath, std::ios::in | std::ios::out | std::ios::binary);
+        assert(stream);
+        stream.seekp(static_cast<std::streamoff>(entry.offset + sizeof(PakInternal::PakChunkHeader)),
+                     std::ios::beg);
+        uint32_t bogus = 0xFFFFFF00u;
+        stream.write(reinterpret_cast<const char*>(&bogus), sizeof(bogus));
+    }
+
+    PakReader reader;
+    reader.SetCacheOptions(TestCacheOptions(root));
+    assert(reader.Open(pakPath.string()));
+
+    PakFileHandle handle = reader.Find("blob.bin");
+    assert(handle);
+
+    std::vector<uint8_t> loaded;
+    assert(reader.Load(handle, loaded) != PakStatus::Ok);
+
+    std::vector<uint8_t> slice(64);
+    assert(reader.ReadRange(handle, 0, slice) != PakStatus::Ok);
+}
+
+
+// ---------------------------------------------------------------------------
+// Scatter reads
+// ---------------------------------------------------------------------------
+
+static void ReadBatchMatchesIndividualReads()
+{
+    fs::path root = TestRoot();
+    fs::path pakPath = root / "batch.pak";
+
+    std::map<std::string, std::vector<uint8_t>> files;
+    for (int i = 0; i < 64; ++i) {
+        std::vector<uint8_t> data(static_cast<size_t>(512 + i * 97),
+                                  static_cast<uint8_t>(i * 3));
+        files["batch/asset_" + std::to_string(i) + ".bin"] = std::move(data);
+    }
+
+    PakOptions options;
+    options.compression = PakCompression::LZ4;
+    Pakker pakker;
+    assert(pakker.CreatePak(pakPath.string(), files, options));
+
+    PakReader reader;
+    reader.SetCacheOptions(TestCacheOptions(root));
+    assert(reader.Open(pakPath.string()));
+
+    // Deliberately request in reverse order: ReadBatch reorders internally by
+    // archive offset, and must still write each result into the right buffer.
+    std::vector<std::string> names;
+    for (const auto& [name, data] : files) names.push_back(name);
+    std::reverse(names.begin(), names.end());
+
+    std::vector<std::vector<uint8_t>> buffers(names.size());
+    std::vector<PakReadRequest> requests(names.size());
+    for (size_t i = 0; i < names.size(); ++i) {
+        PakFileHandle handle = reader.Find(names[i]);
+        assert(handle);
+        buffers[i].resize(files[names[i]].size());
+        requests[i].handle = handle;
+        requests[i].destination = buffers[i];
+    }
+
+    const size_t succeeded = reader.ReadBatch(requests);
+    assert(succeeded == requests.size());
+
+    for (size_t i = 0; i < names.size(); ++i) {
+        assert(requests[i].status == PakStatus::Ok);
+        assert(requests[i].bytesWritten == files[names[i]].size());
+        assert(buffers[i] == files[names[i]]);
+        // The caller's array must come back in the order it was built.
+        assert(requests[i].handle == reader.Find(names[i]));
+    }
+}
+
+static void ReadBatchReportsPerRequestFailures()
+{
+    fs::path root = TestRoot();
+    fs::path pakPath = root / "batch_errors.pak";
+
+    std::map<std::string, std::vector<uint8_t>> files;
+    files["ok.bin"] = std::vector<uint8_t>(256, 9);
+
+    Pakker pakker;
+    PakOptions options;
+    assert(pakker.CreatePak(pakPath.string(), files, options));
+
+    PakReader reader;
+    reader.SetCacheOptions(TestCacheOptions(root));
+    assert(reader.Open(pakPath.string()));
+
+    std::vector<uint8_t> good(256);
+    std::vector<uint8_t> tooSmall(8);
+
+    std::vector<PakReadRequest> requests(3);
+    requests[0].handle = reader.Find("ok.bin");
+    requests[0].destination = good;
+    requests[1].handle = PakFileHandle{};                 // never resolved
+    requests[1].destination = good;
+    requests[2].handle = reader.Find("ok.bin");
+    requests[2].destination = tooSmall;                   // undersized buffer
+
+    const size_t succeeded = reader.ReadBatch(requests);
+    assert(succeeded == 1);
+    assert(requests[0].status == PakStatus::Ok);
+    assert(requests[0].bytesWritten == 256);
+    assert(requests[1].status == PakStatus::InvalidHandle);
+    assert(requests[1].bytesWritten == 0);
+    assert(requests[2].status == PakStatus::BufferTooSmall);
+    assert(requests[2].bytesWritten == 0);
+
+    // A closed reader fails every request rather than reporting success.
+    reader.Close();
+    const size_t afterClose = reader.ReadBatch(requests);
+    assert(afterClose == 0);
+    for (const auto& request : requests) {
+        assert(request.status == PakStatus::NotOpen);
+    }
+
+    // An empty batch is not an error.
+    std::vector<PakReadRequest> none;
+    assert(reader.ReadBatch(none) == 0);
+}
+
+static void ReadBatchIsSafeFromMultipleThreads()
+{
+    fs::path root = TestRoot();
+    fs::path pakPath = root / "batch_threads.pak";
+
+    std::map<std::string, std::vector<uint8_t>> files;
+    for (int i = 0; i < 128; ++i) {
+        files["mt/asset_" + std::to_string(i) + ".bin"] =
+            std::vector<uint8_t>(1024, static_cast<uint8_t>(i));
+    }
+
+    PakOptions options;
+    options.compression = PakCompression::LZ4;
+    Pakker pakker;
+    assert(pakker.CreatePak(pakPath.string(), files, options));
+
+    PakReader reader;
+    reader.SetCacheOptions(TestCacheOptions(root));
+    assert(reader.Open(pakPath.string()));
+
+    // The documented usage: the engine splits a frame's requests across its
+    // own workers, each calling ReadBatch on a disjoint slice.
+    std::atomic<bool> failed{false};
+    std::vector<std::thread> workers;
+    for (int t = 0; t < 8; ++t) {
+        workers.emplace_back([&, t]() {
+            for (int pass = 0; pass < 16; ++pass) {
+                std::vector<std::vector<uint8_t>> buffers(16);
+                std::vector<PakReadRequest> requests(16);
+                for (int i = 0; i < 16; ++i) {
+                    const int index = (t * 16 + i) % 128;
+                    const std::string name = "mt/asset_" + std::to_string(index) + ".bin";
+                    PakFileHandle handle = reader.Find(name);
+                    if (!handle) { failed = true; return; }
+                    buffers[i].assign(1024, 0);
+                    requests[i].handle = handle;
+                    requests[i].destination = buffers[i];
+                }
+                if (reader.ReadBatch(requests) != requests.size()) { failed = true; return; }
+                for (int i = 0; i < 16; ++i) {
+                    const int index = (t * 16 + i) % 128;
+                    if (buffers[i] != std::vector<uint8_t>(1024, static_cast<uint8_t>(index))) {
+                        failed = true;
+                        return;
+                    }
+                }
+            }
+        });
+    }
+    for (auto& worker : workers) worker.join();
+    assert(!failed.load());
+}
+
+
 int main()
 {
     RuntimeHandleApi();
@@ -1641,5 +2161,15 @@ int main()
     OpenWithoutNamesStillReadsByHash();
     MountComposesLayersOpenedWithoutNames();
     PathHashIsStableAndCaseSensitive();
+    ParallelBuildMatchesSequentialByteForByte();
+    ParallelFolderBuildMatchesSequential();
+    ChunkedEntriesRoundTripAndReportChunkSize();
+    ChunkedReadRangeMatchesFullRead();
+    UnchunkedCompressedReadRangeStillUnsupported();
+    ChunkedEncryptedEntriesRoundTrip();
+    ChunkedArchiveRejectsCorruptChunkTable();
+    ReadBatchMatchesIndividualReads();
+    ReadBatchReportsPerRequestFailures();
+    ReadBatchIsSafeFromMultipleThreads();
     return 0;
 }

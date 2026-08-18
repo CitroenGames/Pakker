@@ -284,6 +284,14 @@ bool PakReader::Open(const std::string& pakFilename, const PakOpenOptions& optio
         info.contentHash = record.contentHash;
         info.flags = record.flags;
         info.compressed = PakInternal::IsCompressed(record.flags);
+        if (PakInternal::IsChunked(record.flags)) {
+            if (record.chunkSizeLog2 == 0 || record.chunkSizeLog2 > 31) {
+                Log(PakLogLevel::Error, "PakReader::Open: Invalid chunk size in entry record.");
+                pakStream_.close();
+                return false;
+            }
+            info.chunkSize = 1u << record.chunkSizeLog2;
+        }
 
         if (!table.nameBlob.empty()) {
             std::string_view name(table.nameBlob.data() + record.nameOffset, record.nameLength);
@@ -669,8 +677,18 @@ PakStatus PakReader::ReadEntryToBuffer(const PakFileInfo& entry,
         }
     }
 
-    PakStatus decompressStatus = PakInternal::DecompressBuffer(
-        entry.flags, compressedData, diskSize, output.data(), entry.originalSize);
+    PakStatus decompressStatus;
+    if (PakInternal::IsChunked(entry.flags)) {
+        // A full read of a chunked entry is just the whole range: every chunk,
+        // decoded in order straight into the destination.
+        thread_local std::vector<uint8_t> chunkScratch;
+        decompressStatus = PakInternal::DecompressChunkedRange(
+            entry.flags, compressedData, diskSize, entry.originalSize,
+            0, output.data(), entry.originalSize, chunkScratch);
+    } else {
+        decompressStatus = PakInternal::DecompressBuffer(
+            entry.flags, compressedData, diskSize, output.data(), entry.originalSize);
+    }
     if (decompressStatus != PakStatus::Ok) {
         Log(PakLogLevel::Error, "PakReader::Read: Decompression failed for: " + EntryLabel(entry));
         return decompressStatus;
@@ -760,9 +778,67 @@ PakStatus PakReader::ReadRange(PakFileHandle handle, uint64_t rangeOffset,
 
     const auto& entry = snapshot.table.infos[handle.index];
 
-    // Compressed frames have no internal chunk index in this format -- a
-    // seekable range read isn't possible without decoding the whole entry.
-    // Fail closed rather than faking partial-read semantics via a full decode.
+    // A chunked entry carries its own block index, so a range read only has
+    // to decode the blocks that range actually covers.
+    if (PakInternal::IsChunked(entry.flags)) {
+        if (rangeOffset > entry.originalSize ||
+            destination.size() > entry.originalSize - rangeOffset) {
+            return PakStatus::InvalidArgument;
+        }
+        if (entry.offset > snapshot.fileSize ||
+            entry.compressedSize > snapshot.fileSize - entry.offset) {
+            Log(PakLogLevel::Error,
+                "PakReader::ReadRange: Entry exceeds file bounds: " + EntryLabel(entry));
+            return PakStatus::CorruptArchive;
+        }
+        if (destination.empty()) return PakStatus::Ok;
+
+        const uint8_t* payload = nullptr;
+        std::vector<uint8_t> payloadScratch;
+        if (snapshot.useMmap && snapshot.guardPtr && snapshot.guardPtr->mf.data &&
+            encryptionKey_.empty()) {
+            payload = static_cast<const uint8_t*>(snapshot.guardPtr->mf.data) + entry.offset;
+        } else {
+            // Without a mapping -- or with encryption in play -- the payload
+            // has to be materialized first. The chunk table is at its head, so
+            // the whole payload is needed before any block can be located.
+            if (entry.compressedSize >
+                static_cast<uint64_t>((std::numeric_limits<std::streamsize>::max)())) {
+                return PakStatus::IoError;
+            }
+            payloadScratch.resize(static_cast<size_t>(entry.compressedSize));
+            if (snapshot.useMmap && snapshot.guardPtr && snapshot.guardPtr->mf.data) {
+                std::memcpy(payloadScratch.data(),
+                            static_cast<const uint8_t*>(snapshot.guardPtr->mf.data) + entry.offset,
+                            payloadScratch.size());
+            } else {
+                std::lock_guard streamLock(streamMutex_);
+                pakStream_.clear();
+                pakStream_.seekg(entry.offset, std::ios::beg);
+                if (!pakStream_) return PakStatus::IoError;
+                pakStream_.read(reinterpret_cast<char*>(payloadScratch.data()),
+                                static_cast<std::streamsize>(payloadScratch.size()));
+                if (!pakStream_) return PakStatus::IoError;
+            }
+            EncryptDecryptSpan(payloadScratch, encryptionKey_);
+            payload = payloadScratch.data();
+        }
+
+        thread_local std::vector<uint8_t> chunkScratch;
+        PakStatus chunkStatus = PakInternal::DecompressChunkedRange(
+            entry.flags, payload, entry.compressedSize, entry.originalSize,
+            rangeOffset, destination.data(), destination.size(), chunkScratch);
+        if (chunkStatus != PakStatus::Ok) return chunkStatus;
+
+        if (bytesWritten) *bytesWritten = destination.size();
+        return PakStatus::Ok;
+    }
+
+    // Whole-entry compressed frames have no internal index, so there is no way
+    // to reach an arbitrary offset without decoding everything before it. Fail
+    // closed rather than faking partial-read semantics via a full decode --
+    // build the archive with PakOptions::compressionChunkSize set if these
+    // entries need range reads.
     if (PakInternal::IsCompressed(entry.flags)) {
         return PakStatus::Unsupported;
     }
@@ -813,6 +889,108 @@ PakStatus PakReader::ReadRange(PakFileHandle handle, uint64_t rangeOffset,
 
     if (bytesWritten) *bytesWritten = destination.size();
     return PakStatus::Ok;
+}
+
+size_t PakReader::ReadBatch(std::span<PakReadRequest> requests,
+                            const PakBatchOptions& options) const
+{
+    if (requests.empty()) return 0;
+
+    const ReadSnapshot* snapshot = AcquireSnapshot();
+    if (!snapshot) {
+        for (auto& request : requests) {
+            request.status = PakStatus::NotOpen;
+            request.bytesWritten = 0;
+        }
+        return 0;
+    }
+
+    // Order is decided here rather than by mutating the caller's array: an
+    // engine builds its request list in whatever order assets were asked for,
+    // and having that list come back permuted would be a nasty surprise.
+    // Sort keys are materialized rather than dereferenced inside the
+    // comparator: sorting indices would chase two pointers into the entry
+    // array per comparison, and that indirection costs more than the ordering
+    // buys back.
+    thread_local std::vector<std::pair<uint64_t, uint32_t>> order;
+    order.clear();
+    order.reserve(requests.size());
+
+    bool alreadyOrdered = true;
+    uint64_t previousOffset = 0;
+    for (uint32_t i = 0; i < static_cast<uint32_t>(requests.size()); ++i) {
+        PakReadRequest& request = requests[i];
+        request.bytesWritten = 0;
+
+        if (!request.handle || request.handle.index >= snapshot->table.infos.size()) {
+            request.status = PakStatus::InvalidHandle;
+            continue;
+        }
+        request.status = PakStatus::Ok;
+
+        const uint64_t offset = snapshot->table.infos[request.handle.index].offset;
+        if (!order.empty() && offset < previousOffset) alreadyOrdered = false;
+        previousOffset = offset;
+        order.emplace_back(offset, i);
+    }
+    if (order.empty()) return 0;
+
+    // An engine that resolves handles in archive order hands them over already
+    // sorted; skipping the sort then is free.
+    if (!alreadyOrdered) std::sort(order.begin(), order.end());
+
+    // Hint every entry before consuming any of them, so faults can be in
+    // flight concurrently instead of one blocking fault per read. Purely
+    // advisory: a failed hint changes nothing about correctness.
+    //
+    // Coalescing first matters more than it looks. Entries are already sorted
+    // by offset, and archives are written in that same order, so a batch
+    // typically collapses to a handful of spans. Issuing one hint per entry
+    // instead costs one syscall per entry, which is enough to make ReadBatch
+    // several times *slower* than a plain read loop whenever the pages are
+    // already resident.
+    if (options.prefetch && snapshot->useMmap && snapshot->guardPtr &&
+        snapshot->guardPtr->mf.data) {
+        // Ranges closer together than this are merged: the gap costs less to
+        // fault in than a separate hint costs to issue.
+        constexpr uint64_t kCoalesceGap = 64ull * 1024;
+
+        thread_local std::vector<PakPlatform::PrefetchRange> ranges;
+        ranges.clear();
+        ranges.reserve(order.size());
+
+        for (const auto& [offset, index] : order) {
+            const PakFileInfo& entry = snapshot->table.infos[requests[index].handle.index];
+            if (entry.compressedSize == 0) continue;
+
+            if (!ranges.empty()) {
+                PakPlatform::PrefetchRange& last = ranges.back();
+                const uint64_t lastEnd = last.offset + last.size;
+                if (entry.offset >= last.offset && entry.offset <= lastEnd + kCoalesceGap) {
+                    const uint64_t newEnd = (std::max)(lastEnd, entry.offset + entry.compressedSize);
+                    last.size = newEnd - last.offset;
+                    continue;
+                }
+            }
+            ranges.push_back(PakPlatform::PrefetchRange{entry.offset, entry.compressedSize});
+        }
+
+        if (!ranges.empty()) {
+            PakPlatform::PrefetchMappedRanges(snapshot->guardPtr->mf, ranges.data(),
+                                              ranges.size());
+        }
+    }
+
+    size_t succeeded = 0;
+    for (const auto& [offset, index] : order) {
+        PakReadRequest& request = requests[index];
+        const PakFileInfo& entry = snapshot->table.infos[request.handle.index];
+
+        request.status = ReadEntryWithCache(request.handle, entry, request.destination,
+                                            &request.bytesWritten, *snapshot);
+        if (request.status == PakStatus::Ok) ++succeeded;
+    }
+    return succeeded;
 }
 
 PakStatus PakReader::VerifyEntry(PakFileHandle handle) const

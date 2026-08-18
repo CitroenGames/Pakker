@@ -11,7 +11,7 @@ Its main job is to build `.pak` archives offline, then serve assets at runtime
 with predictable lookup cost, memory-mapped I/O when available, zero-copy views
 for eligible files, and thread-safe concurrent reads.
 
-The current archive format is v7-only.
+The current archive format is v8-only.
 
 ## Repository Map
 
@@ -105,15 +105,15 @@ there unless the public API truly needs to know about it.
 
 ## Archive Format
 
-The current format is v7:
+The current format is v8:
 
 - Header magic is `PAK0`.
-- Header version is `7`.
+- Header version is `8`.
 - The header stores file count, data alignment, the file-table offset, and the
   name-blob offset and size.
 - The file table is an array of **fixed-size 48-byte `PakEntryRecord`s**:
   data offset, original size, compressed size, content hash, path hash, name
-  offset, name length, and flags.
+  offset, name length, flags, and chunk-size log2.
 - All entry names live together in a single contiguous **name blob** that
   follows the record array. A record refers to its name by
   `(nameOffset, nameLength)` into that blob.
@@ -124,7 +124,8 @@ The current format is v7:
 - File data offsets are padded to `PakOptions::alignment`.
 - Bit `0x01` in entry flags means the on-disk data is LZ4-compressed. Bit
   `0x02` means Zstd-compressed. The two are mutually exclusive; helper
-  `PakInternal::IsCompressed(flags)` checks either.
+  `PakInternal::IsCompressed(flags)` checks either. Bit `0x04` means the
+  payload is chunked; helper `PakInternal::IsChunked(flags)` checks it.
 
 ### Why fixed-size records plus a name blob
 
@@ -135,21 +136,46 @@ allocating a `std::string` per file, then a second copy inside a node-based
 badly -- a 200k-entry archive took ~200 ms to open, and a 24-layer mount ran
 to 28 seconds.
 
-The v7 split lets `PakReader::Open()` do exactly two bulk reads (records, then
+The v7 split let `PakReader::Open()` do exactly two bulk reads (records, then
 names) and use the record array as its final runtime representation. Storing
 the path hash in the record additionally means opening does no string hashing
 at all, and that layered mounts can merge namespaces without re-hashing or
 even loading names.
 
+### Chunked entry payload
+
+When flag bit `0x04` is set, the entry's payload is not one compression frame
+over the whole entry. It is a `PakChunkHeader` (uncompressed bytes per block,
+block count), then one `uint32` on-disk size per block, then each block's
+bytes back to back.
+
+Each block is compressed independently, so any one of them can be decoded
+without touching the others. A block that does not compress is stored raw --
+its recorded size equals its uncompressed size -- so incompressible data never
+pays an expansion penalty.
+
+This is what makes `ReadRange()` work on a compressed entry. Without it,
+reaching any byte of a large compressed asset means decoding all of it: on a
+64 MiB Zstd entry that is ~9.8 ms, against ~45 us chunked. The cost is ratio:
+independent blocks give up cross-block matches, measured at roughly 4% larger
+on mixed content, which is why `PakOptions::compressionChunkSize` defaults to
+`0` (off) and is an explicit opt-in for streaming builds.
+
+The block size is recorded twice on purpose: in `PakEntryRecord::chunkSizeLog2`
+so `Open()` can report it without touching payloads, and in the payload header
+where the reader cross-checks it. `ParseChunkTable()` validates the whole size
+table against the payload before any decode, so a corrupt table cannot steer a
+decode off the end of the mapping.
+
 Format invariants:
 
-- Only v7 archives are accepted. v6 (variable-length file table), v5 (no Zstd
-  flag bit) and v4 (no `contentHash` field) are all rejected with no
-  dual-format read path and no in-place upgrade tool -- rebuild from source
-  with the current library. This is the fourth hard version cutover in this
-  project's history (v3->v4, v4->v5, v5->v6, v6->v7) -- keep following that
-  precedent rather than introducing a dual-format reader unless there's a
-  strong reason to break it.
+- Only v8 archives are accepted. v7 (no chunked-entry flag), v6
+  (variable-length file table), v5 (no Zstd flag bit) and v4 (no `contentHash`
+  field) are all rejected with no dual-format read path and no in-place upgrade
+  tool -- rebuild from source with the current library. This is the fifth hard
+  version cutover in this project's history (v3->v4, v4->v5, v5->v6, v6->v7,
+  v7->v8) -- keep following that precedent rather than introducing a
+  dual-format reader unless there's a strong reason to break it.
 - File names are normalized to forward slashes.
 - Empty, invalid, too-long, duplicate-after-normalization, or traversal-like
   names must be rejected.
@@ -165,11 +191,66 @@ Format invariants:
   either a duplicate path or a genuine 64-bit collision; either way the
   archive is unusable as written and `Open()` rejects it rather than making
   one of the two entries unreachable.
+- A chunked entry's chunk table must exactly account for its payload: every
+  block in bounds, none larger than its uncompressed size, and the blocks
+  together covering the payload with nothing left over.
 - Alignment must be a power of two. `0` is treated as `1`.
 
 Any archive-format change must update `PakInternal::PakHeader`,
 `PakInternal::PakEntryRecord`, `ReadPakHeader()`, `WritePakHeader()`,
 file-table I/O, validation, tests, README, and this handbook.
+
+## Concurrency Model
+
+Two rules explain most of the runtime design.
+
+**The read path never writes to shared memory.** `Open()` builds an immutable
+`PakReader::ReadSnapshot` and publishes it with one release store;
+`AcquireSnapshot()` is one acquire load. No lock, no reference count. This
+matters because a `shared_lock` acquire/release pair and a `shared_ptr`
+copy/destroy pair are atomic read-modify-writes, and an atomic RMW must take
+the cache line exclusively -- so under a streaming workload every reader
+invalidates every other reader's copy and aggregate throughput *falls* as
+threads are added. It previously did: `Find()` managed 9.15 Mops/s across 32
+threads against 13.96 on one. It is now 435 Mops/s.
+
+The same pattern is applied to `PakMount::MergedIndex` and to
+`PakReader`'s cache policy. Counters that must be written on the hot path are
+sharded per thread (`PakInternal::ShardedCounter`) for the same reason.
+
+The cost of this is a stricter lifetime contract: `Close()` unpublishes and
+then frees, so it must not race with reads. That was already the documented
+rule. `PakView` and `PakSpan` hold their own `shared_ptr` to the mapping, so
+values already handed out stay valid after `Close()` regardless -- and that
+reference count is the one atomic RMW deliberately left on the read path,
+because there is no way to honour that guarantee without it.
+
+**Anything that costs a lock is moved off the per-read path.** The decoded
+memory cache is split into independently-locked shards, and its policy is read
+through a published pointer rather than copied under a mutex. Before that, a
+compressed read took the global cache mutex and heap-allocated a string copy
+of the options struct, every single time.
+
+When adding to the read path, the question to ask is not "is this lock held
+briefly" but "does this write to a cache line another thread also touches."
+
+## Build Pipeline
+
+`CreatePak()` and `CreatePakFromFolder()` encode entries on a worker pool and
+write them sequentially in input order. Two properties are load-bearing:
+
+- **Output is byte-identical regardless of worker count.** Encoding is
+  parallel, writing is not. `ParallelBuildMatchesSequentialByteForByte` and
+  `ParallelFolderBuildMatchesSequential` assert this directly; keep them
+  passing for any pipeline change.
+- **Memory is bounded by batching.** Entries are processed in batches capped by
+  both count (`kMaxBatchEntries`) and total source bytes (`kMaxBatchBytes`), so
+  a handful of very large assets cannot balloon the working set. The folder
+  builder collects file sizes during directory traversal specifically so it can
+  apply the byte cap before reading anything.
+
+The folder builder reads each file straight into its result buffer, so asset
+bytes are never copied merely to hand them to the encoder.
 
 ## Runtime Read Path
 
@@ -203,13 +284,20 @@ encrypted entries, validate destination sizes, decompress with LZ4 or Zstd
 (dispatched by `PakInternal::DecompressBuffer` based on entry flags) when
 needed, and use decoded caching when the entry is eligible.
 
-`ReadRange()` is a partial-read path for large uncompressed entries (video/
-audio) that shouldn't be fully materialized just to read a slice. It operates
-in decoded/original-offset space, supports encrypted-but-uncompressed entries
-(XOR-with-repeating-key is range-safe -- the key index is offset by
-`rangeOffset`), and returns `PakStatus::Unsupported` immediately for
-compressed entries rather than decoding the whole entry to fake partial-read
-semantics -- this format's compressed frames have no internal chunk index.
+`ReadRange()` is a partial-read path for large entries (video/audio) that
+shouldn't be fully materialized just to read a slice. It operates in
+decoded/original-offset space and covers three cases:
+
+- **Uncompressed** entries, encrypted or not. XOR-with-repeating-key is
+  range-safe: the key index is offset by `rangeOffset` rather than decrypting
+  from the start of the entry.
+- **Chunked compressed** entries, where only the blocks the range actually
+  covers get decoded. With encryption in play the payload has to be
+  materialized and decrypted first, because the chunk table sits at its head.
+- **Whole-entry compressed** entries return `PakStatus::Unsupported`
+  immediately, rather than decoding the whole entry to fake partial-read
+  semantics. There is no index to seek into; rebuild with
+  `PakOptions::compressionChunkSize` set if those entries need range reads.
 
 `ListFiles()`/`ListFilesWithPrefix()` enumerate the cached file table, no
 disk I/O -- the single-archive equivalent of `PakMount`'s enumeration.
@@ -372,7 +460,7 @@ Keep the hot runtime path allocation-conscious:
 Keep compatibility explicit:
 
 - If a change breaks old archives, make the version boundary obvious.
-- If a change only affects v7 internals, add tests that prove existing v7
+- If a change only affects v8 internals, add tests that prove existing v8
   behavior still works.
 - If adding a new public API, update `src/Pak.h`, `README.MD`, examples or tests
   as appropriate.
@@ -385,11 +473,11 @@ Known limitations (deliberate, revisitable scope cuts, not oversights):
   once at a load-screen boundary -- doesn't need selective removal.
 - There is no in-place archive upgrade tool between any format version.
   Rebuild from source with the current library.
-- `PakReader::ReadRange()` only supports uncompressed entries (encrypted or
-  not); compressed entries return `PakStatus::Unsupported`. This format's
-  compressed frames have no internal chunk index, so a true seekable
-  compressed-range-read would need a block-compression format change (chunk
-  table), which is out of scope for now.
+- `PakReader::ReadRange()` supports uncompressed entries (encrypted or not)
+  and chunked compressed entries. A compressed entry stored as one whole-entry
+  frame has no index to seek into and returns `PakStatus::Unsupported`; that
+  is a property of how the archive was built, not a missing feature -- set
+  `PakOptions::compressionChunkSize` at pack time.
 - `PakLooseOverlay` is dev-only: every lookup stats the filesystem, has no
   `View()`/zero-copy equivalent, and loose files are read raw (no
   compression or encryption). Not intended for a shipping hot path.

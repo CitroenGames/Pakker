@@ -46,12 +46,13 @@ static constexpr std::string_view PAK_MAGIC = "PAK0";
 static constexpr uint32_t PAK_VERSION_4     = 4; // rejected legacy format, no contentHash field
 static constexpr uint32_t PAK_VERSION_5     = 5; // rejected legacy format, no Zstd flag bit
 static constexpr uint32_t PAK_VERSION_6     = 6; // rejected legacy format, variable-length file table
-static constexpr uint32_t PAK_VERSION_7     = 7; // v7-only format: fixed-size records + name blob
+static constexpr uint32_t PAK_VERSION_7     = 7; // rejected legacy format, no chunked-entry flag
+static constexpr uint32_t PAK_VERSION_8     = 8; // v8-only format: adds chunked compressed entries
 
 #pragma pack(push, 1)
 struct PakHeader {
     char magic[4] = { 'P', 'A', 'K', '0' };
-    uint32_t version   = PAK_VERSION_7;
+    uint32_t version   = PAK_VERSION_8;
     uint32_t numFiles  = 0;
     uint32_t alignment = 0;         // data alignment in bytes (power of 2)
     uint64_t fileTableOffset = 0;   // start of the fixed-size entry records
@@ -79,7 +80,11 @@ struct PakEntryRecord {
     uint32_t nameOffset     = 0; // byte offset into the name blob
     uint16_t nameLength     = 0;
     uint8_t  flags          = 0; // bit 0: LZ4 compressed, bit 1: Zstd compressed
-    uint8_t  reserved       = 0;
+    // log2 of the uncompressed bytes per block, when PAK_FLAG_CHUNKED is set.
+    // Duplicated in the payload header, which the reader cross-checks against
+    // this; keeping it here means Open() can report an entry's chunk size
+    // without seeking into the payload of every chunked entry.
+    uint8_t  chunkSizeLog2  = 0;
 };
 #pragma pack(pop)
 static_assert(sizeof(PakEntryRecord) == 48, "PakEntryRecord must be 48 bytes with no padding");
@@ -94,6 +99,7 @@ struct PakEntry {
     uint8_t  flags        = 0;   // bit 0: LZ4 compressed, bit 1: Zstd compressed (mutually exclusive)
     uint64_t contentHash   = 0;  // XXH64 of the on-disk (compressed+encrypted) bytes
     uint64_t pathHash      = 0;  // XXH64 of the normalized name
+    uint8_t  chunkSizeLog2 = 0;  // set when flags carries PAK_FLAG_CHUNKED
 
     PakEntry() = default;
     PakEntry(std::string name, uint64_t off, uint64_t origSz,
@@ -117,10 +123,37 @@ static_assert(sizeof(LookupSlot) == 8, "LookupSlot must stay 8 bytes");
 
 static constexpr uint8_t PAK_FLAG_LZ4_COMPRESSED  = 0x01;
 static constexpr uint8_t PAK_FLAG_ZSTD_COMPRESSED = 0x02;
+// The entry's payload is a chunk table followed by independently-compressed
+// fixed-size blocks, rather than one compression frame over the whole entry.
+static constexpr uint8_t PAK_FLAG_CHUNKED         = 0x04;
+
+// Header of a chunked entry's on-disk payload, followed immediately by
+// `chunkCount` uint32 compressed sizes and then the chunk payloads back to
+// back. A chunk whose compressed size equals its uncompressed size is stored
+// raw, which is how incompressible blocks avoid paying an expansion penalty.
+#pragma pack(push, 1)
+struct PakChunkHeader {
+    uint32_t chunkSize  = 0; // uncompressed bytes per chunk (power of two)
+    uint32_t chunkCount = 0;
+};
+#pragma pack(pop)
+static_assert(sizeof(PakChunkHeader) == 8, "PakChunkHeader must be 8 bytes");
+
+// Chunking exists so a large asset does not have to be decoded in full before
+// any of it is usable. Whole-entry compression makes ReadRange() impossible
+// and forces a multi-millisecond decode to reach the first byte of a big
+// streaming asset; chunking bounds that to a single block.
+static constexpr uint32_t MIN_COMPRESSION_CHUNK_SIZE = 4096;
+static constexpr uint32_t MAX_COMPRESSION_CHUNK_SIZE = 16u * 1024 * 1024;
 
 inline bool IsCompressed(uint8_t flags)
 {
     return (flags & (PAK_FLAG_LZ4_COMPRESSED | PAK_FLAG_ZSTD_COMPRESSED)) != 0;
+}
+
+inline bool IsChunked(uint8_t flags)
+{
+    return (flags & PAK_FLAG_CHUNKED) != 0;
 }
 
 // Internal helpers shared by Pakker and PakReader
@@ -301,8 +334,31 @@ struct PakFileInfo {
     uint64_t offset = 0;
     uint64_t pathHash = 0;     // XXH64 of the normalized name; see PakPathHash
     uint64_t contentHash = 0;  // XXH64 of the on-disk bytes
+    uint32_t chunkSize = 0;    // uncompressed bytes per block, 0 when not chunked
     uint8_t  flags = 0;
     bool compressed = false;
+};
+
+// One entry of a scatter read. The caller owns `destination`; `bytesWritten`
+// and `status` are filled in by ReadBatch().
+struct PakReadRequest {
+    PakFileHandle handle{};
+    std::span<uint8_t> destination{};
+
+    uint64_t bytesWritten = 0;
+    PakStatus status = PakStatus::Ok;
+};
+
+// Tuning for ReadBatch().
+struct PakBatchOptions {
+    // Issue OS prefetch hints for the whole batch before reading any of it.
+    //
+    // This pays when the data is not resident -- cold storage, first touch of
+    // a level's assets -- because the faults then overlap instead of
+    // serializing. It is a straight loss when the pages are already resident,
+    // where the hint costs a syscall and a page-table walk for nothing. Leave
+    // it on for streaming; turn it off for re-reads of data known to be hot.
+    bool prefetch = true;
 };
 
 struct PakView {
@@ -333,6 +389,31 @@ struct PakOptions {
     PakCompression compression = PakCompression::None;
     int zstdLevel        = 19;    // 1-19; only consulted when compression == Zstd
     uint32_t alignment   = 16;    // data alignment in bytes (must be power of 2)
+
+    // Splits compressed entries into independently-decodable blocks of this
+    // many uncompressed bytes. 0 disables chunking; otherwise it must be a
+    // power of two between 4 KiB and 16 MiB. Only entries larger than the
+    // chunk size are chunked, so small assets are unaffected either way.
+    //
+    // Chunking is what makes ReadRange() work on a compressed entry, and it
+    // bounds time-to-first-byte on a large streaming asset to one block
+    // instead of the whole file. It is off by default because it is a real
+    // trade: compressing each block independently gives up cross-block
+    // matches, so the archive gets slightly larger, and on a full-size
+    // install a percent of ratio is gigabytes of download. Turn it on for
+    // streaming builds, measure the ratio cost on your own content, and
+    // decide.
+    uint32_t compressionChunkSize = 0;
+
+    // Worker threads used to compress, encrypt and hash entries. 0 means one
+    // per hardware thread; 1 forces the old fully sequential pipeline.
+    //
+    // Entry encoding is embarrassingly parallel and, at the default
+    // zstdLevel of 19, completely dominates build time -- packing is the
+    // difference between an overnight job and a coffee break on a large
+    // content set. Output ordering stays deterministic regardless of worker
+    // count: entries are encoded in parallel but written in input order.
+    uint32_t workerThreads = 0;
 };
 
 // ---------------------------------------------------------------------------
@@ -449,9 +530,14 @@ private:
 // ---------------------------------------------------------------------------
 // Pakker -- build-time API (create, extract, modify PAK files)
 //
-// Thread safety: Pakker is NOT thread-safe. It is designed for single-threaded
-// build-time use. If you need to create multiple PAK files concurrently, use
-// separate Pakker instances (each instance has no shared mutable state).
+// Thread safety: a single Pakker instance must be driven from one thread --
+// do not call into the same instance concurrently. Separate instances share
+// no mutable state and can run in parallel.
+//
+// That is about the API, not the implementation: CreatePak() and
+// CreatePakFromFolder() internally fan entry encoding out across
+// PakOptions::workerThreads and still produce byte-identical, deterministically
+// ordered archives.
 // ---------------------------------------------------------------------------
 
 class Pakker {
@@ -594,6 +680,26 @@ public:
                    uint64_t* bytesWritten = nullptr) const;
     PakStatus Load(PakFileHandle handle, std::vector<uint8_t>& outData) const;
     PakStatus Prefetch(PakFileHandle handle) const;
+
+    // Serves a whole set of reads in one call, visiting entries in ascending
+    // archive offset order rather than in the order the engine happened to ask
+    // for them. Returns how many requests succeeded; per-request outcomes land
+    // in each request's status/bytesWritten.
+    //
+    // Two things make this worth having over a loop of Read() calls. Ordering
+    // the accesses by offset turns a scattered access pattern into a forward
+    // sweep, which is what storage readahead is built to accelerate. And every
+    // entry is prefetch-hinted up front before any of them is consumed, so the
+    // faults overlap instead of serializing one at a time.
+    //
+    // The request array is not reordered -- ordering is internal.
+    //
+    // This does not create threads. Reads are lock-free, so an engine should
+    // split a frame's requests across its own job-system workers and call this
+    // once per worker; that gives both the ordering win and real parallelism,
+    // without the library owning a thread pool.
+    size_t ReadBatch(std::span<PakReadRequest> requests,
+                     const PakBatchOptions& options = {}) const;
 
     // Partial read into decoded/original-content offset space, for large
     // single assets (video/audio) that shouldn't be fully materialized just

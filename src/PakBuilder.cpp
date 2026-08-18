@@ -3,12 +3,171 @@
 #include "PakCompression.h"
 #include <filesystem>
 #include <algorithm>
+#include <atomic>
+#include <thread>
 #include <unordered_set>
 #include <sstream>
+#include <tuple>
 
 namespace fs = std::filesystem;
 
 using namespace PakInternal;
+
+// ---------------------------------------------------------------------------
+// Parallel encode pipeline
+//
+// Compression dominates pack time -- at the default zstd level 19 it is
+// roughly three orders of magnitude slower than the I/O around it -- and it
+// is per-entry independent, so it parallelizes cleanly. Encoding runs on a
+// worker pool while writing stays strictly sequential in input order, which
+// keeps archives byte-identical no matter how many workers ran.
+//
+// Memory is bounded by processing entries in batches: a batch is capped both
+// by entry count and by total source bytes, so a handful of very large assets
+// cannot balloon the working set.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+constexpr size_t kMaxBatchEntries = 4096;
+constexpr uint64_t kMaxBatchBytes = 128ull * 1024 * 1024;
+
+// One entry's encode result: the exact bytes to write plus what the file
+// table needs to record about them.
+struct EncodedEntry {
+    // Holds the transformed bytes when compression or encryption produced
+    // any; for a stored, unencrypted in-memory entry the caller's buffer is
+    // referenced directly instead.
+    std::vector<uint8_t> storage;
+    const uint8_t* sourceBytes = nullptr;
+    uint64_t sourceSize = 0;
+    bool usesStorage = false;
+
+    uint64_t originalSize = 0;
+    uint64_t contentHash = 0;
+    uint8_t flags = 0;
+    uint8_t chunkSizeLog2 = 0;
+
+    bool ok = false;       // false: skip this entry (unreadable source file)
+    bool fatal = false;    // true: abort the whole build
+
+    const uint8_t* Data() const { return usesStorage ? storage.data() : sourceBytes; }
+    uint64_t Size() const
+    {
+        return usesStorage ? static_cast<uint64_t>(storage.size()) : sourceSize;
+    }
+};
+
+// Rejects a chunk size the format cannot represent. 0 means chunking is off.
+bool ValidateChunkSize(uint32_t chunkSize, const char* context)
+{
+    if (chunkSize == 0) return true;
+    if (chunkSize < MIN_COMPRESSION_CHUNK_SIZE || chunkSize > MAX_COMPRESSION_CHUNK_SIZE ||
+        (chunkSize & (chunkSize - 1)) != 0) {
+        Log(PakLogLevel::Error, std::string(context) +
+            ": compressionChunkSize must be a power of two between 4 KiB and 16 MiB.");
+        return false;
+    }
+    return true;
+}
+
+uint32_t ResolveWorkerCount(uint32_t requested)
+{
+    if (requested > 0) return requested;
+    const unsigned hardware = std::thread::hardware_concurrency();
+    return hardware > 0 ? hardware : 1u;
+}
+
+// Runs body(i) for every i in [0, count). Workers pull indices off a shared
+// counter so uneven entry sizes self-balance. The calling thread takes part
+// rather than idling.
+template <typename Body>
+void ParallelFor(size_t count, uint32_t workerCount, Body&& body)
+{
+    if (count == 0) return;
+    if (workerCount <= 1 || count == 1) {
+        for (size_t i = 0; i < count; ++i) body(i);
+        return;
+    }
+
+    std::atomic<size_t> next{0};
+    auto run = [&]() {
+        for (;;) {
+            const size_t index = next.fetch_add(1, std::memory_order_relaxed);
+            if (index >= count) break;
+            body(index);
+        }
+    };
+
+    const uint32_t spawn = static_cast<uint32_t>(
+        (std::min)(static_cast<size_t>(workerCount), count)) - 1;
+    std::vector<std::thread> workers;
+    workers.reserve(spawn);
+    for (uint32_t i = 0; i < spawn; ++i) workers.emplace_back(run);
+    run();
+    for (auto& worker : workers) worker.join();
+}
+
+// Compresses, encrypts and hashes one entry.
+//
+// When `source` is null the bytes are already sitting in out.storage (the
+// folder builder reads straight into it), which avoids a copy of every asset.
+void EncodeEntry(const uint8_t* source, uint64_t sourceSize,
+                 const PakOptions& options, const std::string& encryptionKey,
+                 std::vector<uint8_t>& scratch, EncodedEntry& out)
+{
+    const bool sourceIsExternal = source != nullptr;
+    if (!sourceIsExternal) {
+        source = out.storage.data();
+        sourceSize = static_cast<uint64_t>(out.storage.size());
+        out.usesStorage = true;
+    } else {
+        out.sourceBytes = source;
+        out.sourceSize = sourceSize;
+    }
+    out.originalSize = sourceSize;
+
+    if (options.compression != PakCompression::None && sourceSize > 0) {
+        scratch.clear();
+        // Chunk only entries actually bigger than one chunk. Below that a
+        // chunked payload is just a whole-entry frame plus a table header, so
+        // it costs ratio for nothing.
+        const bool chunked = options.compressionChunkSize > 0 &&
+                             sourceSize > options.compressionChunkSize;
+        const bool ok = chunked
+            ? CompressChunked(options.compression, options.zstdLevel,
+                              options.compressionChunkSize, source, sourceSize,
+                              scratch, out.flags)
+            : CompressBuffer(options.compression, options.zstdLevel,
+                             source, sourceSize, scratch, out.flags);
+        if (!ok) {
+            out.fatal = true;
+            return;
+        }
+        if (out.flags != 0) {
+            out.storage.swap(scratch);
+            out.usesStorage = true;
+            if (chunked) {
+                uint32_t log2 = 0;
+                while ((1u << log2) < options.compressionChunkSize) ++log2;
+                out.chunkSizeLog2 = static_cast<uint8_t>(log2);
+            }
+        }
+    }
+
+    if (!encryptionKey.empty()) {
+        if (!out.usesStorage) {
+            out.storage.assign(source, source + sourceSize);
+            out.usesStorage = true;
+        }
+        EncryptDecrypt(out.storage, encryptionKey);
+    }
+
+    out.contentHash = HashBytesFast(out.Data(), out.Size());
+    out.ok = true;
+}
+
+} // namespace
 
 // Helper: write zero-padding bytes to align stream position
 static bool WritePadding(std::ostream& stream, uint32_t alignment)
@@ -77,6 +236,33 @@ bool Pakker::CreatePak(const std::string& pakFilename,
         Log(PakLogLevel::Error, "CreatePak: Alignment must be a power of 2.");
         return false;
     }
+    if (!ValidateChunkSize(options.compressionChunkSize, "CreatePak")) {
+        return false;
+    }
+
+    // Validate and normalize every name up front, in the map's already-sorted
+    // order, so the encode stage below can be pure and order-independent.
+    std::vector<std::string> names;
+    std::vector<const std::vector<uint8_t>*> payloads;
+    names.reserve(files.size());
+    payloads.reserve(files.size());
+    {
+        std::unordered_set<std::string> seenNames;
+        for (const auto& [filename, data] : files) {
+            std::string normalizedFilename = NormalizePathSeparators(filename);
+            if (!IsValidFilename(normalizedFilename)) {
+                Log(PakLogLevel::Error, "CreatePak: Invalid filename: " + filename);
+                return false;
+            }
+            if (!seenNames.insert(normalizedFilename).second) {
+                Log(PakLogLevel::Error,
+                    "CreatePak: Duplicate filename after normalization: " + normalizedFilename);
+                return false;
+            }
+            names.push_back(std::move(normalizedFilename));
+            payloads.push_back(&data);
+        }
+    }
 
     std::ofstream pakStream(pakFilename, std::ios::binary);
     if (!pakStream) {
@@ -85,7 +271,7 @@ bool Pakker::CreatePak(const std::string& pakFilename,
     }
 
     PakHeader header;
-    header.version = PAK_VERSION_7;
+    header.version = PAK_VERSION_8;
     header.numFiles = static_cast<uint32_t>(files.size());
     header.fileTableOffset = 0;
     header.alignment = alignment;
@@ -95,74 +281,72 @@ bool Pakker::CreatePak(const std::string& pakFilename,
     std::vector<PakEntry> entries;
     entries.reserve(files.size());
 
-    std::vector<uint8_t> compressBuffer;
-    std::vector<uint8_t> encryptBuffer;
-    std::unordered_set<std::string> seenNames;
+    // With nothing to compress or encrypt there is no CPU work to spread --
+    // the payloads are already in memory, so this degenerates to a copy and
+    // spawning threads would only add latency.
+    const bool needsEncoding =
+        options.compression != PakCompression::None || !encryptionKey_.empty();
+    const uint32_t workerCount = needsEncoding ? ResolveWorkerCount(options.workerThreads) : 1;
 
-    for (const auto& [filename, data] : files) {
-        std::string normalizedFilename = NormalizePathSeparators(filename);
-        if (!IsValidFilename(normalizedFilename)) {
-            Log(PakLogLevel::Error, "CreatePak: Invalid filename: " + filename);
-            return false;
-        }
-        if (!seenNames.insert(normalizedFilename).second) {
-            Log(PakLogLevel::Error, "CreatePak: Duplicate filename after normalization: " + normalizedFilename);
-            return false;
-        }
-
-        // Align file data offset
-        if (!WritePadding(pakStream, alignment)) {
-            Log(PakLogLevel::Error, "CreatePak: Failed to write alignment padding.");
-            return false;
+    std::vector<EncodedEntry> encoded;
+    for (size_t batchStart = 0; batchStart < names.size(); ) {
+        size_t batchEnd = batchStart;
+        uint64_t batchBytes = 0;
+        while (batchEnd < names.size() &&
+               batchEnd - batchStart < kMaxBatchEntries &&
+               (batchEnd == batchStart || batchBytes < kMaxBatchBytes)) {
+            batchBytes += payloads[batchEnd]->size();
+            ++batchEnd;
         }
 
-        const uint8_t* writePtr = data.data();
-        size_t writeSize = data.size();
-        uint8_t flags = 0;
-        uint64_t originalSize = data.size();
+        const size_t batchCount = batchEnd - batchStart;
+        encoded.clear();
+        encoded.resize(batchCount);
 
-        if (options.compression != PakCompression::None && !data.empty()) {
-            if (!CompressBuffer(options.compression, options.zstdLevel,
-                                data.data(), data.size(), compressBuffer, flags)) {
-                Log(PakLogLevel::Error, "CreatePak: Compression failed for: " + normalizedFilename);
+        ParallelFor(batchCount, workerCount, [&](size_t i) {
+            // Reused across every entry this worker handles, so compression
+            // does not reallocate its output buffer per file.
+            thread_local std::vector<uint8_t> scratch;
+            const std::vector<uint8_t>& payload = *payloads[batchStart + i];
+            EncodeEntry(payload.data(), static_cast<uint64_t>(payload.size()),
+                        options, encryptionKey_, scratch, encoded[i]);
+        });
+
+        for (size_t i = 0; i < batchCount; ++i) {
+            const EncodedEntry& result = encoded[i];
+            const std::string& name = names[batchStart + i];
+            if (result.fatal) {
+                Log(PakLogLevel::Error, "CreatePak: Compression failed for: " + name);
                 return false;
             }
-            if (flags != 0) {
-                writePtr = compressBuffer.data();
-                writeSize = compressBuffer.size();
+
+            if (!WritePadding(pakStream, alignment)) {
+                Log(PakLogLevel::Error, "CreatePak: Failed to write alignment padding.");
+                return false;
+            }
+
+            const uint64_t currentOffset = SafeStreamPos(pakStream, pakStream.tellp());
+            if (!pakStream) {
+                Log(PakLogLevel::Error, "CreatePak: Failed to get stream position.");
+                return false;
+            }
+
+            entries.emplace_back(name, currentOffset, result.originalSize,
+                                 result.Size(), result.flags, result.contentHash,
+                                 PakPathHash(name));
+            entries.back().chunkSizeLog2 = result.chunkSizeLog2;
+
+            if (result.Size() > 0) {
+                pakStream.write(reinterpret_cast<const char*>(result.Data()),
+                                static_cast<std::streamsize>(result.Size()));
+                if (!pakStream) {
+                    Log(PakLogLevel::Error, "CreatePak: Failed to write data for file: " + name);
+                    return false;
+                }
             }
         }
 
-        // Encrypt in-place on whichever buffer writePtr already points to
-        if (!encryptionKey_.empty()) {
-            if (writePtr == data.data()) {
-                // Data is from the const map value; copy into compressBuffer to mutate
-                compressBuffer.assign(data.begin(), data.end());
-                EncryptDecrypt(compressBuffer, encryptionKey_);
-                writePtr = compressBuffer.data();
-                writeSize = compressBuffer.size();
-            } else {
-                // writePtr points to compressBuffer (compression happened); encrypt in-place
-                EncryptDecrypt(compressBuffer, encryptionKey_);
-            }
-        }
-
-        uint64_t currentOffset = SafeStreamPos(pakStream, pakStream.tellp());
-        if (!pakStream) {
-            Log(PakLogLevel::Error, "CreatePak: Failed to get stream position.");
-            return false;
-        }
-        uint64_t contentHash = HashBytesFast(writePtr, writeSize);
-        entries.emplace_back(normalizedFilename, currentOffset, originalSize,
-                             static_cast<uint64_t>(writeSize), flags, contentHash,
-                             PakPathHash(normalizedFilename));
-
-        pakStream.write(reinterpret_cast<const char*>(writePtr),
-                       static_cast<std::streamsize>(writeSize));
-        if (!pakStream) {
-            Log(PakLogLevel::Error, "CreatePak: Failed to write data for file: " + filename);
-            return false;
-        }
+        batchStart = batchEnd;
     }
 
     if (!WriteFileTable(pakStream, entries, header)) return false;
@@ -513,8 +697,22 @@ bool Pakker::CreatePakFromFolder(const std::string& pakFilename,
                                  const std::string& folderPath,
                                  const PakOptions& options)
 {
-    // Collect file paths first without loading contents into memory
-    std::vector<std::pair<std::string, fs::path>> filePaths; // (normalized name, disk path)
+    // Collect file paths first without loading contents into memory. Sizes
+    // come along so batches below can be bounded by bytes as well as by entry
+    // count -- a few very large assets would otherwise blow past the memory
+    // budget on their own.
+    struct SourceFile {
+        std::string name;   // normalized, archive-relative
+        fs::path diskPath;
+        uint64_t size = 0;
+
+        bool operator<(const SourceFile& other) const
+        {
+            return std::tie(name, diskPath) < std::tie(other.name, other.diskPath);
+        }
+    };
+
+    std::vector<SourceFile> filePaths;
     try {
         for (const auto& entry : fs::recursive_directory_iterator(folderPath)) {
             if (fs::is_regular_file(entry.path())) {
@@ -524,7 +722,10 @@ bool Pakker::CreatePakFromFolder(const std::string& pakFilename,
                     Log(PakLogLevel::Warning, "CreatePakFromFolder: Skipping invalid filename: " + relativePath);
                     continue;
                 }
-                filePaths.emplace_back(relativePath, entry.path());
+                std::error_code sizeEc;
+                const uint64_t size = static_cast<uint64_t>(entry.file_size(sizeEc));
+                filePaths.push_back(SourceFile{std::move(relativePath), entry.path(),
+                                               sizeEc ? 0 : size});
             }
         }
     } catch (const fs::filesystem_error& e) {
@@ -546,6 +747,9 @@ bool Pakker::CreatePakFromFolder(const std::string& pakFilename,
         Log(PakLogLevel::Error, "CreatePakFromFolder: Alignment must be a power of 2.");
         return false;
     }
+    if (!ValidateChunkSize(options.compressionChunkSize, "CreatePakFromFolder")) {
+        return false;
+    }
 
     std::ofstream pakStream(pakFilename, std::ios::binary);
     if (!pakStream) {
@@ -554,7 +758,7 @@ bool Pakker::CreatePakFromFolder(const std::string& pakFilename,
     }
 
     PakHeader header;
-    header.version = PAK_VERSION_7;
+    header.version = PAK_VERSION_8;
     header.numFiles = static_cast<uint32_t>(filePaths.size());
     header.fileTableOffset = 0;
     header.alignment = alignment;
@@ -564,81 +768,106 @@ bool Pakker::CreatePakFromFolder(const std::string& pakFilename,
     std::vector<PakEntry> entries;
     entries.reserve(filePaths.size());
 
-    std::vector<uint8_t> compressBuffer;
+    // Entries are read from disk and encoded on worker threads a batch at a
+    // time, then written sequentially in the sorted order collected above, so
+    // the archive stays byte-identical regardless of worker count. Only one
+    // batch is resident at once, so peak memory tracks kMaxBatchBytes rather
+    // than the size of the content tree.
+    const uint32_t workerCount = ResolveWorkerCount(options.workerThreads);
 
-    // Stream each file from disk one at a time to avoid loading everything into memory
-    for (const auto& [normalizedName, diskPath] : filePaths) {
-        // Bulk read: open at end to get size, then read in one call
-        std::ifstream file(diskPath, std::ios::binary | std::ios::ate);
-        if (!file) {
-            Log(PakLogLevel::Warning, "CreatePakFromFolder: Failed to open file: " + diskPath.string());
-            continue;
+    std::vector<EncodedEntry> encoded;
+    for (size_t batchStart = 0; batchStart < filePaths.size(); ) {
+        size_t batchEnd = batchStart;
+        uint64_t batchBytes = 0;
+        while (batchEnd < filePaths.size() &&
+               batchEnd - batchStart < kMaxBatchEntries &&
+               (batchEnd == batchStart || batchBytes < kMaxBatchBytes)) {
+            batchBytes += filePaths[batchEnd].size;
+            ++batchEnd;
         }
-        auto fileSize = file.tellg();
-        if (fileSize == std::streampos(-1)) {
-            Log(PakLogLevel::Warning, "CreatePakFromFolder: Failed to get file size: " + diskPath.string());
-            continue;
-        }
-        file.seekg(0, std::ios::beg);
-        std::vector<uint8_t> data(static_cast<size_t>(fileSize));
-        if (fileSize > 0) {
-            file.read(reinterpret_cast<char*>(data.data()), fileSize);
+        const size_t batchCount = batchEnd - batchStart;
+
+        encoded.clear();
+        encoded.resize(batchCount);
+
+        ParallelFor(batchCount, workerCount, [&](size_t i) {
+            thread_local std::vector<uint8_t> scratch;
+            EncodedEntry& result = encoded[i];
+            const fs::path& diskPath = filePaths[batchStart + i].diskPath;
+
+            // Bulk read: open at end to get size, then read in one call
+            std::ifstream file(diskPath, std::ios::binary | std::ios::ate);
             if (!file) {
-                Log(PakLogLevel::Warning, "CreatePakFromFolder: Failed to read file: " + diskPath.string());
-                continue;
+                Log(PakLogLevel::Warning,
+                    "CreatePakFromFolder: Failed to open file: " + diskPath.string());
+                return;
             }
-        }
-        file.close();
+            const auto fileSize = file.tellg();
+            if (fileSize == std::streampos(-1)) {
+                Log(PakLogLevel::Warning,
+                    "CreatePakFromFolder: Failed to get file size: " + diskPath.string());
+                return;
+            }
+            file.seekg(0, std::ios::beg);
 
-        // Align file data offset
-        if (!WritePadding(pakStream, alignment)) {
-            Log(PakLogLevel::Error, "CreatePakFromFolder: Failed to write alignment padding.");
-            return false;
-        }
+            // Read straight into the result's storage so the bytes are never
+            // copied just to hand them to the encoder.
+            result.storage.resize(static_cast<size_t>(fileSize));
+            if (fileSize > 0) {
+                file.read(reinterpret_cast<char*>(result.storage.data()), fileSize);
+                if (!file) {
+                    Log(PakLogLevel::Warning,
+                        "CreatePakFromFolder: Failed to read file: " + diskPath.string());
+                    result.storage.clear();
+                    return;
+                }
+            }
+            file.close();
 
-        const uint8_t* writePtr = data.data();
-        size_t writeSize = data.size();
-        uint8_t flags = 0;
-        uint64_t originalSize = data.size();
+            EncodeEntry(nullptr, 0, options, encryptionKey_, scratch, result);
+        });
 
-        if (options.compression != PakCompression::None && !data.empty()) {
-            if (!CompressBuffer(options.compression, options.zstdLevel,
-                                data.data(), data.size(), compressBuffer, flags)) {
-                Log(PakLogLevel::Error, "CreatePakFromFolder: Compression failed for: " + normalizedName);
+        for (size_t i = 0; i < batchCount; ++i) {
+            const EncodedEntry& result = encoded[i];
+            const std::string& normalizedName = filePaths[batchStart + i].name;
+
+            if (result.fatal) {
+                Log(PakLogLevel::Error,
+                    "CreatePakFromFolder: Compression failed for: " + normalizedName);
                 return false;
             }
-            if (flags != 0) {
-                writePtr = compressBuffer.data();
-                writeSize = compressBuffer.size();
+            // An unreadable source file is skipped, matching the previous
+            // behavior; header.numFiles is set from the entries actually written.
+            if (!result.ok) continue;
+
+            if (!WritePadding(pakStream, alignment)) {
+                Log(PakLogLevel::Error, "CreatePakFromFolder: Failed to write alignment padding.");
+                return false;
+            }
+
+            const uint64_t currentOffset = SafeStreamPos(pakStream, pakStream.tellp());
+            if (!pakStream) {
+                Log(PakLogLevel::Error, "CreatePakFromFolder: Failed to get stream position.");
+                return false;
+            }
+
+            entries.emplace_back(normalizedName, currentOffset, result.originalSize,
+                                 result.Size(), result.flags, result.contentHash,
+                                 PakPathHash(normalizedName));
+            entries.back().chunkSizeLog2 = result.chunkSizeLog2;
+
+            if (result.Size() > 0) {
+                pakStream.write(reinterpret_cast<const char*>(result.Data()),
+                                static_cast<std::streamsize>(result.Size()));
+                if (!pakStream) {
+                    Log(PakLogLevel::Error,
+                        "CreatePakFromFolder: Failed to write data for file: " + normalizedName);
+                    return false;
+                }
             }
         }
 
-        // Encrypt in-place on the buffer writePtr already points to
-        if (!encryptionKey_.empty()) {
-            if (writePtr == data.data()) {
-                EncryptDecrypt(data, encryptionKey_);
-            } else {
-                EncryptDecrypt(compressBuffer, encryptionKey_);
-            }
-            // writePtr remains valid -- EncryptDecrypt does not resize
-        }
-
-        uint64_t currentOffset = SafeStreamPos(pakStream, pakStream.tellp());
-        if (!pakStream) {
-            Log(PakLogLevel::Error, "CreatePakFromFolder: Failed to get stream position.");
-            return false;
-        }
-        uint64_t contentHash = HashBytesFast(writePtr, writeSize);
-        entries.emplace_back(normalizedName, currentOffset, originalSize,
-                             static_cast<uint64_t>(writeSize), flags, contentHash,
-                             PakPathHash(normalizedName));
-
-        pakStream.write(reinterpret_cast<const char*>(writePtr),
-                       static_cast<std::streamsize>(writeSize));
-        if (!pakStream) {
-            Log(PakLogLevel::Error, "CreatePakFromFolder: Failed to write data for file: " + normalizedName);
-            return false;
-        }
+        batchStart = batchEnd;
     }
 
     header.numFiles = static_cast<uint32_t>(entries.size());

@@ -8,15 +8,19 @@ Pakker is a high-performance asset archive library designed for 3D game engines.
 - **Zero-copy mapped views** (`PakView`) -- returns a direct pointer into mapped memory for uncompressed assets, eliminating heap allocation entirely
 - **Handle-based runtime API** -- resolve paths once with `Find()`/`Resolve()`, cache `PakFileHandle`, then read without repeated path normalization or lookup allocation
 - **Caller-owned reads** -- `Read(handle, span)` fills engine-owned buffers and reports precise `PakStatus` errors
-- **Page-aligned data** (v7 format) -- file data aligned to configurable boundaries (16 B, 4 KB, 64 KB) for efficient page faults and GPU upload
+- **Page-aligned data** (v8 format) -- file data aligned to configurable boundaries (16 B, 4 KB, 64 KB) for efficient page faults and GPU upload
 - **Per-entry content integrity hashing** -- XXH64 checksum of each entry's on-disk bytes, with opt-in deep verification (`ValidatePak(deepVerify)`, `PakReader::VerifyEntry()`, `PakOpenOptions::verifyOnRead`) to catch corrupted or tampered archives before they reach the engine
 - **Layered archives** (`PakMount`) -- mount a base archive plus patch/DLC/language archives with override semantics, resolved through one composed namespace
 - **Loose-file hot-reload override** (`PakLooseOverlay`) -- dev-only wrapper that serves an edited-on-disk asset over the archive's copy, for iteration without repacking
-- **Thread-safe PakReader** -- `shared_mutex` allows concurrent reads from multiple threads; ideal for asset streaming on worker threads
+- **Lock-free read path** -- reads reach an immutable published snapshot through a single atomic load, taking no lock and no reference count, so lookup and read throughput scale with worker-thread count
 - **Hybrid decoded caching** -- OS page cache/mmap remains the fast path, with default in-memory and persistent decoded caches for compressed, encrypted, and non-mmap reads
-- **O(1) file lookup** via hash map -- no linear scanning
+- **O(1) file lookup** via a flat open-addressing index built over stored path hashes -- no per-entry allocation, no string hashing at open
 - **LZ4 or Zstd per-file compression** -- LZ4 for latency-sensitive hot-reload style reads (~4 GB/s decode), Zstd for a better ratio at similar decode cost; selected per-file, both pluggable side by side in the same archive
-- **Partial/streaming reads** (`PakReader::ReadRange`) -- read a slice of a large uncompressed asset (video/audio) without materializing the whole entry
+- **Partial/streaming reads** (`PakReader::ReadRange`) -- read a slice of a large asset without materializing the whole entry; works on compressed entries too when built with chunking
+- **Chunked compression** -- split compressed entries into independently-decodable blocks, bounding time-to-first-byte on a large asset to one block instead of the whole file
+- **Parallel packing** -- entry compression, encryption and hashing fan out across worker threads while output stays byte-identical and deterministically ordered
+- **Scatter reads** (`PakReader::ReadBatch`) -- serve a whole set of reads in archive-offset order with batched prefetch hints, instead of one call per asset
+- **Hash-keyed lookups** (`PakPathHash`, `FindByHash`) -- carry baked 64-bit asset ids instead of path strings, and optionally drop the name blob entirely in shipping builds
 - **Silent by default** -- no console output unless you set a log callback
 - **Optional XOR encryption** -- disabled by default for best performance; this is lightweight obfuscation, not a security boundary -- see Encryption below
 - **No external dependencies** -- LZ4 and Zstd are vendored, only needs C++20 and a C compiler
@@ -169,12 +173,118 @@ uint64_t written = 0;
 PakStatus status = reader.ReadRange(handle, /*rangeOffset=*/1'048'576, chunk, &written);
 ```
 
-Only supported for uncompressed entries (encrypted or not) -- this archive
-format's compressed frames have no internal chunk index, so a compressed
-entry returns `PakStatus::Unsupported` rather than silently decoding the
-whole entry to fake partial-read semantics. Media that's already compressed
+Supported for uncompressed entries (encrypted or not), and for compressed
+entries built with `PakOptions::compressionChunkSize` set -- see Chunked
+compression below. A compressed entry stored as one whole-entry frame has no
+internal index to seek into, so it returns `PakStatus::Unsupported` rather
+than silently decoding the whole entry to fake partial-read semantics.
+Media that's already compressed
 in its own codec (most video/audio) should be stored uncompressed at the
 archive level if streaming reads are needed.
+
+### Chunked compression
+
+By default a compressed entry is one compression frame over the whole file, so
+reaching any byte of it means decoding all of it. On a large streaming asset
+that is a multi-millisecond stall, and `ReadRange()` cannot work at all.
+
+`PakOptions::compressionChunkSize` splits compressed entries into
+independently-decodable blocks:
+
+```cpp
+PakOptions opts;
+opts.compression = PakCompression::Zstd;
+opts.compressionChunkSize = 256 * 1024;   // 256 KiB blocks
+pakker.CreatePak("streaming.pak", files, opts);
+```
+
+Only entries larger than the chunk size are chunked, so small assets are
+unaffected. `PakFileInfo::chunkSize` reports the block size of an entry
+(`0` when it is not chunked), which lets a streamer align its requests to
+block boundaries and avoid decoding a block twice.
+
+Measured on a 64 MiB Zstd-3 asset, reading the first 64 KiB:
+
+| | whole-entry | chunked (256 KiB) |
+|---|---|---|
+| time to first 64 KiB | 9,848 us | **44.9 us** |
+| seek to the last 64 KiB | 9,848 us | **34.8 us** |
+| `ReadRange()` | `Unsupported` | supported |
+| archive size | 1.85:1 | 1.78:1 |
+
+It is off by default because that last row is a real cost: compressing each
+block independently gives up cross-block matches, and roughly 4% of ratio on a
+full-size install is gigabytes of download. Turn it on for streaming builds,
+measure the ratio cost on your own content, and decide.
+
+### Parallel packing
+
+Entry compression, encryption and hashing run on `PakOptions::workerThreads`
+workers (default: one per hardware thread). Entries are encoded in parallel but
+written in input order, so the archive is byte-identical no matter how many
+workers ran.
+
+```cpp
+PakOptions opts;
+opts.compression = PakCompression::Zstd;
+opts.zstdLevel = 19;
+opts.workerThreads = 0;   // 0 = one per hardware thread, 1 = sequential
+```
+
+At the default level 19, compression completely dominates pack time. Measured
+on 64 MiB across 360 entries on a 32-thread machine:
+
+| workers | time | speedup |
+|---|---|---|
+| 1 | 7.48 s | 1.00x |
+| 4 | 2.16 s | 3.46x |
+| 8 | 1.20 s | 6.25x |
+| 32 | 0.70 s | **10.72x** |
+
+Memory is bounded by batching: only one batch of entries is resident at a
+time, capped by both entry count and total bytes, so a handful of very large
+assets cannot balloon the working set.
+
+### Scatter reads
+
+`ReadBatch()` serves a whole set of reads in one call, visiting entries in
+ascending archive offset order rather than in the order they were requested:
+
+```cpp
+std::vector<std::vector<uint8_t>> buffers(count);
+std::vector<PakReadRequest> requests(count);
+for (size_t i = 0; i < count; ++i) {
+    requests[i].handle = handles[i];
+    requests[i].destination = buffers[i];
+}
+
+size_t ok = reader.ReadBatch(requests);
+// per-request outcomes in requests[i].status / requests[i].bytesWritten
+```
+
+The request array is not reordered -- ordering is internal. Two things make
+this worth having over a loop of `Read()` calls: a scattered access pattern
+becomes a forward sweep, which is what storage readahead is built to
+accelerate, and every entry is prefetch-hinted up front so faults overlap
+instead of serializing.
+
+`ReadBatch()` does not create threads. Reads are lock-free, so split a frame's
+requests across your own job-system workers and call it once per worker.
+
+`PakBatchOptions::prefetch` (default on) controls the hinting. It pays when
+the data is not resident -- which is the normal case for streaming -- and is a
+straight loss when it already is, since the hint then costs a syscall for
+nothing. Turn it off for re-reads of data known to be hot. Measured warm, with
+256 scattered 4 KiB reads:
+
+| | mean | p99 | max |
+|---|---|---|---|
+| `Read()` loop | 40.5 us | 74.0 us | 352.6 us |
+| `ReadBatch()`, ordering only | 40.7 us | 62.4 us | **70.2 us** |
+| `ReadBatch()` + prefetch | 71.9 us | 130.5 us | 146.5 us |
+
+Ordering is free even warm, and cuts worst-case latency 5x. The prefetch cost
+shown here is the price of a benefit this warm-cache benchmark cannot measure.
 
 ### Loose-file hot-reload override: PakLooseOverlay
 
@@ -327,7 +437,7 @@ void AssetStreamWorker(PakReader& reader, AssetQueue& queue) {
 
 | Method | Description |
 |--------|-------------|
-| `CreatePak(filename, files, PakOptions)` | Create v7 PAK with alignment and compression control |
+| `CreatePak(filename, files, PakOptions)` | Create v8 PAK with alignment, compression and worker-thread control |
 | `CreatePakFromFolder(filename, folder, PakOptions)` | Create PAK from directory with options |
 | `ExtractPak(filename, outputDir)` | Extract all files to a directory |
 | `ListPak(filename)` | Log all file entries via the log callback |
@@ -415,6 +525,8 @@ read from disk has no mapping to back that contract.
 | `compression` | `PakCompression` | `None` | Per-file compression method: `None`, `LZ4`, or `Zstd` |
 | `zstdLevel` | `int` | `19` | Zstd compression level (1-19); only consulted when `compression == Zstd` |
 | `alignment` | `uint32_t` | `16` | Data alignment in bytes (must be power of 2) |
+| `workerThreads` | `uint32_t` | `0` | Threads used to compress, encrypt and hash entries. `0` means one per hardware thread; `1` forces a sequential pipeline. Output is byte-identical regardless |
+| `compressionChunkSize` | `uint32_t` | `0` | Split compressed entries into independently-decodable blocks of this many uncompressed bytes. `0` disables chunking; otherwise a power of two between 4 KiB and 16 MiB |
 
 ### PakOpenOptions
 
@@ -451,7 +563,7 @@ the current archive bytes.
 | Field | Type | Description |
 |-------|------|-------------|
 | magic | char[4] | `"PAK0"` |
-| version | uint32_t | 7 |
+| version | uint32_t | 8 |
 | numFiles | uint32_t | Number of files |
 | alignment | uint32_t | Data alignment in bytes |
 | fileTableOffset | uint64_t | Byte offset to the entry-record array |
@@ -459,7 +571,7 @@ the current archive bytes.
 | nameBlobSize | uint64_t | Size of the name blob |
 | reserved | uint64_t[2] | Reserved for future use |
 
-### File table entry (v7) -- fixed 48 bytes
+### File table entry (v8) -- fixed 48 bytes
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -470,8 +582,8 @@ the current archive bytes.
 | pathHash | uint64_t | XXH64 of the normalized name -- see `PakPathHash()` |
 | nameOffset | uint32_t | Byte offset of the name within the name blob |
 | nameLength | uint16_t | Name length in bytes |
-| flags | uint8_t | Bit 0: LZ4 compressed. Bit 1: Zstd compressed (mutually exclusive with bit 0) |
-| reserved | uint8_t | Reserved |
+| flags | uint8_t | Bit 0: LZ4 compressed. Bit 1: Zstd compressed (mutually exclusive with bit 0). Bit 2: chunked |
+| chunkSizeLog2 | uint8_t | log2 of the uncompressed bytes per block, when bit 2 is set |
 
 Entry records are fixed-size and all names live together in one contiguous
 blob after the record array. That is what lets `PakReader::Open()` load the
@@ -483,11 +595,32 @@ hashing at all, and layered mounts can merge namespaces without re-hashing.
 File data offsets are padded to the alignment boundary specified in the
 header. This ensures page-aligned access when memory-mapped.
 
-Archives are v7-only: `PakReader::Open()` and `Pakker::ValidatePak()` reject
-any other version, including v6 (variable-length file table), v5 (no Zstd flag
-bit) and v4 (no `contentHash` field). There is no in-place upgrade tool --
-rebuild older archives with `CreatePak()`/`CreatePakFromFolder()` under the
-current library version.
+### Chunked entry payload
+
+When flag bit 2 is set, the entry's payload is not one compression frame over
+the whole entry. It is:
+
+| Part | Type | Description |
+|------|------|-------------|
+| chunkSize | uint32_t | Uncompressed bytes per block (power of two) |
+| chunkCount | uint32_t | Number of blocks |
+| compressedSizes | uint32_t[chunkCount] | On-disk size of each block |
+| blocks | bytes | Each block's data, back to back |
+
+Each block is compressed independently, so any one of them can be decoded
+without touching the others. A block that does not compress is stored raw
+(its compressed size equals its uncompressed size), so incompressible data
+never pays an expansion penalty.
+
+This is what makes `ReadRange()` work on a compressed entry, and it bounds
+time-to-first-byte on a large asset to one block instead of the whole file.
+See `PakOptions::compressionChunkSize`.
+
+Archives are v8-only: `PakReader::Open()` and `Pakker::ValidatePak()` reject
+any other version, including v7 (no chunked-entry flag), v6 (variable-length
+file table), v5 (no Zstd flag bit) and v4 (no `contentHash` field). There is
+no in-place upgrade tool -- rebuild older archives with
+`CreatePak()`/`CreatePakFromFolder()` under the current library version.
 
 ## Thread Safety
 

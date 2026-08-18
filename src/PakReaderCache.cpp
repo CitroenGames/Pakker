@@ -13,14 +13,6 @@ using namespace PakInternal;
 
 static std::atomic<uint64_t> g_cacheTempCounter{0};
 
-// Entry names are absent when an archive is opened without its name blob, so
-// diagnostics fall back to the path hash -- which is still enough to identify
-// the entry against a build manifest.
-static std::string EntryLabel(const PakFileInfo& entry)
-{
-    if (!entry.filename.empty()) return std::string(entry.filename);
-    return "<path hash " + PakInternal::Hex64(entry.pathHash) + ">";
-}
 
 #pragma pack(push, 1)
 struct PersistentCacheHeader {

@@ -20,7 +20,9 @@
 #include <cstdint>
 #include <filesystem>
 #include <iostream>
+#include <algorithm>
 #include <map>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -62,12 +64,14 @@ std::string EntryName(const SizeClass& sizeClass, size_t index)
 }
 
 bool BuildArchive(const fs::path& path, PakCompression compression, int zstdLevel,
-                  const std::map<std::string, std::vector<uint8_t>>& files)
+                  const std::map<std::string, std::vector<uint8_t>>& files,
+                  uint32_t chunkSize = 0, const char* label = nullptr)
 {
     PakOptions options;
     options.compression = compression;
     options.zstdLevel = zstdLevel;
     options.alignment = 4096;
+    options.compressionChunkSize = chunkSize;
 
     Pakker pakker;
     auto start = Clock::now();
@@ -80,8 +84,9 @@ bool BuildArchive(const fs::path& path, PakCompression compression, int zstdLeve
     std::error_code ec;
     const uint64_t archiveBytes = fs::file_size(path, ec);
 
-    std::cout << "  built " << std::left << std::setw(10)
-              << (compression == PakCompression::None ? "store"
+    std::cout << "  built " << std::left << std::setw(14)
+              << (label ? label
+                  : compression == PakCompression::None ? "store"
                   : compression == PakCompression::LZ4 ? "lz4" : "zstd")
               << std::right << std::fixed << std::setprecision(2)
               << " in " << std::setw(9) << Ms(elapsed) << " ms"
@@ -173,11 +178,17 @@ int main()
     const fs::path storePath = root / "store.pak";
     const fs::path lz4Path = root / "lz4.pak";
     const fs::path zstdPath = root / "zstd.pak";
+    const fs::path chunkedPath = root / "zstd_chunked.pak";
+    constexpr uint32_t kChunkSize = 256u * 1024;
 
     Header("Build");
     if (!BuildArchive(storePath, PakCompression::None, 0, files) ||
         !BuildArchive(lz4Path, PakCompression::LZ4, 0, files) ||
-        !BuildArchive(zstdPath, PakCompression::Zstd, 3, files)) {
+        !BuildArchive(zstdPath, PakCompression::Zstd, 3, files) ||
+        // Same codec and level, chunked -- so the ratio delta printed above is
+        // exactly what chunking costs, with nothing else varying.
+        !BuildArchive(chunkedPath, PakCompression::Zstd, 3, files, kChunkSize,
+                      "zstd chunked")) {
         std::cerr << "failed to build benchmark archives\n";
         return 1;
     }
@@ -322,6 +333,112 @@ int main()
             std::cout << "    " << variant.mode << " ReadRange 64 KiB -> "
                       << PakStatusToString(rangeStatus) << "\n";
         }
+
+        // The same asset, same codec and level, but chunked: a range read now
+        // decodes one block instead of the whole entry.
+        {
+            PakReader reader;
+            reader.Open(chunkedPath.string());
+            PakCacheOptions cacheOptions;
+            cacheOptions.enabled = false;
+            reader.SetCacheOptions(cacheOptions);
+
+            PakFileHandle handle = reader.Find(name);
+            const PakFileInfo* info = reader.Info(handle);
+            std::vector<uint8_t> slice(kSlice);
+
+            Latencies latencies;
+            for (size_t r = 0; r < 32; ++r) {
+                auto start = Clock::now();
+                reader.ReadRange(handle, 0, slice);
+                latencies.Add(Clock::now() - start);
+            }
+            PrintLatencies("zstd chunked ReadRange", latencies);
+
+            // A seek deep into the asset must cost the same as one at the
+            // start; that is the property whole-entry compression cannot offer.
+            Latencies seekLatencies;
+            for (size_t r = 0; r < 32; ++r) {
+                auto start = Clock::now();
+                reader.ReadRange(handle, big.bytes - kSlice, slice);
+                seekLatencies.Add(Clock::now() - start);
+            }
+            PrintLatencies("zstd chunked seek to end", seekLatencies);
+
+            std::cout << "    chunk size: " << (info ? info->chunkSize : 0) << " bytes\n";
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Scattered reads: a Read() loop against one ReadBatch() call.
+    //
+    // Caveat worth stating plainly: the page cache is warm here, so the
+    // faults ReadBatch overlaps have already been paid. This measures the
+    // ordering and call overhead only and understates the real benefit,
+    // which lands on cold storage where each miss is an actual device round
+    // trip.
+    // -----------------------------------------------------------------
+    Header("Scattered reads, warm cache: Read() loop vs ReadBatch()");
+    {
+        PakReader reader;
+        reader.Open(lz4Path.string());
+        PakCacheOptions cacheOptions;
+        cacheOptions.enabled = false;
+        reader.SetCacheOptions(cacheOptions);
+
+        const SizeClass& small = kLadder[0]; // 4 KiB x 256
+        std::vector<PakFileHandle> handles;
+        for (size_t i = 0; i < small.count; ++i) {
+            PakFileHandle handle = reader.Find(EntryName(small, i));
+            if (handle) handles.push_back(handle);
+        }
+
+        // Shuffled, because an engine asks for assets in dependency order,
+        // which has nothing to do with their layout in the archive.
+        std::mt19937 rng(9876);
+        std::shuffle(handles.begin(), handles.end(), rng);
+
+        std::vector<std::vector<uint8_t>> buffers(handles.size());
+        for (auto& buffer : buffers) buffer.resize(small.bytes);
+
+        constexpr size_t kRepeats = 200;
+
+        Latencies loopLatencies;
+        for (size_t r = 0; r < kRepeats; ++r) {
+            auto start = Clock::now();
+            for (size_t i = 0; i < handles.size(); ++i) {
+                reader.Read(handles[i], buffers[i]);
+            }
+            loopLatencies.Add(Clock::now() - start);
+        }
+
+        std::vector<PakReadRequest> requests(handles.size());
+        auto measureBatch = [&](const PakBatchOptions& batchOptions, Latencies& out) {
+            for (size_t r = 0; r < kRepeats; ++r) {
+                for (size_t i = 0; i < handles.size(); ++i) {
+                    requests[i] = PakReadRequest{};
+                    requests[i].handle = handles[i];
+                    requests[i].destination = buffers[i];
+                }
+                auto start = Clock::now();
+                reader.ReadBatch(requests, batchOptions);
+                out.Add(Clock::now() - start);
+            }
+        };
+
+        PakBatchOptions withPrefetch;
+        Latencies batchLatencies;
+        measureBatch(withPrefetch, batchLatencies);
+
+        PakBatchOptions withoutPrefetch;
+        withoutPrefetch.prefetch = false;
+        Latencies orderedLatencies;
+        measureBatch(withoutPrefetch, orderedLatencies);
+
+        std::cout << "  " << handles.size() << " scattered 4 KiB reads per pass\n";
+        PrintLatencies("Read() loop", loopLatencies);
+        PrintLatencies("ReadBatch() +prefetch", batchLatencies);
+        PrintLatencies("ReadBatch() order only", orderedLatencies);
     }
 
     // -----------------------------------------------------------------

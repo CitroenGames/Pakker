@@ -39,6 +39,26 @@ target_compile_options(${PROJECT_NAME} PRIVATE
     $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<BOOL:${PAK_WARNINGS_AS_ERRORS}>>:$<IF:$<CXX_COMPILER_ID:MSVC>,/WX,-Werror>>
 )
 
+# The warning options above are scoped to CXX so the vendored LZ4/Zstd C
+# sources are not held to this project's standards. That scoping is not enough
+# on its own under PAK_WARNINGS_AS_ERRORS: MSVC still applies /WX to the C
+# files, and the vendored Zstd tree has a pre-existing C4013 in
+# zstd_preSplit.c that then fails the build. Turn warnings-as-errors back off
+# for vendored sources explicitly -- we do not maintain that code and should
+# not gate our builds on it.
+if(PAK_WARNINGS_AS_ERRORS)
+    file(GLOB_RECURSE PAK_VENDOR_SOURCES "src/vendor/*.c" "src/vendor/*.cpp")
+    if(PAK_VENDOR_SOURCES)
+        if(MSVC)
+            set_source_files_properties(${PAK_VENDOR_SOURCES}
+                PROPERTIES COMPILE_OPTIONS "/WX-")
+        else()
+            set_source_files_properties(${PAK_VENDOR_SOURCES}
+                PROPERTIES COMPILE_OPTIONS "-Wno-error")
+        endif()
+    endif()
+endif()
+
 if(PAK_ENABLE_LTO)
     include(CheckIPOSupported)
     check_ipo_supported(RESULT PAK_IPO_SUPPORTED OUTPUT PAK_IPO_ERROR)

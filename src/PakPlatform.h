@@ -30,6 +30,19 @@ void UnmapFile(MappedFile& mf);
 // Returns false only when the range is invalid or the platform call fails.
 bool PrefetchMappedRange(const MappedFile& mf, uint64_t offset, uint64_t size);
 
+struct PrefetchRange {
+    uint64_t offset = 0;
+    uint64_t size = 0;
+};
+
+// Best-effort hint covering several mapped ranges at once.
+//
+// Prefer this over calling PrefetchMappedRange in a loop. On Windows the
+// underlying PrefetchVirtualMemory takes the whole set in one call, so hinting
+// N ranges individually costs N syscalls -- enough to make a scatter read
+// slower than not hinting at all when the pages are already resident.
+bool PrefetchMappedRanges(const MappedFile& mf, const PrefetchRange* ranges, size_t count);
+
 // Best-effort hint that a file byte range will be read soon when mmap is not
 // available. Returns true when unsupported so callers can keep this advisory.
 bool PrefetchFileRange(const char* path, uint64_t offset, uint64_t size);

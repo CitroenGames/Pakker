@@ -116,7 +116,7 @@ bool ReadPakHeader(std::istream& stream, PakHeader& header)
         Log(PakLogLevel::Error, "ReadPakHeader: Invalid magic number.");
         return false;
     }
-    if (header.version != PAK_VERSION_7) {
+    if (header.version != PAK_VERSION_8) {
         Log(PakLogLevel::Error, "ReadPakHeader: Unsupported PAK version: " + std::to_string(header.version));
         return false;
     }
@@ -199,6 +199,7 @@ bool ReadFileTable(std::istream& stream, const PakHeader& header,
         entries.emplace_back(std::move(filename), record.offset, record.originalSize,
                              record.compressedSize, record.flags, record.contentHash,
                              record.pathHash);
+        entries.back().chunkSizeLog2 = record.chunkSizeLog2;
     }
     return true;
 }
@@ -242,6 +243,7 @@ bool WriteFileTable(std::ostream& stream, const std::vector<PakEntry>& entries,
         record.nameOffset = nameOffset;
         record.nameLength = static_cast<uint16_t>(entry.filename.size());
         record.flags = entry.flags;
+        record.chunkSizeLog2 = entry.chunkSizeLog2;
         records.push_back(record);
         nameOffset += static_cast<uint32_t>(entry.filename.size());
     }

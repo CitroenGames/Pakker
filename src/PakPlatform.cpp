@@ -1,6 +1,7 @@
 #include "PakPlatform.h"
 
 #include <cstdlib>
+#include <vector>
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -165,6 +166,42 @@ void UnmapFile(MappedFile& mf) { mf = {}; }
 bool PrefetchMappedRange(const MappedFile&, uint64_t, uint64_t) { return false; }
 
 #endif // PAK_NO_MMAP
+
+bool PrefetchMappedRanges(const MappedFile& mf, const PrefetchRange* ranges, size_t count)
+{
+    if (!mf.data || !ranges || count == 0) return true;
+
+#ifdef _WIN32
+    // One syscall for the whole set. Hinting range-by-range costs a syscall
+    // each, which is enough to dominate a scatter read whose pages are
+    // already resident.
+    std::vector<WIN32_MEMORY_RANGE_ENTRY> entries;
+    entries.reserve(count);
+    for (size_t i = 0; i < count; ++i) {
+        if (ranges[i].size == 0) continue;
+        if (ranges[i].offset > mf.size || ranges[i].size > mf.size - ranges[i].offset) {
+            return false;
+        }
+        WIN32_MEMORY_RANGE_ENTRY entry{};
+        entry.VirtualAddress = static_cast<char*>(mf.data) + ranges[i].offset;
+        entry.NumberOfBytes = static_cast<SIZE_T>(ranges[i].size);
+        entries.push_back(entry);
+    }
+    if (entries.empty()) return true;
+
+    return PrefetchVirtualMemory(GetCurrentProcess(),
+                                 static_cast<ULONG_PTR>(entries.size()),
+                                 entries.data(), 0) != FALSE;
+#else
+    // madvise takes one range at a time, but it is a cheap call and callers
+    // coalesce before getting here, so the loop stays short.
+    bool ok = true;
+    for (size_t i = 0; i < count; ++i) {
+        if (!PrefetchMappedRange(mf, ranges[i].offset, ranges[i].size)) ok = false;
+    }
+    return ok;
+#endif
+}
 
 bool PrefetchFileRange(const char* path, uint64_t offset, uint64_t size)
 {
