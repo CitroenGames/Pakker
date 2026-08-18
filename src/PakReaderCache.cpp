@@ -13,6 +13,15 @@ using namespace PakInternal;
 
 static std::atomic<uint64_t> g_cacheTempCounter{0};
 
+// Entry names are absent when an archive is opened without its name blob, so
+// diagnostics fall back to the path hash -- which is still enough to identify
+// the entry against a build manifest.
+static std::string EntryLabel(const PakFileInfo& entry)
+{
+    if (!entry.filename.empty()) return std::string(entry.filename);
+    return "<path hash " + PakInternal::Hex64(entry.pathHash) + ">";
+}
+
 #pragma pack(push, 1)
 struct PersistentCacheHeader {
     char magic[4] = {'P', 'K', 'C', '1'};
@@ -27,36 +36,67 @@ struct PersistentCacheHeader {
 // Cache configuration and maintenance
 // ---------------------------------------------------------------------------
 
+const PakCacheOptions PakReader::kDefaultCacheOptions{};
+
 void PakReader::SetCacheOptions(const PakCacheOptions& options)
 {
     std::lock_guard cacheLock(cacheMutex_);
-    cacheOptions_ = options;
+
+    // Changing the budget can change the shard count, which remaps every key
+    // to a different shard. Anything already cached would become unreachable,
+    // so drop it rather than leak it.
+    const size_t previousShards = ActiveShardCount(CacheOptions());
+
+    cacheOptionsOwner_ = std::make_shared<const PakCacheOptions>(options);
+    cacheOptions_.store(cacheOptionsOwner_.get(), std::memory_order_release);
+
+    if (ActiveShardCount(options) != previousShards) {
+        for (auto& shard : memoryShards_) {
+            std::lock_guard shardLock(shard.mutex);
+            shard.entries.clear();
+            shard.lru.clear();
+            shard.bytes = 0;
+        }
+    }
+
     ResolvePersistentCacheDirectoryLocked();
-    TrimMemoryCacheLocked();
+    TrimAllMemoryShards();
 }
 
 PakCacheOptions PakReader::GetCacheOptions() const
 {
     std::lock_guard cacheLock(cacheMutex_);
-    return cacheOptions_;
+    return CacheOptions();
 }
 
 PakCacheStats PakReader::GetCacheStats() const
 {
-    std::lock_guard cacheLock(cacheMutex_);
-    PakCacheStats stats = cacheStats_;
-    stats.sourceReads = sourceReads_.load(std::memory_order_relaxed);
-    stats.memoryBytes = memoryCacheBytes_;
+    PakCacheStats stats;
+    {
+        std::lock_guard cacheLock(cacheMutex_);
+        stats = cacheStats_;
+    }
+    stats.sourceReads = sourceReads_.Load();
+
+    for (auto& shard : memoryShards_) {
+        std::lock_guard shardLock(shard.mutex);
+        stats.memoryHits += shard.hits;
+        stats.memoryMisses += shard.misses;
+        stats.memoryStores += shard.stores;
+        stats.memoryEvictions += shard.evictions;
+        stats.memoryBytes += shard.bytes;
+    }
     return stats;
 }
 
 void PakReader::ClearMemoryCache()
 {
-    std::lock_guard cacheLock(cacheMutex_);
-    memoryCache_.clear();
-    memoryCacheLru_.clear();
-    memoryCacheBytes_ = 0;
-    cacheStats_.memoryBytes = 0;
+    for (auto& shard : memoryShards_) {
+        std::lock_guard shardLock(shard.mutex);
+        shard.entries.clear();
+        shard.lru.clear();
+        shard.bytes = 0;
+    }
 }
 
 bool PakReader::ClearPersistentCache()
@@ -97,22 +137,24 @@ bool PakReader::ClearCache()
 
 bool PakReader::HasPersistentCacheDirectoryLocked() const
 {
-    return cacheOptions_.enabled &&
-           cacheOptions_.persistentCacheEnabled &&
-           cacheOptions_.persistentBudgetBytes > 0 &&
+    const PakCacheOptions& options = CacheOptions();
+    return options.enabled &&
+           options.persistentCacheEnabled &&
+           options.persistentBudgetBytes > 0 &&
            !effectivePersistentCacheDirectory_.empty();
 }
 
 void PakReader::ResolvePersistentCacheDirectoryLocked() const
 {
     effectivePersistentCacheDirectory_.clear();
-    if (!cacheOptions_.enabled || !cacheOptions_.persistentCacheEnabled ||
-        cacheOptions_.persistentBudgetBytes == 0) {
+    const PakCacheOptions& options = CacheOptions();
+    if (!options.enabled || !options.persistentCacheEnabled ||
+        options.persistentBudgetBytes == 0) {
         return;
     }
 
-    if (!cacheOptions_.persistentCacheDirectory.empty()) {
-        effectivePersistentCacheDirectory_ = cacheOptions_.persistentCacheDirectory;
+    if (!options.persistentCacheDirectory.empty()) {
+        effectivePersistentCacheDirectory_ = options.persistentCacheDirectory;
         return;
     }
 
@@ -127,43 +169,49 @@ std::string PakReader::PersistentCachePathLocked(CacheKey key) const
     return (root / shard / (name + ".pkc")).string();
 }
 
-void PakReader::TrimMemoryCacheLocked() const
+void PakReader::TrimShardLocked(MemoryCacheShard& shard, uint64_t shardBudget) const
 {
-    const bool keepMemory = cacheOptions_.enabled &&
-                            cacheOptions_.memoryCacheEnabled &&
-                            cacheOptions_.memoryBudgetBytes > 0;
-    if (!keepMemory) {
-        if (!memoryCache_.empty()) {
-            cacheStats_.memoryEvictions += static_cast<uint64_t>(memoryCache_.size());
-        }
-        memoryCache_.clear();
-        memoryCacheLru_.clear();
-        memoryCacheBytes_ = 0;
-        cacheStats_.memoryBytes = 0;
+    if (shardBudget == 0) {
+        shard.evictions += static_cast<uint64_t>(shard.entries.size());
+        shard.entries.clear();
+        shard.lru.clear();
+        shard.bytes = 0;
         return;
     }
 
-    while (memoryCacheBytes_ > cacheOptions_.memoryBudgetBytes && !memoryCache_.empty()) {
-        if (memoryCacheLru_.empty()) {
-            cacheStats_.memoryEvictions += static_cast<uint64_t>(memoryCache_.size());
-            memoryCache_.clear();
-            memoryCacheBytes_ = 0;
-            break;
-        }
-        const CacheKey oldestKey = memoryCacheLru_.back();
-        auto oldest = memoryCache_.find(oldestKey);
-        if (oldest == memoryCache_.end()) {
+    while (shard.bytes > shardBudget && !shard.entries.empty()) {
+        if (shard.lru.empty()) {
             // Keep the structures self-healing if invariants are ever broken
             // by a future cache mutation path.
-            memoryCacheLru_.pop_back();
+            shard.evictions += static_cast<uint64_t>(shard.entries.size());
+            shard.entries.clear();
+            shard.bytes = 0;
+            break;
+        }
+        const CacheKey oldestKey = shard.lru.back();
+        auto oldest = shard.entries.find(oldestKey);
+        if (oldest == shard.entries.end()) {
+            shard.lru.pop_back();
             continue;
         }
-        memoryCacheBytes_ -= oldest->second.size;
-        memoryCacheLru_.pop_back();
-        memoryCache_.erase(oldest);
-        ++cacheStats_.memoryEvictions;
+        shard.bytes -= oldest->second.size;
+        shard.lru.pop_back();
+        shard.entries.erase(oldest);
+        ++shard.evictions;
     }
-    cacheStats_.memoryBytes = memoryCacheBytes_;
+}
+
+void PakReader::TrimAllMemoryShards() const
+{
+    const PakCacheOptions& options = CacheOptions();
+    const bool keepMemory = options.enabled && options.memoryCacheEnabled &&
+                            options.memoryBudgetBytes > 0;
+    const uint64_t shardBudget = keepMemory ? ShardBudget(options) : 0;
+
+    for (auto& shard : memoryShards_) {
+        std::lock_guard shardLock(shard.mutex);
+        TrimShardLocked(shard, shardBudget);
+    }
 }
 
 void PakReader::TrimPersistentCache() const
@@ -174,7 +222,7 @@ void PakReader::TrimPersistentCache() const
         std::lock_guard cacheLock(cacheMutex_);
         if (!HasPersistentCacheDirectoryLocked()) return;
         directory = effectivePersistentCacheDirectory_;
-        budget = cacheOptions_.persistentBudgetBytes;
+        budget = CacheOptions().persistentBudgetBytes;
     }
 
     std::error_code ec;
@@ -235,34 +283,34 @@ void PakReader::TrimPersistentCache() const
 // Cache read path
 // ---------------------------------------------------------------------------
 
-bool PakReader::ShouldCacheDecoded(const PakInternal::PakEntry& entry,
-    const ReadContext& context, const PakCacheOptions& options) const
+bool PakReader::ShouldCacheDecoded(const PakFileInfo& entry,
+    const ReadSnapshot& snapshot, const PakCacheOptions& options) const
 {
     if (!options.enabled) return false;
     if (entry.originalSize == 0 || entry.originalSize > options.maxSingleEntryBytes) return false;
     if (!options.memoryCacheEnabled && !options.persistentCacheEnabled) return false;
 
     const bool compressed = PakInternal::IsCompressed(entry.flags);
-    return compressed || !encryptionKey_.empty() || !context.useMmap;
+    return compressed || !encryptionKey_.empty() || !snapshot.useMmap;
 }
 
 PakReader::CacheKey PakReader::MakeMemoryCacheKey(PakFileHandle handle,
-    const ReadContext& context) noexcept
+    const ReadSnapshot& snapshot) noexcept
 {
     // The decoded memory cache is reader-local and cleared whenever a new
     // archive replaces the current one. The archive fingerprint plus stable
     // handle index is therefore already a complete identity; hashing the
     // filename and entry metadata again on every cache hit is redundant.
-    return CacheKey{context.archiveFingerprint, static_cast<uint64_t>(handle.index)};
+    return CacheKey{snapshot.archiveFingerprint, static_cast<uint64_t>(handle.index)};
 }
 
 PakReader::CacheKey PakReader::MakePersistentCacheKey(PakFileHandle handle,
-    const PakInternal::PakEntry& entry, const ReadContext& context) const
+    const PakFileInfo& entry, const ReadSnapshot& snapshot) const
 {
     uint64_t high = FNV_OFFSET_BASIS;
     uint64_t low = FNV_OFFSET_BASIS ^ 0x9e3779b97f4a7c15ull;
 
-    HashValue(high, context.archiveFingerprint);
+    HashValue(high, snapshot.archiveFingerprint);
     HashValue(high, handle.index);
     HashValue(high, entry.offset);
     HashValue(high, entry.originalSize);
@@ -270,7 +318,7 @@ PakReader::CacheKey PakReader::MakePersistentCacheKey(PakFileHandle handle,
     HashValue(high, entry.flags);
     HashString(high, entry.filename);
 
-    HashValue(low, context.archiveFingerprint);
+    HashValue(low, snapshot.archiveFingerprint);
     HashValue(low, entry.contentHash);
     uint64_t encryptionHash = FNV_OFFSET_BASIS;
     HashString(encryptionHash, encryptionKey_);
@@ -281,23 +329,24 @@ PakReader::CacheKey PakReader::MakePersistentCacheKey(PakFileHandle handle,
     return CacheKey{high, low};
 }
 
-PakStatus PakReader::HashEntrySourceBytes(const PakInternal::PakEntry& entry,
-    const ReadContext& context, uint64_t& outHash) const
+PakStatus PakReader::HashEntrySourceBytes(const PakFileInfo& entry,
+    const ReadSnapshot& snapshot, uint64_t& outHash) const
 {
     outHash = 0;
     const uint64_t diskSize = entry.compressedSize;
     if (diskSize == 0) {
-        outHash = FNV_OFFSET_BASIS;
+        // Must match what the writer stamps for a zero-byte entry.
+        outHash = HashBytesFast(nullptr, 0);
         return PakStatus::Ok;
     }
 
-    if (entry.offset > context.fileSize || diskSize > context.fileSize - entry.offset) {
+    if (entry.offset > snapshot.fileSize || diskSize > snapshot.fileSize - entry.offset) {
         return PakStatus::CorruptArchive;
     }
 
-    if (context.useMmap && context.guard && context.guard->mf.data) {
-        const auto* mappedPtr = static_cast<const uint8_t*>(context.guard->mf.data) + entry.offset;
-        outHash = HashBuffer(mappedPtr, diskSize);
+    if (snapshot.useMmap && snapshot.guardPtr && snapshot.guardPtr->mf.data) {
+        const auto* mappedPtr = static_cast<const uint8_t*>(snapshot.guardPtr->mf.data) + entry.offset;
+        outHash = HashBytesFast(mappedPtr, diskSize);
         return PakStatus::Ok;
     }
 
@@ -318,30 +367,32 @@ PakStatus PakReader::HashEntrySourceBytes(const PakInternal::PakEntry& entry,
                         static_cast<std::streamsize>(source.size()));
         if (!pakStream_) return PakStatus::IoError;
     }
-    outHash = HashBuffer(source.data(), source.size());
+    outHash = HashBytesFast(source.data(), source.size());
     return PakStatus::Ok;
 }
 
 bool PakReader::TryGetMemoryCache(CacheKey key,
     std::shared_ptr<const std::vector<uint8_t>>& outData) const
 {
-    std::lock_guard cacheLock(cacheMutex_);
-    if (!cacheOptions_.enabled || !cacheOptions_.memoryCacheEnabled ||
-        cacheOptions_.memoryBudgetBytes == 0) {
+    const PakCacheOptions& options = CacheOptions();
+    if (!options.enabled || !options.memoryCacheEnabled ||
+        options.memoryBudgetBytes == 0) {
         return false;
     }
 
-    auto it = memoryCache_.find(key);
-    if (it == memoryCache_.end()) {
-        ++cacheStats_.memoryMisses;
+    MemoryCacheShard& shard = memoryShards_[ShardIndexFor(key, ActiveShardCount(options))];
+    std::lock_guard shardLock(shard.mutex);
+
+    auto it = shard.entries.find(key);
+    if (it == shard.entries.end()) {
+        ++shard.misses;
         return false;
     }
 
-    memoryCacheLru_.splice(memoryCacheLru_.begin(), memoryCacheLru_,
-                           it->second.lruPosition);
-    it->second.lruPosition = memoryCacheLru_.begin();
+    shard.lru.splice(shard.lru.begin(), shard.lru, it->second.lruPosition);
+    it->second.lruPosition = shard.lru.begin();
     outData = it->second.data;
-    ++cacheStats_.memoryHits;
+    ++shard.hits;
     return static_cast<bool>(outData);
 }
 
@@ -350,30 +401,38 @@ void PakReader::StoreMemoryCache(CacheKey key,
 {
     if (!data) return;
 
-    std::lock_guard cacheLock(cacheMutex_);
-    if (!cacheOptions_.enabled || !cacheOptions_.memoryCacheEnabled ||
-        cacheOptions_.memoryBudgetBytes == 0 ||
-        data->size() > cacheOptions_.maxSingleEntryBytes ||
-        data->size() > cacheOptions_.memoryBudgetBytes) {
+    const PakCacheOptions& options = CacheOptions();
+    const uint64_t shardBudget = ShardBudget(options);
+    if (!options.enabled || !options.memoryCacheEnabled ||
+        options.memoryBudgetBytes == 0 ||
+        data->size() > options.maxSingleEntryBytes ||
+        // An entry bigger than one shard's slice could never be retained, and
+        // admitting it would evict that entire shard on its way back out. So
+        // with sharding active the effective single-entry ceiling is
+        // min(maxSingleEntryBytes, budget / shards) -- which also rules out
+        // the pathological case of one entry evicting the whole cache.
+        data->size() > shardBudget) {
         return;
     }
 
-    uint64_t size = static_cast<uint64_t>(data->size());
-    auto it = memoryCache_.find(key);
-    if (it != memoryCache_.end()) {
-        memoryCacheBytes_ -= it->second.size;
-        memoryCacheLru_.splice(memoryCacheLru_.begin(), memoryCacheLru_,
-                               it->second.lruPosition);
-        it->second = DecodedCacheEntry{std::move(data), size, memoryCacheLru_.begin()};
+    const uint64_t size = static_cast<uint64_t>(data->size());
+    MemoryCacheShard& shard = memoryShards_[ShardIndexFor(key, ActiveShardCount(options))];
+    std::lock_guard shardLock(shard.mutex);
+
+    auto it = shard.entries.find(key);
+    if (it != shard.entries.end()) {
+        shard.bytes -= it->second.size;
+        shard.lru.splice(shard.lru.begin(), shard.lru, it->second.lruPosition);
+        it->second = DecodedCacheEntry{std::move(data), size, shard.lru.begin()};
     } else {
-        memoryCacheLru_.push_front(key);
-        memoryCache_.emplace(key,
-            DecodedCacheEntry{std::move(data), size, memoryCacheLru_.begin()});
+        shard.lru.push_front(key);
+        shard.entries.emplace(key,
+            DecodedCacheEntry{std::move(data), size, shard.lru.begin()});
     }
 
-    memoryCacheBytes_ += size;
-    ++cacheStats_.memoryStores;
-    TrimMemoryCacheLocked();
+    shard.bytes += size;
+    ++shard.stores;
+    TrimShardLocked(shard, shardBudget);
 }
 
 bool PakReader::TryLoadPersistentCache(CacheKey key,
@@ -414,7 +473,7 @@ bool PakReader::TryLoadPersistentCache(CacheKey key,
 
     {
         std::lock_guard cacheLock(cacheMutex_);
-        if (header.dataSize > cacheOptions_.maxSingleEntryBytes) {
+        if (header.dataSize > CacheOptions().maxSingleEntryBytes) {
             ++cacheStats_.persistentMisses;
             return false;
         }
@@ -455,8 +514,8 @@ void PakReader::StorePersistentCache(CacheKey key, const std::vector<uint8_t>& d
     {
         std::lock_guard cacheLock(cacheMutex_);
         if (!HasPersistentCacheDirectoryLocked() ||
-            data.size() > cacheOptions_.maxSingleEntryBytes ||
-            data.size() > cacheOptions_.persistentBudgetBytes) {
+            data.size() > CacheOptions().maxSingleEntryBytes ||
+            data.size() > CacheOptions().persistentBudgetBytes) {
             return;
         }
         pathString = PersistentCachePathLocked(key);
@@ -510,22 +569,22 @@ void PakReader::StorePersistentCache(CacheKey key, const std::vector<uint8_t>& d
 }
 
 PakStatus PakReader::ReadEntryWithCache(PakFileHandle handle,
-    const PakInternal::PakEntry& entry, std::span<uint8_t> destination,
-    uint64_t* bytesWritten, const ReadContext& context) const
+    const PakFileInfo& entry, std::span<uint8_t> destination,
+    uint64_t* bytesWritten, const ReadSnapshot& snapshot) const
 {
     if (bytesWritten) *bytesWritten = 0;
 
-    PakStatus validation = ValidateReadRequest(entry, static_cast<uint64_t>(destination.size()), context);
+    PakStatus validation = ValidateReadRequest(entry, static_cast<uint64_t>(destination.size()), snapshot);
     if (validation != PakStatus::Ok) return validation;
     if (entry.originalSize == 0) return PakStatus::Ok;
 
     // verifyOnRead promises to hash the current source bytes on every call.
     // A decoded cache hit cannot satisfy that contract, so keep verification
     // on the direct source path regardless of cache policy.
-    if (context.verifyOnRead) {
-        PakStatus status = ReadEntryToBuffer(entry, destination, bytesWritten, context);
+    if (snapshot.verifyOnRead) {
+        PakStatus status = ReadEntryToBuffer(entry, destination, bytesWritten, snapshot);
         if (status == PakStatus::Ok) {
-            sourceReads_.fetch_add(1, std::memory_order_relaxed);
+            sourceReads_.Increment();
         }
         return status;
     }
@@ -533,30 +592,28 @@ PakStatus PakReader::ReadEntryWithCache(PakFileHandle handle,
     // Mapped, plain entries can never benefit from the decoded cache: the
     // mapping is already the cache and Read() only needs a memcpy. Avoid the
     // cache mutex and policy copy entirely on this dominant shipping path.
-    if (context.useMmap && !PakInternal::IsCompressed(entry.flags) &&
+    if (snapshot.useMmap && !PakInternal::IsCompressed(entry.flags) &&
         encryptionKey_.empty()) {
-        PakStatus status = ReadEntryToBuffer(entry, destination, bytesWritten, context);
+        PakStatus status = ReadEntryToBuffer(entry, destination, bytesWritten, snapshot);
         if (status == PakStatus::Ok) {
-            sourceReads_.fetch_add(1, std::memory_order_relaxed);
+            sourceReads_.Increment();
         }
         return status;
     }
 
-    PakCacheOptions options;
-    {
-        std::lock_guard cacheLock(cacheMutex_);
-        options = cacheOptions_;
-    }
+    // Read straight from the published policy: no lock, and no copy of a
+    // struct that owns a std::string.
+    const PakCacheOptions& options = CacheOptions();
 
-    if (!ShouldCacheDecoded(entry, context, options)) {
-        PakStatus status = ReadEntryToBuffer(entry, destination, bytesWritten, context);
+    if (!ShouldCacheDecoded(entry, snapshot, options)) {
+        PakStatus status = ReadEntryToBuffer(entry, destination, bytesWritten, snapshot);
         if (status == PakStatus::Ok) {
-            sourceReads_.fetch_add(1, std::memory_order_relaxed);
+            sourceReads_.Increment();
         }
         return status;
     }
 
-    CacheKey memoryKey = MakeMemoryCacheKey(handle, context);
+    CacheKey memoryKey = MakeMemoryCacheKey(handle, snapshot);
     std::shared_ptr<const std::vector<uint8_t>> cached;
     if (options.memoryCacheEnabled && TryGetMemoryCache(memoryKey, cached)) {
         if (cached->size() != entry.originalSize) return PakStatus::CorruptArchive;
@@ -576,7 +633,7 @@ PakStatus PakReader::ReadEntryWithCache(PakFileHandle handle,
         // contentHash is the archive's persisted FNV-1a hash of these exact
         // on-disk source bytes. Reuse it in the persistent key instead of
         // scanning the compressed payload before every cache lookup.
-        persistentKey = MakePersistentCacheKey(handle, entry, context);
+        persistentKey = MakePersistentCacheKey(handle, entry, snapshot);
         havePersistentKey = true;
         if (TryLoadPersistentCache(persistentKey, cached)) {
             if (cached->size() != entry.originalSize) return PakStatus::CorruptArchive;
@@ -587,10 +644,10 @@ PakStatus PakReader::ReadEntryWithCache(PakFileHandle handle,
         }
     }
 
-    PakStatus status = ReadEntryToBuffer(entry, destination, bytesWritten, context);
+    PakStatus status = ReadEntryToBuffer(entry, destination, bytesWritten, snapshot);
     if (status != PakStatus::Ok) return status;
 
-    sourceReads_.fetch_add(1, std::memory_order_relaxed);
+    sourceReads_.Increment();
 
     auto output = destination.first(static_cast<size_t>(entry.originalSize));
     auto stored = std::make_shared<std::vector<uint8_t>>(output.begin(), output.end());

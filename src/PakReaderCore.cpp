@@ -23,6 +23,15 @@ static void EncryptDecryptSpan(std::span<uint8_t> data, const std::string& key,
     }
 }
 
+// Entry names are absent when an archive is opened without its name blob, so
+// diagnostics fall back to the path hash -- which is still enough to identify
+// the entry against a build manifest.
+static std::string EntryLabel(const PakFileInfo& entry)
+{
+    if (!entry.filename.empty()) return std::string(entry.filename);
+    return "<path hash " + PakInternal::Hex64(entry.pathHash) + ">";
+}
+
 // ===========================================================================
 // PakReader -- runtime read-only API for shipping builds
 // ===========================================================================
@@ -37,6 +46,33 @@ PakReader::~PakReader()
     Close();
 }
 
+// Transfers the decoded memory cache shard by shard. std::list nodes survive
+// a move, so the LRU iterators stored in each entry stay valid.
+void PakReader::AdoptMemoryShards(PakReader& other) const
+{
+    for (size_t i = 0; i < kMemoryCacheShards; ++i) {
+        MemoryCacheShard& destination = memoryShards_[i];
+        MemoryCacheShard& source = other.memoryShards_[i];
+        std::scoped_lock shardLock(destination.mutex, source.mutex);
+
+        destination.entries = std::move(source.entries);
+        destination.lru = std::move(source.lru);
+        destination.bytes = source.bytes;
+        destination.hits = source.hits;
+        destination.misses = source.misses;
+        destination.stores = source.stores;
+        destination.evictions = source.evictions;
+
+        source.entries.clear();
+        source.lru.clear();
+        source.bytes = 0;
+        source.hits = 0;
+        source.misses = 0;
+        source.stores = 0;
+        source.evictions = 0;
+    }
+}
+
 PakReader::PakReader(PakReader&& other) noexcept
     : encryptionKey_()
       // mutex_ and streamMutex_ are default-constructed (non-movable)
@@ -48,95 +84,67 @@ PakReader::PakReader(PakReader&& other) noexcept
     pakStream_ = std::move(other.pakStream_);
     pakFilename_ = std::move(other.pakFilename_);
     header_ = other.header_;
-    pakFileSize_ = other.pakFileSize_;
-    isOpen_ = other.isOpen_;
-    table_ = std::move(other.table_);
-    mappedGuard_ = std::move(other.mappedGuard_);
-    useMmap_ = other.useMmap_;
     alignment_ = other.alignment_;
-    archiveFingerprint_ = other.archiveFingerprint_;
-    verifyOnRead_ = other.verifyOnRead_;
-    cacheOptions_ = other.cacheOptions_;
+
+    snapshotOwner_ = std::move(other.snapshotOwner_);
+    snapshot_.store(other.snapshot_.load(std::memory_order_relaxed),
+                    std::memory_order_relaxed);
+    other.snapshot_.store(nullptr, std::memory_order_relaxed);
+
+    cacheOptionsOwner_ = std::move(other.cacheOptionsOwner_);
+    cacheOptions_.store(cacheOptionsOwner_.get(), std::memory_order_relaxed);
+    other.cacheOptions_.store(nullptr, std::memory_order_relaxed);
     cacheStats_ = other.cacheStats_;
-    sourceReads_.store(other.sourceReads_.load(std::memory_order_relaxed),
-                       std::memory_order_relaxed);
-    memoryCacheLru_ = std::move(other.memoryCacheLru_);
-    memoryCache_ = std::move(other.memoryCache_);
-    memoryCacheBytes_ = other.memoryCacheBytes_;
+    sourceReads_.Store(other.sourceReads_.Load());
+    other.sourceReads_.Reset();
+    AdoptMemoryShards(other);
     effectivePersistentCacheDirectory_ = std::move(other.effectivePersistentCacheDirectory_);
 
-    other.isOpen_ = false;
-    other.pakFileSize_ = 0;
-    other.useMmap_ = false;
     other.alignment_ = 1;
-    other.archiveFingerprint_ = 0;
-    other.verifyOnRead_ = false;
-    other.memoryCacheBytes_ = 0;
 }
 
 PakReader& PakReader::operator=(PakReader&& other) noexcept
 {
-    if (this != &other) {
-        // Lock both mutexes in address order to prevent deadlock
-        std::unique_lock<std::shared_mutex> lk1, lk2;
-        if (this < &other) {
-            lk1 = std::unique_lock(mutex_);
-            lk2 = std::unique_lock(other.mutex_);
-        } else {
-            lk2 = std::unique_lock(other.mutex_);
-            lk1 = std::unique_lock(mutex_);
-        }
-        std::scoped_lock cacheLock(cacheMutex_, other.cacheMutex_);
+    if (this == &other) return *this;
 
-        // Close current state (inline, we already hold our lock)
-        if (isOpen_) {
-            mappedGuard_.reset();
-            useMmap_ = false;
-            pakStream_.close();
-            table_.reset();
-            header_ = PakInternal::PakHeader{};
-            pakFileSize_ = 0;
-            isOpen_ = false;
-            alignment_ = 1;
-            archiveFingerprint_ = 0;
-            verifyOnRead_ = false;
-            pakFilename_.clear();
-        }
-        memoryCache_.clear();
-        memoryCacheLru_.clear();
-        memoryCacheBytes_ = 0;
-        cacheStats_.memoryBytes = 0;
-
-        encryptionKey_ = std::move(other.encryptionKey_);
-        pakStream_ = std::move(other.pakStream_);
-        pakFilename_ = std::move(other.pakFilename_);
-        header_ = other.header_;
-        pakFileSize_ = other.pakFileSize_;
-        isOpen_ = other.isOpen_;
-        table_ = std::move(other.table_);
-        mappedGuard_ = std::move(other.mappedGuard_);
-        useMmap_ = other.useMmap_;
-        alignment_ = other.alignment_;
-        archiveFingerprint_ = other.archiveFingerprint_;
-        verifyOnRead_ = other.verifyOnRead_;
-        cacheOptions_ = other.cacheOptions_;
-        cacheStats_ = other.cacheStats_;
-        sourceReads_.store(other.sourceReads_.load(std::memory_order_relaxed),
-                           std::memory_order_relaxed);
-        memoryCacheLru_ = std::move(other.memoryCacheLru_);
-        memoryCache_ = std::move(other.memoryCache_);
-        memoryCacheBytes_ = other.memoryCacheBytes_;
-        effectivePersistentCacheDirectory_ = std::move(other.effectivePersistentCacheDirectory_);
-        // mutex_ and streamMutex_ stay as-is (non-movable)
-
-        other.isOpen_ = false;
-        other.pakFileSize_ = 0;
-        other.useMmap_ = false;
-        other.alignment_ = 1;
-        other.archiveFingerprint_ = 0;
-        other.verifyOnRead_ = false;
-        other.memoryCacheBytes_ = 0;
+    // Lock both mutexes in address order to prevent deadlock
+    std::unique_lock<std::shared_mutex> lk1, lk2;
+    if (this < &other) {
+        lk1 = std::unique_lock(mutex_);
+        lk2 = std::unique_lock(other.mutex_);
+    } else {
+        lk2 = std::unique_lock(other.mutex_);
+        lk1 = std::unique_lock(mutex_);
     }
+
+    // Takes and releases cacheMutex_, so it must run before the scoped_lock
+    // below rather than inside it.
+    CloseLocked();
+
+    std::scoped_lock cacheLock(cacheMutex_, other.cacheMutex_);
+
+    encryptionKey_ = std::move(other.encryptionKey_);
+    pakStream_ = std::move(other.pakStream_);
+    pakFilename_ = std::move(other.pakFilename_);
+    header_ = other.header_;
+    alignment_ = other.alignment_;
+
+    snapshotOwner_ = std::move(other.snapshotOwner_);
+    snapshot_.store(other.snapshot_.load(std::memory_order_relaxed),
+                    std::memory_order_relaxed);
+    other.snapshot_.store(nullptr, std::memory_order_relaxed);
+
+    cacheOptionsOwner_ = std::move(other.cacheOptionsOwner_);
+    cacheOptions_.store(cacheOptionsOwner_.get(), std::memory_order_relaxed);
+    other.cacheOptions_.store(nullptr, std::memory_order_relaxed);
+    cacheStats_ = other.cacheStats_;
+    sourceReads_.Store(other.sourceReads_.Load());
+    other.sourceReads_.Reset();
+    AdoptMemoryShards(other);
+    effectivePersistentCacheDirectory_ = std::move(other.effectivePersistentCacheDirectory_);
+    // mutex_ and streamMutex_ stay as-is (non-movable)
+
+    other.alignment_ = 1;
     return *this;
 }
 
@@ -148,26 +156,7 @@ bool PakReader::Open(const std::string& pakFilename)
 bool PakReader::Open(const std::string& pakFilename, const PakOpenOptions& options)
 {
     std::unique_lock lock(mutex_);
-    if (isOpen_) {
-        // Close without locking (we already hold the lock)
-        mappedGuard_.reset();
-        useMmap_ = false;
-        pakStream_.close();
-        table_.reset();
-        header_ = PakHeader{};
-        pakFileSize_ = 0;
-        isOpen_ = false;
-        alignment_ = 1;
-        archiveFingerprint_ = 0;
-        verifyOnRead_ = false;
-        {
-            std::lock_guard cacheLock(cacheMutex_);
-            memoryCache_.clear();
-            memoryCacheLru_.clear();
-            memoryCacheBytes_ = 0;
-            cacheStats_.memoryBytes = 0;
-        }
-    }
+    CloseLocked();
 
     pakFilename_ = pakFilename;
 
@@ -184,72 +173,133 @@ bool PakReader::Open(const std::string& pakFilename, const PakOpenOptions& optio
     alignment_ = (header_.alignment > 0) ? header_.alignment : 1;
 
     pakStream_.seekg(0, std::ios::end);
-    pakFileSize_ = SafeStreamPos(pakStream_, pakStream_.tellg());
+    const uint64_t pakFileSize = SafeStreamPos(pakStream_, pakStream_.tellg());
 
+    uint64_t fingerprint = FNV_OFFSET_BASIS;
     {
-        uint64_t fingerprint = FNV_OFFSET_BASIS;
         std::error_code ec;
         fs::path absolutePath = fs::absolute(fs::path(pakFilename), ec);
         std::string pathForHash = ec ? pakFilename : absolutePath.string();
         HashString(fingerprint, pathForHash);
-        HashValue(fingerprint, pakFileSize_);
+        HashValue(fingerprint, pakFileSize);
         HashValue(fingerprint, header_.numFiles);
         HashValue(fingerprint, header_.fileTableOffset);
         uint64_t modifiedTime = FileTimeFingerprint(pakFilename);
         HashValue(fingerprint, modifiedTime);
-        archiveFingerprint_ = fingerprint;
     }
 
-    if (header_.fileTableOffset > pakFileSize_) {
+    if (header_.fileTableOffset > pakFileSize) {
         Log(PakLogLevel::Error, "PakReader::Open: Invalid file table offset.");
         pakStream_.close();
         return false;
     }
 
-    pakStream_.seekg(header_.fileTableOffset, std::ios::beg);
-    if (!pakStream_) {
-        Log(PakLogLevel::Error, "PakReader::Open: Failed to seek to file table.");
+    const uint32_t numFiles = header_.numFiles;
+    if (header_.nameBlobSize > pakFileSize ||
+        header_.nameBlobOffset > pakFileSize - header_.nameBlobSize) {
+        Log(PakLogLevel::Error, "PakReader::Open: Name blob outside archive bounds.");
+        pakStream_.close();
+        return false;
+    }
+    if (static_cast<uint64_t>(numFiles) * sizeof(PakEntryRecord) >
+            pakFileSize - header_.fileTableOffset) {
+        Log(PakLogLevel::Error, "PakReader::Open: Entry table outside archive bounds.");
         pakStream_.close();
         return false;
     }
 
-    std::vector<PakEntry> entries;
-    if (!ReadFileTable(pakStream_, header_.numFiles, entries)) {
-        pakStream_.close();
-        return false;
+    auto snapshot = std::make_shared<ReadSnapshot>();
+    snapshot->fileSize = pakFileSize;
+    snapshot->archiveFingerprint = fingerprint;
+    snapshot->verifyOnRead = options.verifyOnRead;
+
+    RuntimeTable& table = snapshot->table;
+    table.pakFilename = pakFilename_;
+    table.namesLoaded = options.loadNames;
+
+    // One bulk read for the records, one for the names. This is the whole
+    // reason the v7 table is fixed-size: no per-entry stream reads, no
+    // per-entry allocation, and the arrays below are the final runtime
+    // representation rather than an intermediate parse.
+    std::vector<PakEntryRecord> records(numFiles);
+    if (numFiles > 0) {
+        pakStream_.seekg(static_cast<std::streamoff>(header_.fileTableOffset), std::ios::beg);
+        if (!pakStream_) {
+            Log(PakLogLevel::Error, "PakReader::Open: Failed to seek to file table.");
+            pakStream_.close();
+            return false;
+        }
+        pakStream_.read(reinterpret_cast<char*>(records.data()),
+                        static_cast<std::streamsize>(records.size() * sizeof(PakEntryRecord)));
+        if (!pakStream_) {
+            Log(PakLogLevel::Error, "PakReader::Open: Failed to read entry records.");
+            pakStream_.close();
+            return false;
+        }
     }
 
-    auto table = std::make_shared<RuntimeTable>();
-    table->entries.reserve(entries.size());
-    table->infos.reserve(entries.size());
-    table->indexByName.reserve(entries.size());
-    table->pakFilename = pakFilename_;
+    if (options.loadNames && header_.nameBlobSize > 0) {
+        table.nameBlob.resize(static_cast<size_t>(header_.nameBlobSize));
+        pakStream_.seekg(static_cast<std::streamoff>(header_.nameBlobOffset), std::ios::beg);
+        if (!pakStream_) {
+            Log(PakLogLevel::Error, "PakReader::Open: Failed to seek to name blob.");
+            pakStream_.close();
+            return false;
+        }
+        pakStream_.read(table.nameBlob.data(),
+                        static_cast<std::streamsize>(table.nameBlob.size()));
+        if (!pakStream_) {
+            Log(PakLogLevel::Error, "PakReader::Open: Failed to read name blob.");
+            pakStream_.close();
+            return false;
+        }
+    }
 
-    for (auto& entry : entries) {
-        if (!ValidateEntry(entry, pakFileSize_)) {
-            Log(PakLogLevel::Error, "PakReader::Open: Invalid entry: " + entry.filename);
+    table.infos.resize(numFiles);
+    for (uint32_t i = 0; i < numFiles; ++i) {
+        const PakEntryRecord& record = records[i];
+
+        const uint64_t diskSize = record.compressedSize > 0 ? record.compressedSize
+                                                            : record.originalSize;
+        if (record.offset > pakFileSize || diskSize > pakFileSize - record.offset) {
+            Log(PakLogLevel::Error, "PakReader::Open: Entry exceeds archive bounds.");
+            pakStream_.close();
+            return false;
+        }
+        // Names are bounds-checked against the blob size from the header, so
+        // this holds whether or not the blob was actually loaded.
+        if (record.nameLength == 0 ||
+            record.nameOffset > header_.nameBlobSize ||
+            record.nameLength > header_.nameBlobSize - record.nameOffset) {
+            Log(PakLogLevel::Error, "PakReader::Open: Name range outside the name blob.");
             pakStream_.close();
             return false;
         }
 
-        uint32_t index = static_cast<uint32_t>(table->entries.size());
-        table->entries.emplace_back(std::move(entry));
+        PakFileInfo& info = table.infos[i];
+        info.originalSize = record.originalSize;
+        info.compressedSize = record.compressedSize;
+        info.offset = record.offset;
+        info.pathHash = record.pathHash;
+        info.contentHash = record.contentHash;
+        info.flags = record.flags;
+        info.compressed = PakInternal::IsCompressed(record.flags);
 
-        const auto& storedEntry = table->entries.back();
-        PakFileInfo info{};
-        info.filename = storedEntry.filename;
-        info.originalSize = storedEntry.originalSize;
-        info.compressedSize = storedEntry.compressedSize;
-        info.offset = storedEntry.offset;
-        info.compressed = PakInternal::IsCompressed(storedEntry.flags);
-        table->infos.emplace_back(info);
-
-        auto [_, inserted] = table->indexByName.emplace(storedEntry.filename, index);
-        if (!inserted) {
-            Log(PakLogLevel::Error, "PakReader::Open: Duplicate entry: " + storedEntry.filename);
-            pakStream_.close();
-            return false;
+        if (!table.nameBlob.empty()) {
+            std::string_view name(table.nameBlob.data() + record.nameOffset, record.nameLength);
+            if (!IsValidFilename(std::string(name))) {
+                Log(PakLogLevel::Error, "PakReader::Open: Invalid filename: " + std::string(name));
+                pakStream_.close();
+                return false;
+            }
+            info.filename = name;
         }
+    }
+
+    if (!BuildLookupTable(table)) {
+        Log(PakLogLevel::Error, "PakReader::Open: Duplicate path hash in file table.");
+        pakStream_.close();
+        return false;
     }
 
     // Attempt memory-mapped I/O -- close ifstream first to avoid double file handle
@@ -257,12 +307,13 @@ bool PakReader::Open(const std::string& pakFilename, const PakOpenOptions& optio
 
     auto guard = std::make_shared<PakInternal::MappedFileGuard>();
     guard->mf = PakPlatform::MapFileReadOnly(pakFilename.c_str());
-    if (guard->mf.data && guard->mf.size == pakFileSize_) {
-        mappedGuard_ = std::move(guard);
-        useMmap_ = true;
+    if (guard->mf.data && guard->mf.size == pakFileSize) {
+        snapshot->guardPtr = guard.get();
+        snapshot->guard = std::move(guard);
+        snapshot->useMmap = true;
     } else {
         // Fallback: re-open ifstream (guard destructor unmaps if needed)
-        useMmap_ = false;
+        snapshot->useMmap = false;
         pakStream_.open(pakFilename, std::ios::binary);
         if (!pakStream_) {
             Log(PakLogLevel::Error, "PakReader::Open: Failed to re-open pak file for streaming.");
@@ -270,54 +321,62 @@ bool PakReader::Open(const std::string& pakFilename, const PakOpenOptions& optio
         }
     }
 
-    table_ = std::move(table);
-    isOpen_ = true;
-    verifyOnRead_ = options.verifyOnRead;
     {
         std::lock_guard cacheLock(cacheMutex_);
         ResolvePersistentCacheDirectoryLocked();
     }
+
+    // Publish last. Everything the snapshot points at is fully constructed
+    // before this store, and the release ordering pairs with the acquire load
+    // in AcquireSnapshot() so readers observe it completely initialized.
+    snapshotOwner_ = std::move(snapshot);
+    snapshot_.store(snapshotOwner_.get(), std::memory_order_release);
+
     Log(PakLogLevel::Info, "PakReader::Open: Opened '" + pakFilename + "' with " +
         std::to_string(header_.numFiles) + " files" +
-        (useMmap_ ? " (memory-mapped)" : " (streaming)") + ".");
+        (snapshotOwner_->useMmap ? " (memory-mapped)" : " (streaming)") + ".");
     return true;
+}
+
+void PakReader::CloseLocked()
+{
+    // Unpublish before releasing. After this store no new read can reach the
+    // snapshot; the documented threading contract (no Close() concurrent with
+    // reads) covers reads already inside one. PakView/PakSpan values already
+    // handed out keep the mapping alive through their own shared_ptr.
+    snapshot_.store(nullptr, std::memory_order_release);
+    snapshotOwner_.reset();
+
+    pakStream_.close();
+    header_ = PakHeader{};
+    alignment_ = 1;
+    pakFilename_.clear();
+
+    std::lock_guard cacheLock(cacheMutex_);
+    for (auto& shard : memoryShards_) {
+        std::lock_guard shardLock(shard.mutex);
+        shard.entries.clear();
+        shard.lru.clear();
+        shard.bytes = 0;
+    }
+    cacheStats_.memoryBytes = 0;
 }
 
 void PakReader::Close()
 {
     std::unique_lock lock(mutex_);
-    if (isOpen_) {
-        mappedGuard_.reset();
-        useMmap_ = false;
-        pakStream_.close();
-        table_.reset();
-        header_ = PakHeader{};
-        pakFileSize_ = 0;
-        isOpen_ = false;
-        alignment_ = 1;
-        archiveFingerprint_ = 0;
-        verifyOnRead_ = false;
-        pakFilename_.clear();
-        {
-            std::lock_guard cacheLock(cacheMutex_);
-            memoryCache_.clear();
-            memoryCacheLru_.clear();
-            memoryCacheBytes_ = 0;
-            cacheStats_.memoryBytes = 0;
-        }
-    }
+    CloseLocked();
 }
 
 bool PakReader::IsOpen() const
 {
-    std::shared_lock lock(mutex_);
-    return isOpen_;
+    return AcquireSnapshot() != nullptr;
 }
 
 bool PakReader::IsMapped() const
 {
-    std::shared_lock lock(mutex_);
-    return useMmap_;
+    const ReadSnapshot* snapshot = AcquireSnapshot();
+    return snapshot != nullptr && snapshot->useMmap;
 }
 
 // ---------------------------------------------------------------------------
@@ -335,29 +394,103 @@ std::string PakReader::NormalizePath(std::string_view path)
     return PakInternal::NormalizePathSeparators(std::string(path));
 }
 
+// Builds the open-addressing name index over the path hashes the archive
+// already stores, so opening does no string hashing at all. Kept at <=70%
+// load; the table is sized once and never grows.
+bool PakReader::BuildLookupTable(RuntimeTable& table)
+{
+    const size_t count = table.infos.size();
+    if (count == 0) {
+        table.lookup.clear();
+        table.lookupMask = 0;
+        return true;
+    }
+
+    uint64_t slotCount = 16;
+    const uint64_t required = (static_cast<uint64_t>(count) * 10 + 6) / 7;
+    while (slotCount < required) slotCount <<= 1;
+
+    table.lookup.assign(static_cast<size_t>(slotCount), PakInternal::LookupSlot{});
+    table.lookupMask = slotCount - 1;
+
+    for (size_t i = 0; i < count; ++i) {
+        const uint64_t pathHash = table.infos[i].pathHash;
+        uint64_t position = pathHash & table.lookupMask;
+        while (true) {
+            PakInternal::LookupSlot& slot = table.lookup[static_cast<size_t>(position)];
+            if (slot.entryIndex == PakFileHandle::InvalidIndex) {
+                slot.hashTag = static_cast<uint32_t>(pathHash >> 32);
+                slot.entryIndex = static_cast<uint32_t>(i);
+                break;
+            }
+            if (slot.hashTag == static_cast<uint32_t>(pathHash >> 32) &&
+                table.infos[slot.entryIndex].pathHash == pathHash) {
+                // Two entries sharing a path hash means either a duplicate
+                // path or a genuine collision. Either way the archive is
+                // unusable as written, so refuse it rather than silently
+                // making one of the two unreachable.
+                return false;
+            }
+            position = (position + 1) & table.lookupMask;
+        }
+    }
+    return true;
+}
+
+PakFileHandle PakReader::FindByHashInTable(const RuntimeTable& table, uint64_t pathHash,
+                                           std::string_view verifyName)
+{
+    if (table.lookup.empty()) return {};
+
+    const uint32_t tag = static_cast<uint32_t>(pathHash >> 32);
+    uint64_t position = pathHash & table.lookupMask;
+    while (true) {
+        const PakInternal::LookupSlot& slot = table.lookup[static_cast<size_t>(position)];
+        if (slot.entryIndex == PakFileHandle::InvalidIndex) return {};
+
+        // The 32-bit tag rejects almost every non-match without touching the
+        // entry array, so a probe usually costs one cache line, not two.
+        if (slot.hashTag == tag) {
+            const PakFileInfo& info = table.infos[slot.entryIndex];
+            if (info.pathHash == pathHash) {
+                // Confirm against the stored name when it is resident, so a
+                // hash collision cannot hand back the wrong asset. With names
+                // dropped there is nothing to confirm against and the 64-bit
+                // hash has to stand on its own.
+                if (!verifyName.empty() && !info.filename.empty() &&
+                    info.filename != verifyName) {
+                    return {};
+                }
+                return PakFileHandle{slot.entryIndex};
+            }
+        }
+        position = (position + 1) & table.lookupMask;
+    }
+}
+
 PakFileHandle PakReader::FindInTable(const RuntimeTable& table, std::string_view filename)
 {
     if (filename.empty()) return {};
 
     if (NeedsPathNormalization(filename)) {
-        std::string normalized = NormalizePath(filename);
-        auto it = table.indexByName.find(normalized);
-        return it != table.indexByName.end() ? PakFileHandle{it->second} : PakFileHandle{};
+        const std::string normalized = NormalizePath(filename);
+        return FindByHashInTable(table, PakPathHash(normalized), normalized);
     }
-
-    auto it = table.indexByName.find(filename);
-    return it != table.indexByName.end() ? PakFileHandle{it->second} : PakFileHandle{};
+    return FindByHashInTable(table, PakPathHash(filename), filename);
 }
 
 PakFileHandle PakReader::Find(std::string_view filename) const
 {
-    std::shared_ptr<const RuntimeTable> table;
-    {
-        std::shared_lock lock(mutex_);
-        if (!isOpen_ || !table_) return {};
-        table = table_;
-    }
-    return FindInTable(*table, filename);
+    const ReadSnapshot* snapshot = AcquireSnapshot();
+    if (!snapshot) return {};
+    return FindInTable(snapshot->table, filename);
+}
+
+PakFileHandle PakReader::FindByHash(uint64_t pathHash) const
+{
+    const ReadSnapshot* snapshot = AcquireSnapshot();
+    if (!snapshot) return {};
+    return FindByHashInTable(snapshot->table, pathHash, std::string_view{});
 }
 
 size_t PakReader::Resolve(std::span<const std::string_view> filenames,
@@ -366,18 +499,14 @@ size_t PakReader::Resolve(std::span<const std::string_view> filenames,
     size_t resolvedCount = 0;
     size_t count = std::min(filenames.size(), handles.size());
 
-    std::shared_ptr<const RuntimeTable> table;
-    {
-        std::shared_lock lock(mutex_);
-        if (!isOpen_ || !table_) {
-            for (size_t i = 0; i < count; ++i) handles[i] = {};
-            return 0;
-        }
-        table = table_;
+    const ReadSnapshot* snapshot = AcquireSnapshot();
+    if (!snapshot) {
+        for (size_t i = 0; i < count; ++i) handles[i] = {};
+        return 0;
     }
 
     for (size_t i = 0; i < count; ++i) {
-        handles[i] = FindInTable(*table, filenames[i]);
+        handles[i] = FindInTable(snapshot->table, filenames[i]);
         if (handles[i]) ++resolvedCount;
     }
     return resolvedCount;
@@ -385,50 +514,51 @@ size_t PakReader::Resolve(std::span<const std::string_view> filenames,
 
 const PakFileInfo* PakReader::Info(PakFileHandle handle) const
 {
-    std::shared_lock lock(mutex_);
-    if (!isOpen_ || !table_ || !handle || handle.index >= table_->infos.size()) return nullptr;
-    return &table_->infos[handle.index];
+    const ReadSnapshot* snapshot = AcquireSnapshot();
+    if (!snapshot || !handle || handle.index >= snapshot->table.infos.size()) return nullptr;
+    return &snapshot->table.infos[handle.index];
 }
 
 const PakFileInfo* PakReader::InfoByIndex(uint32_t index) const
 {
-    std::shared_lock lock(mutex_);
-    if (!isOpen_ || !table_ || index >= table_->infos.size()) return nullptr;
-    return &table_->infos[index];
+    const ReadSnapshot* snapshot = AcquireSnapshot();
+    if (!snapshot || index >= snapshot->table.infos.size()) return nullptr;
+    return &snapshot->table.infos[index];
 }
 
 // ---------------------------------------------------------------------------
 // Read helpers
 // ---------------------------------------------------------------------------
 
-PakStatus PakReader::CaptureReadContext(PakFileHandle handle, ReadContext& context) const
+const PakReader::ReadSnapshot* PakReader::ResolveHandle(PakFileHandle handle,
+    PakStatus& outStatus) const noexcept
 {
-    std::shared_lock lock(mutex_);
-    if (!isOpen_ || !table_) return PakStatus::NotOpen;
-    if (!handle || handle.index >= table_->entries.size()) return PakStatus::InvalidHandle;
-
-    context.table = table_;
-    context.guard = mappedGuard_;
-    context.useMmap = useMmap_;
-    context.verifyOnRead = verifyOnRead_;
-    context.fileSize = pakFileSize_;
-    context.archiveFingerprint = archiveFingerprint_;
-    return PakStatus::Ok;
+    const ReadSnapshot* snapshot = AcquireSnapshot();
+    if (!snapshot) {
+        outStatus = PakStatus::NotOpen;
+        return nullptr;
+    }
+    if (!handle || handle.index >= snapshot->table.infos.size()) {
+        outStatus = PakStatus::InvalidHandle;
+        return nullptr;
+    }
+    outStatus = PakStatus::Ok;
+    return snapshot;
 }
 
-PakStatus PakReader::ValidateReadRequest(const PakInternal::PakEntry& entry,
-    uint64_t destinationSize, const ReadContext& context) const
+PakStatus PakReader::ValidateReadRequest(const PakFileInfo& entry,
+    uint64_t destinationSize, const ReadSnapshot& snapshot) const
 {
     const uint64_t diskSize = entry.compressedSize;
     const bool compressed = PakInternal::IsCompressed(entry.flags);
 
-    if (entry.offset > context.fileSize || diskSize > context.fileSize - entry.offset) {
-        Log(PakLogLevel::Error, "PakReader::Read: Entry exceeds file bounds: " + entry.filename);
+    if (entry.offset > snapshot.fileSize || diskSize > snapshot.fileSize - entry.offset) {
+        Log(PakLogLevel::Error, "PakReader::Read: Entry exceeds file bounds: " + EntryLabel(entry));
         return PakStatus::CorruptArchive;
     }
 
     if (!compressed && diskSize != entry.originalSize) {
-        Log(PakLogLevel::Error, "PakReader::Read: Uncompressed entry has mismatched disk size: " + entry.filename);
+        Log(PakLogLevel::Error, "PakReader::Read: Uncompressed entry has mismatched disk size: " + EntryLabel(entry));
         return PakStatus::CorruptArchive;
     }
 
@@ -437,23 +567,23 @@ PakStatus PakReader::ValidateReadRequest(const PakInternal::PakEntry& entry,
     }
 
     if (compressed && (entry.originalSize > MAX_COMPRESSIBLE_ENTRY_SIZE || diskSize > MAX_COMPRESSIBLE_ENTRY_SIZE)) {
-        Log(PakLogLevel::Error, "PakReader::Read: Entry exceeds compressed size limit: " + entry.filename);
+        Log(PakLogLevel::Error, "PakReader::Read: Entry exceeds compressed size limit: " + EntryLabel(entry));
         return PakStatus::CorruptArchive;
     }
 
     return PakStatus::Ok;
 }
 
-PakStatus PakReader::ReadEntryToBuffer(const PakInternal::PakEntry& entry,
+PakStatus PakReader::ReadEntryToBuffer(const PakFileInfo& entry,
     std::span<uint8_t> destination, uint64_t* bytesWritten,
-    const ReadContext& context) const
+    const ReadSnapshot& snapshot) const
 {
     if (bytesWritten) *bytesWritten = 0;
 
     const uint64_t diskSize = entry.compressedSize;
     const bool compressed = PakInternal::IsCompressed(entry.flags);
 
-    PakStatus validation = ValidateReadRequest(entry, static_cast<uint64_t>(destination.size()), context);
+    PakStatus validation = ValidateReadRequest(entry, static_cast<uint64_t>(destination.size()), snapshot);
     if (validation != PakStatus::Ok) return validation;
 
     if (entry.originalSize == 0) {
@@ -463,8 +593,8 @@ PakStatus PakReader::ReadEntryToBuffer(const PakInternal::PakEntry& entry,
     auto output = destination.first(static_cast<size_t>(entry.originalSize));
 
     const uint8_t* mappedPtr = nullptr;
-    if (context.useMmap && context.guard && context.guard->mf.data) {
-        mappedPtr = static_cast<const uint8_t*>(context.guard->mf.data) + entry.offset;
+    if (snapshot.useMmap && snapshot.guardPtr && snapshot.guardPtr->mf.data) {
+        mappedPtr = static_cast<const uint8_t*>(snapshot.guardPtr->mf.data) + entry.offset;
     }
 
     if (!compressed) {
@@ -485,10 +615,10 @@ PakStatus PakReader::ReadEntryToBuffer(const PakInternal::PakEntry& entry,
 
         // output currently holds the raw on-disk bytes (pre-decrypt) -- verify
         // here, before EncryptDecryptSpan mutates them in place.
-        if (context.verifyOnRead) {
-            uint64_t hash = HashBuffer(output.data(), output.size());
+        if (snapshot.verifyOnRead) {
+            uint64_t hash = HashBytesFast(output.data(), output.size());
             if (hash != entry.contentHash) {
-                Log(PakLogLevel::Error, "PakReader::Read: Content hash mismatch: " + entry.filename);
+                Log(PakLogLevel::Error, "PakReader::Read: Content hash mismatch: " + EntryLabel(entry));
                 return PakStatus::HashMismatch;
             }
         }
@@ -520,21 +650,21 @@ PakStatus PakReader::ReadEntryToBuffer(const PakInternal::PakEntry& entry,
 
         // compressedScratch currently holds the raw on-disk bytes (pre-decrypt,
         // still compressed) -- verify before EncryptDecryptSpan mutates them.
-        if (context.verifyOnRead) {
-            uint64_t hash = HashBuffer(compressedScratch.data(), compressedScratch.size());
+        if (snapshot.verifyOnRead) {
+            uint64_t hash = HashBytesFast(compressedScratch.data(), compressedScratch.size());
             if (hash != entry.contentHash) {
-                Log(PakLogLevel::Error, "PakReader::Read: Content hash mismatch: " + entry.filename);
+                Log(PakLogLevel::Error, "PakReader::Read: Content hash mismatch: " + EntryLabel(entry));
                 return PakStatus::HashMismatch;
             }
         }
 
         EncryptDecryptSpan(compressedScratch, encryptionKey_);
         compressedData = compressedScratch.data();
-    } else if (context.verifyOnRead) {
+    } else if (snapshot.verifyOnRead) {
         // compressedData points directly at mapped, unencrypted on-disk bytes.
-        uint64_t hash = HashBuffer(compressedData, diskSize);
+        uint64_t hash = HashBytesFast(compressedData, diskSize);
         if (hash != entry.contentHash) {
-            Log(PakLogLevel::Error, "PakReader::Read: Content hash mismatch: " + entry.filename);
+            Log(PakLogLevel::Error, "PakReader::Read: Content hash mismatch: " + EntryLabel(entry));
             return PakStatus::HashMismatch;
         }
     }
@@ -542,7 +672,7 @@ PakStatus PakReader::ReadEntryToBuffer(const PakInternal::PakEntry& entry,
     PakStatus decompressStatus = PakInternal::DecompressBuffer(
         entry.flags, compressedData, diskSize, output.data(), entry.originalSize);
     if (decompressStatus != PakStatus::Ok) {
-        Log(PakLogLevel::Error, "PakReader::Read: Decompression failed for: " + entry.filename);
+        Log(PakLogLevel::Error, "PakReader::Read: Decompression failed for: " + EntryLabel(entry));
         return decompressStatus;
     }
 
@@ -558,56 +688,62 @@ PakStatus PakReader::View(PakFileHandle handle, PakView& outView) const
 {
     outView = PakView{};
 
-    ReadContext context;
-    PakStatus status = CaptureReadContext(handle, context);
-    if (status != PakStatus::Ok) return status;
+    PakStatus status = PakStatus::Ok;
+    const ReadSnapshot* snapshotPtr = ResolveHandle(handle, status);
+    if (!snapshotPtr) return status;
+    const ReadSnapshot& snapshot = *snapshotPtr;
 
-    const auto& entry = context.table->entries[handle.index];
+    const auto& entry = snapshot.table.infos[handle.index];
     if (PakInternal::IsCompressed(entry.flags) || !encryptionKey_.empty()) {
         return PakStatus::Unsupported;
     }
-    if (!context.useMmap || !context.guard || !context.guard->mf.data) {
+    if (!snapshot.useMmap || !snapshot.guardPtr || !snapshot.guardPtr->mf.data) {
         return PakStatus::Unsupported;
     }
-    if (entry.offset > context.fileSize || entry.originalSize > context.fileSize - entry.offset) {
+    if (entry.offset > snapshot.fileSize || entry.originalSize > snapshot.fileSize - entry.offset) {
         return PakStatus::CorruptArchive;
     }
 
-    outView.data = static_cast<const uint8_t*>(context.guard->mf.data) + entry.offset;
+    outView.data = static_cast<const uint8_t*>(snapshot.guardPtr->mf.data) + entry.offset;
     outView.size = entry.originalSize;
     outView.mapped = true;
-    outView.mappingRef_ = std::move(context.guard);
+    // The one reference count the read path still takes. PakView is
+    // documented to stay valid after Close(), which requires it to own a
+    // share of the mapping -- there is no way to honour that without it.
+    outView.mappingRef_ = snapshot.guard;
     return PakStatus::Ok;
 }
 
 PakStatus PakReader::Read(PakFileHandle handle, std::span<uint8_t> destination,
                           uint64_t* bytesWritten) const
 {
-    ReadContext context;
-    PakStatus status = CaptureReadContext(handle, context);
-    if (status != PakStatus::Ok) return status;
+    PakStatus status = PakStatus::Ok;
+    const ReadSnapshot* snapshotPtr = ResolveHandle(handle, status);
+    if (!snapshotPtr) return status;
+    const ReadSnapshot& snapshot = *snapshotPtr;
 
-    const auto& entry = context.table->entries[handle.index];
-    return ReadEntryWithCache(handle, entry, destination, bytesWritten, context);
+    const auto& entry = snapshot.table.infos[handle.index];
+    return ReadEntryWithCache(handle, entry, destination, bytesWritten, snapshot);
 }
 
 PakStatus PakReader::Load(PakFileHandle handle, std::vector<uint8_t>& outData) const
 {
-    ReadContext context;
-    PakStatus status = CaptureReadContext(handle, context);
-    if (status != PakStatus::Ok) {
+    PakStatus status = PakStatus::Ok;
+    const ReadSnapshot* snapshotPtr = ResolveHandle(handle, status);
+    if (!snapshotPtr) {
         outData.clear();
         return status;
     }
+    const ReadSnapshot& snapshot = *snapshotPtr;
 
-    const auto& entry = context.table->entries[handle.index];
+    const auto& entry = snapshot.table.infos[handle.index];
     if (entry.originalSize > static_cast<uint64_t>((std::numeric_limits<size_t>::max)())) {
         outData.clear();
         return PakStatus::InvalidArgument;
     }
 
     outData.resize(static_cast<size_t>(entry.originalSize));
-    status = ReadEntryWithCache(handle, entry, outData, nullptr, context);
+    status = ReadEntryWithCache(handle, entry, outData, nullptr, snapshot);
     if (status != PakStatus::Ok) outData.clear();
     return status;
 }
@@ -617,11 +753,12 @@ PakStatus PakReader::ReadRange(PakFileHandle handle, uint64_t rangeOffset,
 {
     if (bytesWritten) *bytesWritten = 0;
 
-    ReadContext context;
-    PakStatus status = CaptureReadContext(handle, context);
-    if (status != PakStatus::Ok) return status;
+    PakStatus status = PakStatus::Ok;
+    const ReadSnapshot* snapshotPtr = ResolveHandle(handle, status);
+    if (!snapshotPtr) return status;
+    const ReadSnapshot& snapshot = *snapshotPtr;
 
-    const auto& entry = context.table->entries[handle.index];
+    const auto& entry = snapshot.table.infos[handle.index];
 
     // Compressed frames have no internal chunk index in this format -- a
     // seekable range read isn't possible without decoding the whole entry.
@@ -631,7 +768,7 @@ PakStatus PakReader::ReadRange(PakFileHandle handle, uint64_t rangeOffset,
     }
 
     if (entry.compressedSize != entry.originalSize) {
-        Log(PakLogLevel::Error, "PakReader::ReadRange: Uncompressed entry has mismatched disk size: " + entry.filename);
+        Log(PakLogLevel::Error, "PakReader::ReadRange: Uncompressed entry has mismatched disk size: " + EntryLabel(entry));
         return PakStatus::CorruptArchive;
     }
 
@@ -640,15 +777,15 @@ PakStatus PakReader::ReadRange(PakFileHandle handle, uint64_t rangeOffset,
         return PakStatus::InvalidArgument;
     }
 
-    if (entry.offset > context.fileSize || entry.originalSize > context.fileSize - entry.offset) {
-        Log(PakLogLevel::Error, "PakReader::ReadRange: Entry exceeds file bounds: " + entry.filename);
+    if (entry.offset > snapshot.fileSize || entry.originalSize > snapshot.fileSize - entry.offset) {
+        Log(PakLogLevel::Error, "PakReader::ReadRange: Entry exceeds file bounds: " + EntryLabel(entry));
         return PakStatus::CorruptArchive;
     }
 
     const uint64_t diskOffset = entry.offset + rangeOffset;
 
-    if (context.useMmap && context.guard && context.guard->mf.data) {
-        const uint8_t* mappedPtr = static_cast<const uint8_t*>(context.guard->mf.data) + diskOffset;
+    if (snapshot.useMmap && snapshot.guardPtr && snapshot.guardPtr->mf.data) {
+        const uint8_t* mappedPtr = static_cast<const uint8_t*>(snapshot.guardPtr->mf.data) + diskOffset;
         if (!destination.empty()) {
             std::memcpy(destination.data(), mappedPtr, destination.size());
         }
@@ -680,14 +817,15 @@ PakStatus PakReader::ReadRange(PakFileHandle handle, uint64_t rangeOffset,
 
 PakStatus PakReader::VerifyEntry(PakFileHandle handle) const
 {
-    ReadContext context;
-    PakStatus status = CaptureReadContext(handle, context);
-    if (status != PakStatus::Ok) return status;
+    PakStatus status = PakStatus::Ok;
+    const ReadSnapshot* snapshotPtr = ResolveHandle(handle, status);
+    if (!snapshotPtr) return status;
+    const ReadSnapshot& snapshot = *snapshotPtr;
 
-    const auto& entry = context.table->entries[handle.index];
+    const auto& entry = snapshot.table.infos[handle.index];
 
     uint64_t hash = 0;
-    status = HashEntrySourceBytes(entry, context, hash);
+    status = HashEntrySourceBytes(entry, snapshot, hash);
     if (status != PakStatus::Ok) return status;
 
     return hash == entry.contentHash ? PakStatus::Ok : PakStatus::HashMismatch;
@@ -695,20 +833,21 @@ PakStatus PakReader::VerifyEntry(PakFileHandle handle) const
 
 PakStatus PakReader::Prefetch(PakFileHandle handle) const
 {
-    ReadContext context;
-    PakStatus status = CaptureReadContext(handle, context);
-    if (status != PakStatus::Ok) return status;
+    PakStatus status = PakStatus::Ok;
+    const ReadSnapshot* snapshotPtr = ResolveHandle(handle, status);
+    if (!snapshotPtr) return status;
+    const ReadSnapshot& snapshot = *snapshotPtr;
 
-    const auto& entry = context.table->entries[handle.index];
+    const auto& entry = snapshot.table.infos[handle.index];
     if (entry.compressedSize == 0) return PakStatus::Ok;
-    if (!context.useMmap || !context.guard || !context.guard->mf.data) {
-        if (!PakPlatform::PrefetchFileRange(context.table->pakFilename.c_str(),
+    if (!snapshot.useMmap || !snapshot.guardPtr || !snapshot.guardPtr->mf.data) {
+        if (!PakPlatform::PrefetchFileRange(snapshot.table.pakFilename.c_str(),
                                             entry.offset, entry.compressedSize)) {
             return PakStatus::IoError;
         }
         return PakStatus::Ok;
     }
-    if (!PakPlatform::PrefetchMappedRange(context.guard->mf, entry.offset, entry.compressedSize)) {
+    if (!PakPlatform::PrefetchMappedRange(snapshot.guardPtr->mf, entry.offset, entry.compressedSize)) {
         return PakStatus::IoError;
     }
     return PakStatus::Ok;
@@ -791,25 +930,25 @@ bool PakReader::FileExists(std::string_view filename) const
 
 uint32_t PakReader::GetFileCount() const
 {
-    std::shared_lock lock(mutex_);
-    if (!isOpen_ || !table_) return 0;
-    return static_cast<uint32_t>(table_->entries.size());
+    const ReadSnapshot* snapshot = AcquireSnapshot();
+    if (!snapshot) return 0;
+    return static_cast<uint32_t>(snapshot->table.infos.size());
 }
 
 PakReader::FileInfo PakReader::GetFileInfo(const std::string& filename) const
 {
-    std::shared_lock lock(mutex_);
     FileInfo info{};
     info.found = false;
     info.compressed = false;
     info.originalSize = 0;
     info.compressedSize = 0;
 
-    if (!isOpen_ || !table_) return info;
+    const ReadSnapshot* snapshot = AcquireSnapshot();
+    if (!snapshot) return info;
 
-    PakFileHandle handle = FindInTable(*table_, filename);
+    PakFileHandle handle = FindInTable(snapshot->table, filename);
     if (handle) {
-        const PakFileInfo& runtimeInfo = table_->infos[handle.index];
+        const PakFileInfo& runtimeInfo = snapshot->table.infos[handle.index];
         info.filename = std::string(runtimeInfo.filename);
         info.originalSize = runtimeInfo.originalSize;
         info.compressedSize = runtimeInfo.compressedSize;
@@ -825,16 +964,16 @@ PakReader::FileInfo PakReader::GetFileInfo(const std::string& filename) const
 
 std::vector<std::string> PakReader::ListFiles() const
 {
-    std::shared_ptr<const RuntimeTable> table;
-    {
-        std::shared_lock lock(mutex_);
-        if (!isOpen_ || !table_) return {};
-        table = table_;
-    }
+    const ReadSnapshot* snapshot = AcquireSnapshot();
+    if (!snapshot) return {};
+
+    // Nothing to enumerate when the archive was opened without its name blob;
+    // returning a run of empty strings would be worse than returning nothing.
+    if (!snapshot->table.namesLoaded) return {};
 
     std::vector<std::string> files;
-    files.reserve(table->infos.size());
-    for (const auto& info : table->infos) {
+    files.reserve(snapshot->table.infos.size());
+    for (const auto& info : snapshot->table.infos) {
         files.emplace_back(info.filename);
     }
     std::sort(files.begin(), files.end());

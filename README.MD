@@ -8,8 +8,8 @@ Pakker is a high-performance asset archive library designed for 3D game engines.
 - **Zero-copy mapped views** (`PakView`) -- returns a direct pointer into mapped memory for uncompressed assets, eliminating heap allocation entirely
 - **Handle-based runtime API** -- resolve paths once with `Find()`/`Resolve()`, cache `PakFileHandle`, then read without repeated path normalization or lookup allocation
 - **Caller-owned reads** -- `Read(handle, span)` fills engine-owned buffers and reports precise `PakStatus` errors
-- **Page-aligned data** (v6 format) -- file data aligned to configurable boundaries (16 B, 4 KB, 64 KB) for efficient page faults and GPU upload
-- **Per-entry content integrity hashing** -- FNV-1a-64 checksum of each entry's on-disk bytes, with opt-in deep verification (`ValidatePak(deepVerify)`, `PakReader::VerifyEntry()`, `PakOpenOptions::verifyOnRead`) to catch corrupted or tampered archives before they reach the engine
+- **Page-aligned data** (v7 format) -- file data aligned to configurable boundaries (16 B, 4 KB, 64 KB) for efficient page faults and GPU upload
+- **Per-entry content integrity hashing** -- XXH64 checksum of each entry's on-disk bytes, with opt-in deep verification (`ValidatePak(deepVerify)`, `PakReader::VerifyEntry()`, `PakOpenOptions::verifyOnRead`) to catch corrupted or tampered archives before they reach the engine
 - **Layered archives** (`PakMount`) -- mount a base archive plus patch/DLC/language archives with override semantics, resolved through one composed namespace
 - **Loose-file hot-reload override** (`PakLooseOverlay`) -- dev-only wrapper that serves an edited-on-disk asset over the archive's copy, for iteration without repacking
 - **Thread-safe PakReader** -- `shared_mutex` allows concurrent reads from multiple threads; ideal for asset streaming on worker threads
@@ -202,7 +202,7 @@ this). Loose files are read raw -- no compression or encryption.
 
 ### Integrity verification
 
-Every entry stores an FNV-1a-64 hash of its on-disk (post-compression,
+Every entry stores an XXH64 hash of its on-disk (post-compression,
 post-encryption) bytes, computed at build time. Verification is opt-in and
 off the default hot path:
 
@@ -276,6 +276,39 @@ Note: encrypted files cannot use zero-copy reads since decryption requires a mut
 
 For textures stored in GPU-ready formats (DDS, KTX2, Basis), use `View(handle, PakView&)` with `alignment = 4096` or `65536`. The returned pointer is page-aligned and can be passed directly to graphics API upload functions without an intermediate copy.
 
+### Hash-keyed lookups
+
+Every entry stores an XXH64 hash of its normalized path, and `PakPathHash()`
+computes the same value for a string. Bake those hashes into your asset
+references at build time and the runtime never has to touch a path string:
+
+```cpp
+// Build time: emit a header/blob of asset ids.
+uint64_t kPlayerDiffuse = PakPathHash("textures/player/diffuse.dds");
+
+// Runtime: no hashing, no string compare, no allocation.
+PakFileHandle handle = reader.FindByHash(kPlayerDiffuse);
+```
+
+`FindByHash()` skips both the path hashing and the name confirmation that
+`Find()` performs, which is most of `Find()`'s cost. The trade is that a
+64-bit hash collision resolves to the wrong entry instead of failing --
+around a 3e-8 chance across a million assets. `Open()` rejects any archive
+whose entries do not all have distinct path hashes, so a collision cannot be
+introduced silently at build time.
+
+Once every lookup goes through hashes, the name blob is dead weight in a
+shipping build. `PakOpenOptions::loadNames = false` leaves it on disk:
+
+```cpp
+PakOpenOptions options;
+options.loadNames = false;  // ~50 bytes/entry saved, much faster Open()
+reader.Open("assets.pak", options);
+```
+
+Keep names loaded for tools, editors, and anything that reports an asset path
+to a human.
+
 ### Asset streaming pattern
 
 ```cpp
@@ -294,7 +327,7 @@ void AssetStreamWorker(PakReader& reader, AssetQueue& queue) {
 
 | Method | Description |
 |--------|-------------|
-| `CreatePak(filename, files, PakOptions)` | Create v6 PAK with alignment and compression control |
+| `CreatePak(filename, files, PakOptions)` | Create v7 PAK with alignment and compression control |
 | `CreatePakFromFolder(filename, folder, PakOptions)` | Create PAK from directory with options |
 | `ExtractPak(filename, outputDir)` | Extract all files to a directory |
 | `ListPak(filename)` | Log all file entries via the log callback |
@@ -313,7 +346,8 @@ void AssetStreamWorker(PakReader& reader, AssetQueue& queue) {
 | `Close()` | Unmap file, close handle, free cached data |
 | `IsOpen()` | Check if a PAK is currently open |
 | `IsMapped()` | Check if memory-mapped I/O is active |
-| `Find(name)` | O(1) lookup, returns `PakFileHandle` |
+| `Find(name)` | O(1) lookup, returns `PakFileHandle`; confirms the match against the stored name |
+| `FindByHash(pathHash)` | O(1) lookup by a precomputed `PakPathHash()`; skips path hashing and name comparison entirely |
 | `Resolve(names, handles)` | Batch lookup for engine asset registration |
 | `Info(handle)` | Returns cached metadata for a handle |
 | `InfoByIndex(index)` | Returns cached metadata for the entry at a dense `[0, GetFileCount())` index; used by enumeration/composition layers such as `PakMount` |
@@ -387,6 +421,7 @@ read from disk has no mapping to back that contract.
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `verifyOnRead` | `bool` | `false` | Re-hash on-disk bytes on every `Read()`/`Load()` and fail closed with `PakStatus::HashMismatch` on a mismatch. Costs real throughput (forces a full read+hash pass even on the mmap path); prefer `VerifyEntry()` for off-hot-path verification |
+| `loadNames` | `bool` | `true` | Read the archive's name blob into memory. Turning it off saves roughly 50 bytes per entry and makes `Open()` markedly faster, at the cost of `PakFileInfo::filename`, `ListFiles()`, and name-based collision confirmation |
 
 ### PakCacheOptions
 
@@ -411,36 +446,48 @@ the current archive bytes.
 
 ## PAK Format
 
-### Header (36 bytes)
+### Header (56 bytes)
 
 | Field | Type | Description |
 |-------|------|-------------|
 | magic | char[4] | `"PAK0"` |
-| version | uint32_t | 6 |
+| version | uint32_t | 7 |
 | numFiles | uint32_t | Number of files |
-| fileTableOffset | uint64_t | Byte offset to file table |
 | alignment | uint32_t | Data alignment in bytes |
-| reserved | uint32_t[3] | Reserved for future use |
+| fileTableOffset | uint64_t | Byte offset to the entry-record array |
+| nameBlobOffset | uint64_t | Byte offset to the packed name bytes |
+| nameBlobSize | uint64_t | Size of the name blob |
+| reserved | uint64_t[2] | Reserved for future use |
 
-### File table entry (v6)
+### File table entry (v7) -- fixed 48 bytes
 
 | Field | Type | Description |
 |-------|------|-------------|
-| nameLength | uint16_t | Filename length |
-| filename | char[] | UTF-8 filename |
 | offset | uint64_t | Byte offset to file data |
 | originalSize | uint64_t | Uncompressed size |
 | compressedSize | uint64_t | Size on disk |
+| contentHash | uint64_t | XXH64 of the on-disk (compressed+encrypted) bytes |
+| pathHash | uint64_t | XXH64 of the normalized name -- see `PakPathHash()` |
+| nameOffset | uint32_t | Byte offset of the name within the name blob |
+| nameLength | uint16_t | Name length in bytes |
 | flags | uint8_t | Bit 0: LZ4 compressed. Bit 1: Zstd compressed (mutually exclusive with bit 0) |
-| contentHash | uint64_t | FNV-1a-64 hash of the on-disk (compressed+encrypted) bytes |
+| reserved | uint8_t | Reserved |
 
-File data offsets are padded to the alignment boundary specified in the header. This ensures page-aligned access when memory-mapped.
+Entry records are fixed-size and all names live together in one contiguous
+blob after the record array. That is what lets `PakReader::Open()` load the
+whole file table in two bulk reads and use the record array directly as its
+runtime representation, instead of parsing entry by entry and allocating a
+string per file. Because the path hash is stored, opening does no string
+hashing at all, and layered mounts can merge namespaces without re-hashing.
 
-Archives are v6-only: `PakReader::Open()` and `Pakker::ValidatePak()` reject
-any other version, including the prior v5 format (no Zstd flag bit) and v4
-(no `contentHash` field). There is no in-place upgrade tool -- rebuild older
-archives with `CreatePak()`/`CreatePakFromFolder()` under the current library
-version.
+File data offsets are padded to the alignment boundary specified in the
+header. This ensures page-aligned access when memory-mapped.
+
+Archives are v7-only: `PakReader::Open()` and `Pakker::ValidatePak()` reject
+any other version, including v6 (variable-length file table), v5 (no Zstd flag
+bit) and v4 (no `contentHash` field). There is no in-place upgrade tool --
+rebuild older archives with `CreatePak()`/`CreatePakFromFolder()` under the
+current library version.
 
 ## Thread Safety
 

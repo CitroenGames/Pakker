@@ -53,9 +53,8 @@ static PakInternal::PakEntry ReadSingleEntry(const fs::path& pakPath)
     PakInternal::PakHeader header;
     assert(PakInternal::ReadPakHeader(stream, header));
     assert(header.numFiles == 1);
-    stream.seekg(header.fileTableOffset, std::ios::beg);
     std::vector<PakInternal::PakEntry> entries;
-    assert(PakInternal::ReadFileTable(stream, header.numFiles, entries));
+    assert(PakInternal::ReadFileTable(stream, header, entries));
     assert(entries.size() == 1);
     return entries[0];
 }
@@ -67,9 +66,8 @@ static PakInternal::PakEntry ReadEntryByName(const fs::path& pakPath, const std:
     assert(stream);
     PakInternal::PakHeader header;
     assert(PakInternal::ReadPakHeader(stream, header));
-    stream.seekg(header.fileTableOffset, std::ios::beg);
     std::vector<PakInternal::PakEntry> entries;
-    assert(PakInternal::ReadFileTable(stream, header.numFiles, entries));
+    assert(PakInternal::ReadFileTable(stream, header, entries));
     for (auto& e : entries) {
         if (e.filename == name) return e;
     }
@@ -116,7 +114,7 @@ static void RuntimeHandleApi()
         std::ifstream stream(pakPath, std::ios::binary);
         PakInternal::PakHeader header;
         assert(PakInternal::ReadPakHeader(stream, header));
-        assert(header.version == PakInternal::PAK_VERSION_6);
+        assert(header.version == PakInternal::PAK_VERSION_7);
     }
 
     PakReader reader;
@@ -239,11 +237,12 @@ static void OldVersionRejected()
     PakOptions options;
     assert(pakker.CreatePak(pakPath.string(), files, options));
 
-    // PAK_VERSION_4 (no contentHash field) and PAK_VERSION_5 (no Zstd flag
-    // bit) are both immediately-prior formats -- confirm both are cleanly
-    // rejected now that v6 is the only accepted version, same "rebuild from
-    // source" remediation for either.
-    for (uint32_t oldVersion : {PakInternal::PAK_VERSION_4, PakInternal::PAK_VERSION_5}) {
+    // v4 (no contentHash field), v5 (no Zstd flag bit) and v6
+    // (variable-length file table) are all prior formats -- confirm each is
+    // cleanly rejected now that v7 is the only accepted version, with the
+    // same "rebuild from source" remediation for any of them.
+    for (uint32_t oldVersion : {PakInternal::PAK_VERSION_4, PakInternal::PAK_VERSION_5,
+                                PakInternal::PAK_VERSION_6}) {
         std::fstream stream(pakPath, std::ios::in | std::ios::out | std::ios::binary);
         assert(stream);
         stream.seekp(4, std::ios::beg);
@@ -274,12 +273,10 @@ static void CorruptArchiveFailsOpen()
 
     PakInternal::PakHeader header;
     assert(PakInternal::ReadPakHeader(stream, header));
-    stream.seekp(header.fileTableOffset, std::ios::beg);
 
-    uint16_t nameLength = 0;
-    stream.read(reinterpret_cast<char*>(&nameLength), sizeof(nameLength));
-    stream.seekp(nameLength, std::ios::cur);
-
+    // v7 records are fixed-size and lead with the data offset, so the first
+    // eight bytes of the file table are the first entry's offset.
+    stream.seekp(static_cast<std::streamoff>(header.fileTableOffset), std::ios::beg);
     uint64_t badOffset = UINT64_MAX - 8;
     stream.write(reinterpret_cast<const char*>(&badOffset), sizeof(badOffset));
     stream.close();
@@ -540,20 +537,19 @@ static void ContentHashStoredAndRoundTrips()
     std::ifstream stream(pakPath, std::ios::binary);
     PakInternal::PakHeader header;
     assert(PakInternal::ReadPakHeader(stream, header));
-    stream.seekg(header.fileTableOffset, std::ios::beg);
     std::vector<PakInternal::PakEntry> entries;
-    assert(PakInternal::ReadFileTable(stream, header.numFiles, entries));
+    assert(PakInternal::ReadFileTable(stream, header, entries));
     assert(entries.size() == 2);
 
     for (const auto& entry : entries) {
         if (entry.filename == "plain.bin") {
             const auto& expected = files["plain.bin"];
-            uint64_t expectedHash = PakInternal::HashBuffer(expected.data(), expected.size());
+            uint64_t expectedHash = PakInternal::HashBytesFast(expected.data(), expected.size());
             assert(entry.contentHash == expectedHash);
             assert(entry.contentHash != 0);
         } else {
             assert(entry.filename == "empty.bin");
-            assert(entry.contentHash == PakInternal::FNV_OFFSET_BASIS);
+            assert(entry.contentHash == PakInternal::HashBytesFast(nullptr, 0));
         }
     }
 }
@@ -1431,6 +1427,173 @@ static void LooseOverlayRejectsPathTraversal()
     assert(overlay.Load("../secret.bin", loaded) == PakStatus::NotFound);
 }
 
+// ---------------------------------------------------------------------------
+// v7: hash-keyed lookup and optional name residency
+// ---------------------------------------------------------------------------
+
+static void FindByHashMatchesFindByName()
+{
+    fs::path root = TestRoot();
+    fs::path pakPath = root / "hash_lookup.pak";
+
+    std::map<std::string, std::vector<uint8_t>> files;
+    files["textures/albedo.dds"] = Bytes("albedo");
+    files["meshes/lod0.bin"] = Bytes("mesh");
+    files["audio/gunshot.wav"] = Bytes("bang");
+
+    Pakker pakker;
+    PakOptions options;
+    assert(pakker.CreatePak(pakPath.string(), files, options));
+
+    PakReader reader;
+    reader.SetCacheOptions(TestCacheOptions(root));
+    assert(reader.Open(pakPath.string()));
+
+    for (const auto& [name, data] : files) {
+        PakFileHandle byName = reader.Find(name);
+        PakFileHandle byHash = reader.FindByHash(PakPathHash(name));
+        assert(byName);
+        assert(byHash);
+        assert(byName == byHash);
+
+        const PakFileInfo* info = reader.Info(byHash);
+        assert(info);
+        assert(info->pathHash == PakPathHash(name));
+    }
+
+    // A path that isn't present must not resolve to anything.
+    assert(!reader.FindByHash(PakPathHash("nope/missing.bin")));
+}
+
+static void FindNormalizesBeforeHashing()
+{
+    fs::path root = TestRoot();
+    fs::path pakPath = root / "hash_normalize.pak";
+
+    std::map<std::string, std::vector<uint8_t>> files;
+    files["ui/fonts/body.ttf"] = Bytes("font");
+
+    Pakker pakker;
+    PakOptions options;
+    assert(pakker.CreatePak(pakPath.string(), files, options));
+
+    PakReader reader;
+    reader.SetCacheOptions(TestCacheOptions(root));
+    assert(reader.Open(pakPath.string()));
+
+    // Backslashes and a leading slash must normalize to the stored form
+    // before hashing, or they would hash to unrelated values.
+    PakFileHandle direct = reader.Find("ui/fonts/body.ttf");
+    assert(direct);
+    assert(reader.Find("ui\\fonts\\body.ttf") == direct);
+    assert(reader.Find("/ui/fonts/body.ttf") == direct);
+}
+
+static void OpenWithoutNamesStillReadsByHash()
+{
+    fs::path root = TestRoot();
+    fs::path pakPath = root / "no_names.pak";
+
+    std::map<std::string, std::vector<uint8_t>> files;
+    files["plain.bin"] = std::vector<uint8_t>(4096, 7);
+    files["compressed.bin"] = std::vector<uint8_t>(8192, 3);
+
+    Pakker pakker;
+    PakOptions options;
+    options.compression = PakCompression::LZ4;
+    assert(pakker.CreatePak(pakPath.string(), files, options));
+
+    PakReader reader;
+    reader.SetCacheOptions(TestCacheOptions(root));
+    PakOpenOptions openOptions;
+    openOptions.loadNames = false;
+    assert(reader.Open(pakPath.string(), openOptions));
+    assert(reader.GetFileCount() == 2);
+
+    for (const auto& [name, expected] : files) {
+        PakFileHandle handle = reader.FindByHash(PakPathHash(name));
+        assert(handle);
+
+        const PakFileInfo* info = reader.Info(handle);
+        assert(info);
+        // The name blob was never read, so no name is available...
+        assert(info->filename.empty());
+        // ...but everything needed to actually serve the read still is.
+        assert(info->originalSize == expected.size());
+        assert(info->pathHash == PakPathHash(name));
+
+        std::vector<uint8_t> data;
+        assert(reader.Load(handle, data) == PakStatus::Ok);
+        assert(data == expected);
+
+        // Integrity verification does not depend on names either.
+        assert(reader.VerifyEntry(handle) == PakStatus::Ok);
+    }
+
+    // Find() by name still resolves, because it hashes the path it is given.
+    assert(reader.Find("plain.bin"));
+
+    // Enumeration has nothing to report rather than a run of empty strings.
+    assert(reader.ListFiles().empty());
+    assert(reader.ListFilesWithPrefix("").empty());
+}
+
+static void MountComposesLayersOpenedWithoutNames()
+{
+    fs::path root = TestRoot();
+    fs::path basePak = root / "no_names_base.pak";
+    fs::path patchPak = root / "no_names_patch.pak";
+
+    std::map<std::string, std::vector<uint8_t>> baseFiles;
+    baseFiles["base_only.bin"] = std::vector<uint8_t>(512, 1);
+    baseFiles["shared.bin"] = std::vector<uint8_t>(512, 2);
+
+    std::map<std::string, std::vector<uint8_t>> patchFiles;
+    patchFiles["shared.bin"] = std::vector<uint8_t>(512, 3);
+
+    Pakker pakker;
+    PakOptions options;
+    assert(pakker.CreatePak(basePak.string(), baseFiles, options));
+    assert(pakker.CreatePak(patchPak.string(), patchFiles, options));
+
+    // The merged index is keyed on stored path hashes, so layers still
+    // compose (and still override) with no names resident anywhere.
+    PakOpenOptions openOptions;
+    openOptions.loadNames = false;
+
+    PakMount mount;
+    for (const auto& path : {basePak, patchPak}) {
+        auto reader = std::make_shared<PakReader>();
+        assert(reader->Open(path.string(), openOptions));
+        assert(mount.MountReader(reader));
+    }
+
+    assert(mount.GetFileCount() == 2);
+
+    PakMountHandle shared = mount.Find("shared.bin");
+    assert(shared);
+    std::vector<uint8_t> data;
+    assert(mount.Load(shared, data) == PakStatus::Ok);
+    assert(data == patchFiles["shared.bin"]);
+
+    PakMountHandle baseOnly = mount.Find("base_only.bin");
+    assert(baseOnly);
+    assert(mount.Load(baseOnly, data) == PakStatus::Ok);
+    assert(data == baseFiles["base_only.bin"]);
+}
+
+static void PathHashIsStableAndCaseSensitive()
+{
+    // The hash is part of the on-disk format, so drift would silently
+    // invalidate every shipped archive. Pin a couple of known relationships
+    // rather than the literal values, which vary with the xxHash build.
+    assert(PakPathHash("a/b.bin") == PakPathHash("a/b.bin"));
+    assert(PakPathHash("a/b.bin") != PakPathHash("a/B.bin"));
+    assert(PakPathHash("a/b.bin") != PakPathHash("a/b.bin "));
+    assert(PakPathHash("") == PakPathHash(""));
+}
+
+
 int main()
 {
     RuntimeHandleApi();
@@ -1473,5 +1636,10 @@ int main()
     LooseOverlayFallsBackToWrappedReader();
     LooseOverlayFileExistsChecksBoth();
     LooseOverlayRejectsPathTraversal();
+    FindByHashMatchesFindByName();
+    FindNormalizesBeforeHashing();
+    OpenWithoutNamesStillReadsByHash();
+    MountComposesLayersOpenedWithoutNames();
+    PathHashIsStableAndCaseSensitive();
     return 0;
 }

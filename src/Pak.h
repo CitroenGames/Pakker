@@ -37,38 +37,83 @@ void PakSetLogCallback(PakLogCallback cb);
 namespace PakInternal {
 
 static constexpr size_t MAX_FILENAME_LENGTH = 65535;
-static constexpr size_t MAX_FILES_IN_PAK    = 1000000;
+// A single shipping archive can hold a whole game's worth of assets, so this
+// ceiling exists to reject absurd headers rather than to express a design
+// limit. Handles are uint32, and the name blob is separately bounded below.
+static constexpr size_t MAX_FILES_IN_PAK    = 8000000;
+static constexpr uint64_t MAX_NAME_BLOB_SIZE = 1ull << 30; // 1 GiB
 static constexpr std::string_view PAK_MAGIC = "PAK0";
 static constexpr uint32_t PAK_VERSION_4     = 4; // rejected legacy format, no contentHash field
 static constexpr uint32_t PAK_VERSION_5     = 5; // rejected legacy format, no Zstd flag bit
-static constexpr uint32_t PAK_VERSION_6     = 6; // v6-only format: entries may be LZ4- or Zstd-compressed
+static constexpr uint32_t PAK_VERSION_6     = 6; // rejected legacy format, variable-length file table
+static constexpr uint32_t PAK_VERSION_7     = 7; // v7-only format: fixed-size records + name blob
 
 #pragma pack(push, 1)
 struct PakHeader {
     char magic[4] = { 'P', 'A', 'K', '0' };
-    uint32_t version   = PAK_VERSION_6;
+    uint32_t version   = PAK_VERSION_7;
     uint32_t numFiles  = 0;
-    uint64_t fileTableOffset = 0;
     uint32_t alignment = 0;         // data alignment in bytes (power of 2)
-    uint32_t reserved[3] = {0, 0, 0};
+    uint64_t fileTableOffset = 0;   // start of the fixed-size entry records
+    uint64_t nameBlobOffset  = 0;   // start of the packed name bytes
+    uint64_t nameBlobSize    = 0;
+    uint64_t reserved[2] = {0, 0};
 };
 #pragma pack(pop)
-static_assert(sizeof(PakHeader) == 36, "PakHeader must be 36 bytes with no padding");
+static_assert(sizeof(PakHeader) == 56, "PakHeader must be 56 bytes with no padding");
 
+// One file-table entry exactly as it appears on disk.
+//
+// Fixed size is the whole point. v6 stored a length-prefixed name inline with
+// each entry, so opening an archive meant parsing entries one at a time and
+// heap-allocating a std::string per file. A fixed-size record lets the entire
+// table be read in one bulk I/O and consumed as a flat array, and lets the
+// names travel together in a single contiguous blob.
+#pragma pack(push, 1)
+struct PakEntryRecord {
+    uint64_t offset         = 0;
+    uint64_t originalSize   = 0;
+    uint64_t compressedSize = 0; // == originalSize when uncompressed
+    uint64_t contentHash    = 0; // XXH64 of the on-disk (compressed+encrypted) bytes
+    uint64_t pathHash       = 0; // XXH64 of the normalized name
+    uint32_t nameOffset     = 0; // byte offset into the name blob
+    uint16_t nameLength     = 0;
+    uint8_t  flags          = 0; // bit 0: LZ4 compressed, bit 1: Zstd compressed
+    uint8_t  reserved       = 0;
+};
+#pragma pack(pop)
+static_assert(sizeof(PakEntryRecord) == 48, "PakEntryRecord must be 48 bytes with no padding");
+
+// Build-time entry. Carries the name by value because the writer assembles
+// entries before it knows the final blob layout; the reader never uses this.
 struct PakEntry {
     std::string filename;
     uint64_t offset       = 0;
     uint64_t originalSize = 0;
     uint64_t compressedSize = 0; // == originalSize when uncompressed
     uint8_t  flags        = 0;   // bit 0: LZ4 compressed, bit 1: Zstd compressed (mutually exclusive)
-    uint64_t contentHash   = 0;  // FNV-1a-64 of the on-disk (compressed+encrypted) bytes
+    uint64_t contentHash   = 0;  // XXH64 of the on-disk (compressed+encrypted) bytes
+    uint64_t pathHash      = 0;  // XXH64 of the normalized name
 
     PakEntry() = default;
     PakEntry(std::string name, uint64_t off, uint64_t origSz,
-             uint64_t compSz = 0, uint8_t f = 0, uint64_t hash = 0)
+             uint64_t compSz = 0, uint8_t f = 0, uint64_t hash = 0, uint64_t pHash = 0)
         : filename(std::move(name)), offset(off), originalSize(origSz),
-          compressedSize(compSz == 0 ? origSz : compSz), flags(f), contentHash(hash) {}
+          compressedSize(compSz == 0 ? origSz : compSz), flags(f), contentHash(hash),
+          pathHash(pHash) {}
 };
+
+// One slot of the reader's open-addressing name index, built at Open().
+//
+// Only a 32-bit tag of the path hash lives here; a tag match is confirmed
+// against the full 64-bit pathHash in the entry record. That keeps the table
+// at 8 bytes per slot instead of 16, which halves both its footprint and the
+// number of cache lines a probe has to touch.
+struct LookupSlot {
+    uint32_t hashTag    = 0;
+    uint32_t entryIndex = 0xFFFFFFFFu; // 0xFFFFFFFF == empty
+};
+static_assert(sizeof(LookupSlot) == 8, "LookupSlot must stay 8 bytes");
 
 static constexpr uint8_t PAK_FLAG_LZ4_COMPRESSED  = 0x01;
 static constexpr uint8_t PAK_FLAG_ZSTD_COMPRESSED = 0x02;
@@ -87,10 +132,20 @@ uint64_t SafeStreamPos(std::ios& stream, std::streampos pos);
 bool ValidateEntry(const PakEntry& entry, uint64_t pakFileSize);
 
 bool ReadPakHeader(std::istream& stream, PakHeader& header);
-bool ReadFileTable(std::istream& stream, uint32_t numFiles,
-                   std::vector<PakEntry>& entries);
 bool WritePakHeader(std::ostream& stream, const PakHeader& header);
-bool WriteFileTable(std::ostream& stream, const std::vector<PakEntry>& entries);
+
+// Reads the v7 file table (records followed by the name blob) and expands it
+// into name-carrying PakEntry values. Convenience for build-time and tooling
+// paths; PakReader::Open deliberately does not use this, because materializing
+// a std::string per entry is exactly the cost it exists to avoid.
+bool ReadFileTable(std::istream& stream, const PakHeader& header,
+                   std::vector<PakEntry>& entries);
+
+// Writes the record array followed by the name blob, filling in
+// header.nameBlobOffset/nameBlobSize. `tableOffset` is where the records
+// begin, so the name offsets can be computed before anything is written.
+bool WriteFileTable(std::ostream& stream, const std::vector<PakEntry>& entries,
+                    PakHeader& header);
 
 void EncryptDecrypt(std::vector<uint8_t>& data, const std::string& key);
 
@@ -103,6 +158,71 @@ struct MappedFileGuard {
     MappedFileGuard() = default;
     MappedFileGuard(const MappedFileGuard&) = delete;
     MappedFileGuard& operator=(const MappedFileGuard&) = delete;
+};
+
+// Stable per-thread index used to shard hot counters and cache buckets so
+// independent threads touch independent cache lines. Indices are handed out
+// on first use and never reused; callers must take it modulo their shard
+// count.
+size_t ThreadShardIndex() noexcept;
+
+// XXH64 over an arbitrary buffer. Roughly an order of magnitude faster than
+// the byte-at-a-time FNV-1a used for structural fingerprints, which matters
+// wherever whole archives get hashed.
+uint64_t HashBytesFast(const void* data, size_t size) noexcept;
+
+// A counter incremented on the hot read path from many threads at once.
+//
+// A single std::atomic<uint64_t> looks cheap, but fetch_add is a
+// read-modify-write: it must acquire the cache line exclusively, so N
+// threads incrementing one counter serialize on one line. Spreading the
+// increments across per-thread, cache-line-aligned slots keeps them
+// core-local. The trade is that the value is only correct when summed, which
+// is fine for a diagnostic read out by GetCacheStats().
+class ShardedCounter {
+public:
+    static constexpr size_t Shards = 64;
+
+    void Increment() noexcept
+    {
+        shards_[ThreadShardIndex() % Shards].value.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    uint64_t Load() const noexcept
+    {
+        uint64_t total = 0;
+        for (const auto& shard : shards_) {
+            total += shard.value.load(std::memory_order_relaxed);
+        }
+        return total;
+    }
+
+    void Reset() noexcept
+    {
+        for (auto& shard : shards_) shard.value.store(0, std::memory_order_relaxed);
+    }
+
+    // Collapses an existing total into shard 0. Used when moving a reader.
+    void Store(uint64_t value) noexcept
+    {
+        Reset();
+        shards_[0].value.store(value, std::memory_order_relaxed);
+    }
+
+private:
+    // Padding to a cache line is the entire point, so MSVC's "structure was
+    // padded due to alignment specifier" diagnostic is noise here.
+#ifdef _MSC_VER
+#pragma warning(push)
+#pragma warning(disable : 4324)
+#endif
+    struct alignas(64) Shard {
+        std::atomic<uint64_t> value{0};
+    };
+#ifdef _MSC_VER
+#pragma warning(pop)
+#endif
+    Shard shards_[Shards];
 };
 
 struct TransparentStringHash {
@@ -149,6 +269,15 @@ enum class PakStatus {
 
 const char* PakStatusToString(PakStatus status);
 
+// Stable 64-bit hash of an asset path (XXH64). Lets an engine carry
+// precomputed asset IDs instead of path strings, and is what the layered
+// mount index is keyed on.
+//
+// The input must already be normalized -- forward slashes, no leading slash
+// -- exactly as stored in the archive. Hashing is byte-exact and therefore
+// case-sensitive, matching lookup behaviour elsewhere in the library.
+uint64_t PakPathHash(std::string_view path) noexcept;
+
 struct PakFileHandle {
     static constexpr uint32_t InvalidIndex = UINT32_MAX;
 
@@ -159,11 +288,20 @@ struct PakFileHandle {
     friend bool operator!=(PakFileHandle a, PakFileHandle b) { return !(a == b); }
 };
 
+// The reader's runtime entry, and what Info() hands back.
+//
+// One array of these is the whole file table at runtime: there is no second
+// parallel array of "real" entries behind it. filename points into the
+// reader's contiguous name blob and is empty when the archive was opened with
+// PakOpenOptions::loadNames disabled.
 struct PakFileInfo {
     std::string_view filename;
     uint64_t originalSize = 0;
     uint64_t compressedSize = 0;
     uint64_t offset = 0;
+    uint64_t pathHash = 0;     // XXH64 of the normalized name; see PakPathHash
+    uint64_t contentHash = 0;  // XXH64 of the on-disk bytes
+    uint8_t  flags = 0;
     bool compressed = false;
 };
 
@@ -211,6 +349,18 @@ struct PakOpenOptions {
     // View() is never verified, even when this is enabled -- see View()'s doc
     // comment below.
     bool verifyOnRead = false;
+
+    // When false, the archive's name blob is not read into memory. Lookups
+    // still work -- Find() hashes the path and matches on the 64-bit path
+    // hash -- but the name is no longer available to confirm the match, so a
+    // hash collision would resolve to the wrong entry instead of failing, and
+    // PakFileInfo::filename, ListFiles(), and GetFileInfo() report nothing.
+    //
+    // Worth it only where the saving is real: names run around 50 bytes per
+    // entry, so a shipping build that resolves everything through precomputed
+    // IDs can drop tens of megabytes across a full mount. Leave it on for
+    // tools, editors, and anything that reports asset paths to a human.
+    bool loadNames = true;
 };
 
 // ---------------------------------------------------------------------------
@@ -410,6 +560,16 @@ public:
 
     // Engine runtime API: resolve once, cache handles, and avoid per-read path work.
     PakFileHandle Find(std::string_view filename) const;
+
+    // Lookup by precomputed PakPathHash(), skipping path hashing entirely.
+    // The intended shipping pattern: bake asset IDs at build time, carry
+    // those, and never touch a path string at runtime.
+    //
+    // Unlike Find(), this cannot confirm the match against the stored name,
+    // so a 64-bit hash collision resolves to the wrong entry rather than
+    // failing. With ~10^6 assets that probability is about 3e-8.
+    PakFileHandle FindByHash(uint64_t pathHash) const;
+
     size_t Resolve(std::span<const std::string_view> filenames,
                    std::span<PakFileHandle> handles) const;
     const PakFileInfo* Info(PakFileHandle handle) const;
@@ -418,6 +578,17 @@ public:
     // layers (e.g. a multi-archive VFS) that need to iterate all entries.
     // Returns nullptr if index is out of range or the reader is not open.
     const PakFileInfo* InfoByIndex(uint32_t index) const;
+
+    // Returns a zero-copy pointer into the mapping. The returned PakView is
+    // documented to stay valid after Close(), so it takes a reference count on
+    // the mapping -- the one atomic read-modify-write left anywhere on the
+    // read path, and therefore the one call here that does not scale linearly
+    // with thread count when hammered in a tight loop.
+    //
+    // That is the intended shape of the API rather than a limitation to work
+    // around: a view is meant to be taken once when an asset loads and then
+    // held for that asset's lifetime, not re-taken per access. Read(), which
+    // is what per-frame streaming actually calls, takes no reference count.
     PakStatus View(PakFileHandle handle, PakView& outView) const;
     PakStatus Read(PakFileHandle handle, std::span<uint8_t> destination,
                    uint64_t* bytesWritten = nullptr) const;
@@ -517,48 +688,96 @@ private:
         CacheLru::iterator lruPosition;
     };
 
+    // The whole file table, in three allocations regardless of entry count.
+    //
+    // v6 held a std::string per entry inside PakEntry, a second copy inside a
+    // node-based unordered_map, plus a separate infos array -- roughly four
+    // allocations and ~218 resident bytes per file, and an Open() that
+    // touched every one of them. Here the records arrive as one bulk read,
+    // the names as a second, and the lookup table is built in place over
+    // hashes the archive already stores.
     struct RuntimeTable {
-        std::vector<PakInternal::PakEntry> entries;
         std::vector<PakFileInfo> infos;
-        std::unordered_map<std::string, uint32_t,
-            PakInternal::TransparentStringHash,
-            PakInternal::TransparentStringEqual> indexByName;
+        std::vector<char> nameBlob;            // empty when names are not resident
+        std::vector<PakInternal::LookupSlot> lookup;
+        uint64_t lookupMask = 0;
+        bool namesLoaded = false;
         // Kept in the immutable snapshot so in-flight prefetches do not need
         // to copy the archive path on every handle operation.
         std::string pakFilename;
     };
 
-    struct ReadContext {
-        std::shared_ptr<const RuntimeTable> table;
+    // Immutable read-path state, published as a unit by Open() and retired
+    // by Close(). Everything a read needs lives here, so the whole hot path
+    // reaches it through a single acquire load of snapshot_ -- no lock, and
+    // no reference-count traffic.
+    //
+    // That distinction is the entire point. A shared_lock acquire/release
+    // pair and a shared_ptr copy/destroy pair are atomic read-modify-writes,
+    // and an atomic RMW must take the cache line exclusively, so every
+    // concurrent reader invalidates every other reader's copy of that line.
+    // Under a streaming workload fanned across worker threads that turns into
+    // pure cache-line ping-pong and aggregate throughput *falls* as threads
+    // are added. A plain acquire load never writes, so the line stays Shared
+    // in every core and reads scale.
+    //
+    // Lifetime: snapshotOwner_ owns the snapshot; Close() unpublishes it and
+    // then frees it. Callers must not run Close() concurrently with reads --
+    // already required by this class's documented threading contract. Values
+    // already handed out stay valid regardless, because PakView and PakSpan
+    // hold their own shared_ptr to the mapping guard.
+    struct ReadSnapshot {
+        RuntimeTable table;
         std::shared_ptr<PakInternal::MappedFileGuard> guard;
+        const PakInternal::MappedFileGuard* guardPtr = nullptr;
         bool useMmap = false;
         bool verifyOnRead = false;
         uint64_t fileSize = 0;
         uint64_t archiveFingerprint = 0;
     };
 
+    // nullptr when the reader is closed.
+    const ReadSnapshot* AcquireSnapshot() const noexcept
+    {
+        return snapshot_.load(std::memory_order_acquire);
+    }
+
     static bool NeedsPathNormalization(std::string_view path);
     static std::string NormalizePath(std::string_view path);
     static PakFileHandle FindInTable(const RuntimeTable& table, std::string_view filename);
+    // Probes the lookup table by path hash. When `verifyName` is non-empty and
+    // names are resident, the candidate's name must match it exactly.
+    static PakFileHandle FindByHashInTable(const RuntimeTable& table, uint64_t pathHash,
+                                           std::string_view verifyName);
+    // Returns false if two entries share a path hash, which makes the archive
+    // unusable as written.
+    static bool BuildLookupTable(RuntimeTable& table);
 
-    PakStatus CaptureReadContext(PakFileHandle handle, ReadContext& context) const;
-    PakStatus ValidateReadRequest(const PakInternal::PakEntry& entry,
-        uint64_t destinationSize, const ReadContext& context) const;
-    PakStatus ReadEntryToBuffer(const PakInternal::PakEntry& entry,
-        std::span<uint8_t> destination, uint64_t* bytesWritten,
-        const ReadContext& context) const;
-    PakStatus ReadEntryWithCache(PakFileHandle handle, const PakInternal::PakEntry& entry,
-        std::span<uint8_t> destination, uint64_t* bytesWritten,
-        const ReadContext& context) const;
+    // Tears down all open state. Caller must hold mutex_ exclusively. Takes
+    // and releases cacheMutex_ internally, so callers must not already hold it.
+    void CloseLocked();
 
-    bool ShouldCacheDecoded(const PakInternal::PakEntry& entry,
-        const ReadContext& context, const PakCacheOptions& options) const;
+    // Resolves a handle against the published snapshot. Returns nullptr and
+    // sets outStatus when the reader is closed or the handle is out of range.
+    const ReadSnapshot* ResolveHandle(PakFileHandle handle, PakStatus& outStatus) const noexcept;
+
+    PakStatus ValidateReadRequest(const PakFileInfo& entry,
+        uint64_t destinationSize, const ReadSnapshot& snapshot) const;
+    PakStatus ReadEntryToBuffer(const PakFileInfo& entry,
+        std::span<uint8_t> destination, uint64_t* bytesWritten,
+        const ReadSnapshot& snapshot) const;
+    PakStatus ReadEntryWithCache(PakFileHandle handle, const PakFileInfo& entry,
+        std::span<uint8_t> destination, uint64_t* bytesWritten,
+        const ReadSnapshot& snapshot) const;
+
+    bool ShouldCacheDecoded(const PakFileInfo& entry,
+        const ReadSnapshot& snapshot, const PakCacheOptions& options) const;
     static CacheKey MakeMemoryCacheKey(PakFileHandle handle,
-        const ReadContext& context) noexcept;
+        const ReadSnapshot& snapshot) noexcept;
     CacheKey MakePersistentCacheKey(PakFileHandle handle,
-        const PakInternal::PakEntry& entry, const ReadContext& context) const;
-    PakStatus HashEntrySourceBytes(const PakInternal::PakEntry& entry,
-        const ReadContext& context, uint64_t& outHash) const;
+        const PakFileInfo& entry, const ReadSnapshot& snapshot) const;
+    PakStatus HashEntrySourceBytes(const PakFileInfo& entry,
+        const ReadSnapshot& snapshot, uint64_t& outHash) const;
     bool TryGetMemoryCache(CacheKey key,
         std::shared_ptr<const std::vector<uint8_t>>& outData) const;
     void StoreMemoryCache(CacheKey key,
@@ -568,7 +787,7 @@ private:
     void StorePersistentCache(CacheKey key,
         const std::vector<uint8_t>& data) const;
     void ResolvePersistentCacheDirectoryLocked() const;
-    void TrimMemoryCacheLocked() const;
+    void TrimAllMemoryShards() const;
     void TrimPersistentCache() const;
     std::string PersistentCachePathLocked(CacheKey key) const;
     bool HasPersistentCacheDirectoryLocked() const;
@@ -577,33 +796,90 @@ private:
     mutable std::ifstream pakStream_;
     std::string pakFilename_;
     PakInternal::PakHeader header_{};
-    uint64_t pakFileSize_ = 0;
-    bool isOpen_ = false;
-
-    // Immutable runtime table shared with in-flight reads so Close() can proceed
-    // without invalidating handles that have already been captured.
-    std::shared_ptr<const RuntimeTable> table_;
-
-    // Memory-mapped I/O (shared ownership with PakView/PakSpan instances)
-    std::shared_ptr<PakInternal::MappedFileGuard> mappedGuard_;
-    bool useMmap_ = false;
     uint32_t alignment_ = 1;
-    uint64_t archiveFingerprint_ = 0;
-    bool verifyOnRead_ = false;
 
-    // Thread safety
+    // Owns the published snapshot; only ever touched under mutex_.
+    std::shared_ptr<const ReadSnapshot> snapshotOwner_;
+    // The hot path's only view of reader state. See ReadSnapshot above.
+    std::atomic<const ReadSnapshot*> snapshot_{nullptr};
+
+    // Thread safety. mutex_ now guards Open()/Close()/move and the cold-path
+    // members above only -- reads never take it.
     mutable std::shared_mutex mutex_;
     mutable std::mutex streamMutex_;
+    // Guards the cache *policy* and the persistent-cache bookkeeping below.
+    // It is deliberately not on the decoded-read path any more: it used to be
+    // taken once per compressed read merely to copy the options struct, and
+    // since that struct holds a std::string, every such read also allocated.
     mutable std::mutex cacheMutex_;
-    mutable PakCacheOptions cacheOptions_{};
+
+    // Published policy. Readers take the atomic; writers swap it under
+    // cacheMutex_. Same publish-once discipline as ReadSnapshot.
+    std::shared_ptr<const PakCacheOptions> cacheOptionsOwner_;
+    mutable std::atomic<const PakCacheOptions*> cacheOptions_{nullptr};
+
+    const PakCacheOptions& CacheOptions() const noexcept
+    {
+        const PakCacheOptions* options = cacheOptions_.load(std::memory_order_acquire);
+        return options ? *options : kDefaultCacheOptions;
+    }
+    static const PakCacheOptions kDefaultCacheOptions;
+
+    // Persistent-cache stats only; the memory cache keeps its own per shard.
     mutable PakCacheStats cacheStats_{};
-    // Source reads include the uncached mmap fast path. Keep this counter
-    // lock-free so independent mapped reads are not serialized just to
-    // maintain diagnostics.
-    mutable std::atomic<uint64_t> sourceReads_{0};
-    mutable CacheLru memoryCacheLru_;
-    mutable std::unordered_map<CacheKey, DecodedCacheEntry, CacheKeyHash> memoryCache_;
-    mutable uint64_t memoryCacheBytes_ = 0;
+    // Source reads include the uncached mmap fast path, so this counter is
+    // bumped by literally every read. A single atomic counter is still a
+    // contended RMW on one cache line, which was enough to cap read scaling
+    // on its own -- so it is sharded per thread and summed only when
+    // GetCacheStats() asks.
+    mutable PakInternal::ShardedCounter sourceReads_;
+    // The decoded memory cache, split across independently-locked shards.
+    //
+    // One mutex over one map and one LRU list meant every cache hit from every
+    // streaming worker serialized on the same lock, so hit throughput went
+    // *down* as threads were added. Sharding by cache key makes unrelated
+    // entries independent; each shard keeps its own budget slice, LRU, and
+    // counters, and the counters are summed only when GetCacheStats() asks.
+    static constexpr size_t kMemoryCacheShards = 16;
+
+    struct MemoryCacheShard {
+        mutable std::mutex mutex;
+        CacheLru lru;
+        std::unordered_map<CacheKey, DecodedCacheEntry, CacheKeyHash> entries;
+        uint64_t bytes = 0;
+        uint64_t hits = 0;
+        uint64_t misses = 0;
+        uint64_t stores = 0;
+        uint64_t evictions = 0;
+    };
+
+    mutable MemoryCacheShard memoryShards_[kMemoryCacheShards];
+
+    // Sharding only pays off once each shard still holds a useful number of
+    // entries. Splitting a small budget 16 ways would leave slices too small
+    // to admit anything, so the shard count scales with the budget and
+    // collapses to 1 -- exactly the old single-lock, exact-LRU behavior --
+    // for caches below this threshold.
+    static constexpr uint64_t kMinBytesPerShard = 4ull * 1024 * 1024;
+
+    static size_t ActiveShardCount(const PakCacheOptions& options) noexcept
+    {
+        const uint64_t shards = options.memoryBudgetBytes / kMinBytesPerShard;
+        if (shards <= 1) return 1;
+        return shards >= kMemoryCacheShards ? kMemoryCacheShards
+                                            : static_cast<size_t>(shards);
+    }
+    static size_t ShardIndexFor(CacheKey key, size_t shardCount) noexcept
+    {
+        return static_cast<size_t>(CacheKeyHash{}(key)) % shardCount;
+    }
+    // Each active shard gets an equal slice of the overall budget.
+    static uint64_t ShardBudget(const PakCacheOptions& options) noexcept
+    {
+        return options.memoryBudgetBytes / ActiveShardCount(options);
+    }
+    void TrimShardLocked(MemoryCacheShard& shard, uint64_t shardBudget) const;
+    void AdoptMemoryShards(PakReader& other) const;
     mutable std::string effectivePersistentCacheDirectory_;
 };
 
@@ -724,24 +1000,55 @@ public:
     std::vector<std::string> ListFilesWithPrefix(const std::string& prefix) const;
 
 private:
-    struct MergedEntry {
+    // One slot of the merged open-addressing table.
+    //
+    // Keyed on the path hash rather than on the path itself. The merged
+    // namespace of a large layered install runs to hundreds of thousands of
+    // names, and the previous design stored a std::string copy of every one
+    // of them in a node-based map *and* re-sorted a second full copy on every
+    // Mount() -- so mounting N layers did O(N^2) name work and allocated per
+    // entry per mount. A flat power-of-two slot array is memcpy-cheap to copy
+    // forward, so each mount overlays only its own layer.
+    struct MergedSlot {
+        uint64_t pathHash = 0;
         uint32_t layerIndex = PakMountHandle::InvalidLayer;
         PakFileHandle fileHandle{};
+
+        bool Empty() const { return layerIndex == PakMountHandle::InvalidLayer; }
     };
 
+    // Immutable once published; see PakReader::ReadSnapshot for why the hot
+    // path reaches this through a plain atomic load rather than a lock plus a
+    // shared_ptr copy. layerReaders holds raw pointers whose lifetime is
+    // owned by layers_ below, which is sound because mounting may not race
+    // with reads (see the threading contract above).
     struct MergedIndex {
-        std::unordered_map<std::string, MergedEntry,
-            PakInternal::TransparentStringHash,
-            PakInternal::TransparentStringEqual> byName;
-        std::vector<std::string> sortedNames;
+        std::vector<MergedSlot> slots;  // power-of-two sized, or empty
+        std::vector<PakReader*> layerReaders;
+        uint64_t mask = 0;
+        uint32_t count = 0;
     };
 
-    void RebuildMergedIndexLocked();
+    static void GrowIndex(MergedIndex& index, uint32_t additionalEntries);
+    // Returns the slot's previous occupant, or an Empty() slot when the
+    // insert filled a free slot.
+    static MergedSlot InsertSlot(MergedIndex& index, uint64_t pathHash,
+                                 uint32_t layerIndex, PakFileHandle fileHandle);
+    static void OverlayLayer(MergedIndex& index, uint32_t layerIndex, PakReader& reader);
+    static const MergedSlot* ProbeIndex(const MergedIndex& index, uint64_t pathHash);
     static PakMountHandle FindInIndex(const MergedIndex& index, std::string_view filename);
+
+    void PublishIndexLocked(std::shared_ptr<const MergedIndex> index);
+
+    const MergedIndex* AcquireIndex() const noexcept
+    {
+        return index_.load(std::memory_order_acquire);
+    }
 
     mutable std::shared_mutex mutex_;
     std::vector<std::shared_ptr<PakReader>> layers_; // index 0 = lowest priority
-    std::shared_ptr<const MergedIndex> index_;
+    std::shared_ptr<const MergedIndex> indexOwner_;
+    std::atomic<const MergedIndex*> index_{nullptr};
 };
 
 #endif // PAK_H

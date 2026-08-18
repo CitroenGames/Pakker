@@ -85,7 +85,7 @@ bool Pakker::CreatePak(const std::string& pakFilename,
     }
 
     PakHeader header;
-    header.version = PAK_VERSION_6;
+    header.version = PAK_VERSION_7;
     header.numFiles = static_cast<uint32_t>(files.size());
     header.fileTableOffset = 0;
     header.alignment = alignment;
@@ -152,9 +152,10 @@ bool Pakker::CreatePak(const std::string& pakFilename,
             Log(PakLogLevel::Error, "CreatePak: Failed to get stream position.");
             return false;
         }
-        uint64_t contentHash = HashBuffer(writePtr, writeSize);
+        uint64_t contentHash = HashBytesFast(writePtr, writeSize);
         entries.emplace_back(normalizedFilename, currentOffset, originalSize,
-                             static_cast<uint64_t>(writeSize), flags, contentHash);
+                             static_cast<uint64_t>(writeSize), flags, contentHash,
+                             PakPathHash(normalizedFilename));
 
         pakStream.write(reinterpret_cast<const char*>(writePtr),
                        static_cast<std::streamsize>(writeSize));
@@ -164,12 +165,7 @@ bool Pakker::CreatePak(const std::string& pakFilename,
         }
     }
 
-    header.fileTableOffset = SafeStreamPos(pakStream, pakStream.tellp());
-    if (!pakStream) {
-        Log(PakLogLevel::Error, "CreatePak: Failed to get file table offset.");
-        return false;
-    }
-    if (!WriteFileTable(pakStream, entries)) return false;
+    if (!WriteFileTable(pakStream, entries, header)) return false;
 
     pakStream.seekp(0, std::ios::beg);
     if (!pakStream) {
@@ -197,14 +193,9 @@ bool Pakker::ExtractPak(const std::string& pakFilename, const std::string& outpu
     pakStream.seekg(0, std::ios::end);
     uint64_t pakFileSize = SafeStreamPos(pakStream, pakStream.tellg());
 
-    pakStream.seekg(header.fileTableOffset, std::ios::beg);
-    if (!pakStream) {
-        Log(PakLogLevel::Error, "ExtractPak: Failed to seek to fileTableOffset.");
-        return false;
-    }
 
     std::vector<PakEntry> entries;
-    if (!ReadFileTable(pakStream, header.numFiles, entries)) return false;
+    if (!ReadFileTable(pakStream, header, entries)) return false;
 
     for (const auto& entry : entries) {
         if (!ValidateEntry(entry, pakFileSize)) {
@@ -269,14 +260,9 @@ bool Pakker::ListPak(const std::string& pakFilename) const
     PakHeader header;
     if (!ReadPakHeader(pakStream, header)) return false;
 
-    pakStream.seekg(header.fileTableOffset, std::ios::beg);
-    if (!pakStream) {
-        Log(PakLogLevel::Error, "ListPak: Failed to seek to fileTableOffset.");
-        return false;
-    }
 
     std::vector<PakEntry> entries;
-    if (!ReadFileTable(pakStream, header.numFiles, entries)) return false;
+    if (!ReadFileTable(pakStream, header, entries)) return false;
 
     Log(PakLogLevel::Info, "ListPak: Contents of '" + pakFilename + "':");
     for (const auto& entry : entries) {
@@ -305,14 +291,9 @@ std::vector<std::string> Pakker::ListFiles(const std::string& pakFilename) const
     PakHeader header;
     if (!ReadPakHeader(pakStream, header)) return {};
 
-    pakStream.seekg(header.fileTableOffset, std::ios::beg);
-    if (!pakStream) {
-        Log(PakLogLevel::Error, "ListFiles: Failed to seek to fileTableOffset.");
-        return {};
-    }
 
     std::vector<PakEntry> entries;
-    if (!ReadFileTable(pakStream, header.numFiles, entries)) return {};
+    if (!ReadFileTable(pakStream, header, entries)) return {};
 
     std::vector<std::string> files;
     files.reserve(entries.size());
@@ -355,11 +336,10 @@ std::vector<uint8_t> Pakker::ReadFileFromPak(const std::string& pakFilename,
     pakStream.seekg(0, std::ios::end);
     uint64_t pakFileSize = SafeStreamPos(pakStream, pakStream.tellg());
 
-    pakStream.seekg(header.fileTableOffset, std::ios::beg);
     if (!pakStream) return {};
 
     std::vector<PakEntry> entries;
-    if (!ReadFileTable(pakStream, header.numFiles, entries)) return {};
+    if (!ReadFileTable(pakStream, header, entries)) return {};
 
     std::string normalizedFilename = NormalizePathSeparators(filename);
     for (const auto& entry : entries) {
@@ -430,11 +410,10 @@ bool Pakker::AddFileToPak(const std::string& pakFilename,
         return false;
     }
 
-    pakStream.seekg(header.fileTableOffset, std::ios::beg);
     if (!pakStream) return false;
 
     std::vector<PakEntry> entries;
-    if (!ReadFileTable(pakStream, header.numFiles, entries)) return false;
+    if (!ReadFileTable(pakStream, header, entries)) return false;
 
     auto it = std::find_if(entries.begin(), entries.end(), [&](const PakEntry& e) {
         return e.filename == normalizedFilename;
@@ -494,21 +473,24 @@ bool Pakker::AddFileToPak(const std::string& pakFilename,
                    static_cast<std::streamsize>(writeSize));
     if (!pakStream) return false;
 
-    uint64_t contentHash = HashBuffer(writePtr, writeSize);
+    uint64_t contentHash = HashBytesFast(writePtr, writeSize);
     entries.emplace_back(normalizedFilename, newOffset, originalSize,
-                         static_cast<uint64_t>(writeSize), flags, contentHash);
+                         static_cast<uint64_t>(writeSize), flags, contentHash,
+                         PakPathHash(normalizedFilename));
     header.numFiles += 1;
-    header.fileTableOffset = SafeStreamPos(pakStream, pakStream.tellp());
-    if (!pakStream) {
-        Log(PakLogLevel::Error, "AddFileToPak: Failed to get file table offset.");
-        return false;
-    }
+
+    // The table goes immediately after the data just appended, and
+    // WriteFileTable is what fills in the table and name-blob offsets -- so it
+    // has to run before the header is rewritten with those offsets in it.
+    if (!WriteFileTable(pakStream, entries, header)) return false;
+
+    // Truncate any leftover bytes from the old file table before stamping the
+    // header, so a short write can never leave a header pointing past the end.
+    const uint64_t tableEnd = SafeStreamPos(pakStream, pakStream.tellp());
 
     pakStream.seekp(0, std::ios::beg);
     if (!WritePakHeader(pakStream, header)) return false;
-
-    pakStream.seekp(header.fileTableOffset, std::ios::beg);
-    if (!WriteFileTable(pakStream, entries)) return false;
+    pakStream.seekp(static_cast<std::streamoff>(tableEnd), std::ios::beg);
 
     // Truncate any leftover bytes from the old file table
     uint64_t finalSize = SafeStreamPos(pakStream, pakStream.tellp());
@@ -572,7 +554,7 @@ bool Pakker::CreatePakFromFolder(const std::string& pakFilename,
     }
 
     PakHeader header;
-    header.version = PAK_VERSION_6;
+    header.version = PAK_VERSION_7;
     header.numFiles = static_cast<uint32_t>(filePaths.size());
     header.fileTableOffset = 0;
     header.alignment = alignment;
@@ -646,9 +628,10 @@ bool Pakker::CreatePakFromFolder(const std::string& pakFilename,
             Log(PakLogLevel::Error, "CreatePakFromFolder: Failed to get stream position.");
             return false;
         }
-        uint64_t contentHash = HashBuffer(writePtr, writeSize);
+        uint64_t contentHash = HashBytesFast(writePtr, writeSize);
         entries.emplace_back(normalizedName, currentOffset, originalSize,
-                             static_cast<uint64_t>(writeSize), flags, contentHash);
+                             static_cast<uint64_t>(writeSize), flags, contentHash,
+                             PakPathHash(normalizedName));
 
         pakStream.write(reinterpret_cast<const char*>(writePtr),
                        static_cast<std::streamsize>(writeSize));
@@ -658,13 +641,8 @@ bool Pakker::CreatePakFromFolder(const std::string& pakFilename,
         }
     }
 
-    header.fileTableOffset = SafeStreamPos(pakStream, pakStream.tellp());
-    if (!pakStream) {
-        Log(PakLogLevel::Error, "CreatePakFromFolder: Failed to get file table offset.");
-        return false;
-    }
     header.numFiles = static_cast<uint32_t>(entries.size());
-    if (!WriteFileTable(pakStream, entries)) return false;
+    if (!WriteFileTable(pakStream, entries, header)) return false;
 
     pakStream.seekp(0, std::ios::beg);
     if (!pakStream) {
@@ -704,11 +682,10 @@ Pakker::FileInfo Pakker::GetFileInfo(const std::string& pakFilename,
     PakHeader header;
     if (!ReadPakHeader(pakStream, header)) return info;
 
-    pakStream.seekg(header.fileTableOffset, std::ios::beg);
     if (!pakStream) return info;
 
     std::vector<PakEntry> entries;
-    if (!ReadFileTable(pakStream, header.numFiles, entries)) return info;
+    if (!ReadFileTable(pakStream, header, entries)) return info;
 
     std::string normalizedFilename = NormalizePathSeparators(filename);
     auto it = std::find_if(entries.begin(), entries.end(),
@@ -756,11 +733,10 @@ bool Pakker::ValidatePak(const std::string& pakFilename, bool deepVerify) const
         return false;
     }
 
-    pakStream.seekg(header.fileTableOffset, std::ios::beg);
     if (!pakStream) return false;
 
     std::vector<PakEntry> entries;
-    if (!ReadFileTable(pakStream, header.numFiles, entries)) return false;
+    if (!ReadFileTable(pakStream, header, entries)) return false;
 
     for (const auto& entry : entries) {
         if (!ValidateEntry(entry, pakFileSize)) {
@@ -788,7 +764,7 @@ bool Pakker::ValidatePak(const std::string& pakFilename, bool deepVerify) const
                 }
             }
 
-            uint64_t hash = HashBuffer(diskBytes.data(), diskBytes.size());
+            uint64_t hash = HashBytesFast(diskBytes.data(), diskBytes.size());
             if (hash != entry.contentHash) {
                 Log(PakLogLevel::Error, "ValidatePak: Content hash mismatch: " + entry.filename);
                 return false;

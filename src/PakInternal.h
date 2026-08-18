@@ -25,9 +25,11 @@ namespace PakInternal {
 // letting it silently diverge per codec.
 static constexpr uint64_t MAX_COMPRESSIBLE_ENTRY_SIZE = 0x7E000000;
 
-// FNV-1a fingerprint helpers used by PakReader for its archive fingerprint
-// (Open()) and its decoded-cache-key generation (MakeCacheKey,
-// HashEntrySourceBytes).
+// FNV-1a fingerprint helpers, used only for values that never reach disk:
+// PakReader's archive fingerprint (Open()) and its decoded-cache keys. These
+// hash a handful of scalars each, so the byte-at-a-time loop is irrelevant
+// here. Content-integrity hashing, which runs over whole payloads, uses
+// PakInternal::HashBytesFast (XXH64) instead.
 static constexpr uint64_t FNV_OFFSET_BASIS = 14695981039346656037ull;
 static constexpr uint64_t FNV_PRIME = 1099511628211ull;
 
@@ -51,13 +53,6 @@ inline void HashString(uint64_t& hash, std::string_view value)
     uint64_t size = static_cast<uint64_t>(value.size());
     HashValue(hash, size);
     if (!value.empty()) HashBytes(hash, value.data(), value.size());
-}
-
-inline uint64_t HashBuffer(const uint8_t* data, uint64_t size)
-{
-    uint64_t hash = FNV_OFFSET_BASIS;
-    if (data && size > 0) HashBytes(hash, data, static_cast<size_t>(size));
-    return hash;
 }
 
 inline std::string Hex64(uint64_t value)

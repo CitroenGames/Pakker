@@ -83,6 +83,26 @@ endif()
 if(BUILD_BENCHMARKS)
 add_executable(PakkerBenchmark benchmarks/PakRuntimeBenchmark.cpp)
 target_link_libraries(PakkerBenchmark PRIVATE ${PROJECT_NAME})
+
+# Benchmarks covering the axes that decide whether the library survives a
+# large-game asset set. They share benchmarks/BenchSupport.h for timing,
+# percentiles, residency, and synthetic asset generation.
+#
+#   Scale       -- per-entry metadata cost: open time, resident file table,
+#                  lookup throughput, layered-mount index build
+#   Throughput  -- decode bandwidth and latency across an entry-size ladder,
+#                  time-to-first-byte on large assets, integrity hashing
+#   Concurrency -- how read throughput scales across worker threads
+#   Build       -- pack throughput per codec and level
+foreach(bench Scale Throughput Concurrency Build)
+    add_executable(Pakker${bench}Benchmark benchmarks/Pak${bench}Benchmark.cpp)
+    target_link_libraries(Pakker${bench}Benchmark PRIVATE ${PROJECT_NAME})
+    target_include_directories(Pakker${bench}Benchmark PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/benchmarks)
+    if(WIN32)
+        # GetProcessMemoryInfo for the resident-bytes readout.
+        target_link_libraries(Pakker${bench}Benchmark PRIVATE psapi)
+    endif()
+endforeach()
 endif()
 
 # Only export/install when Pakker is the top-level project -- consumers

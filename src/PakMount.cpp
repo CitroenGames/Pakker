@@ -16,15 +16,30 @@ bool NeedsPathNormalization(std::string_view path)
            (!path.empty() && path.front() == '/');
 }
 
+// Keeps the open-addressing table at most ~70% full. Linear probing degrades
+// sharply past that, and the slots are small enough that the headroom is
+// cheap: 16 bytes per slot against ~50 bytes for the path string the old
+// index stored per entry per layer.
+constexpr uint64_t kMaxLoadNumerator = 7;
+constexpr uint64_t kMaxLoadDenominator = 10;
+
+uint64_t NextPowerOfTwo(uint64_t value)
+{
+    uint64_t result = 16;
+    while (result < value) result <<= 1;
+    return result;
+}
+
 } // namespace
 
 PakMount::PakMount(PakMount&& other) noexcept
 {
     std::unique_lock lock(other.mutex_);
     layers_ = std::move(other.layers_);
-    index_ = std::move(other.index_);
+    indexOwner_ = std::move(other.indexOwner_);
+    index_.store(other.index_.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    other.index_.store(nullptr, std::memory_order_relaxed);
     other.layers_.clear();
-    other.index_.reset();
 }
 
 PakMount& PakMount::operator=(PakMount&& other) noexcept
@@ -41,11 +56,121 @@ PakMount& PakMount::operator=(PakMount&& other) noexcept
         }
 
         layers_ = std::move(other.layers_);
-        index_ = std::move(other.index_);
+        indexOwner_ = std::move(other.indexOwner_);
+        index_.store(other.index_.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        other.index_.store(nullptr, std::memory_order_relaxed);
         other.layers_.clear();
-        other.index_.reset();
     }
     return *this;
+}
+
+// ---------------------------------------------------------------------------
+// Merged index construction
+// ---------------------------------------------------------------------------
+
+void PakMount::GrowIndex(MergedIndex& index, uint32_t additionalEntries)
+{
+    const uint64_t needed = static_cast<uint64_t>(index.count) + additionalEntries;
+    const uint64_t required = (needed * kMaxLoadDenominator + kMaxLoadNumerator - 1) /
+                              kMaxLoadNumerator;
+    if (!index.slots.empty() && index.slots.size() >= required) return;
+
+    std::vector<MergedSlot> oldSlots = std::move(index.slots);
+
+    const uint64_t slotCount = NextPowerOfTwo(required);
+    index.slots.assign(static_cast<size_t>(slotCount), MergedSlot{});
+    index.mask = slotCount - 1;
+
+    for (const MergedSlot& slot : oldSlots) {
+        if (slot.Empty()) continue;
+        uint64_t position = slot.pathHash & index.mask;
+        while (!index.slots[static_cast<size_t>(position)].Empty()) {
+            position = (position + 1) & index.mask;
+        }
+        index.slots[static_cast<size_t>(position)] = slot;
+    }
+}
+
+PakMount::MergedSlot PakMount::InsertSlot(MergedIndex& index, uint64_t pathHash,
+                                          uint32_t layerIndex, PakFileHandle fileHandle)
+{
+    uint64_t position = pathHash & index.mask;
+    while (true) {
+        MergedSlot& slot = index.slots[static_cast<size_t>(position)];
+        if (slot.Empty()) {
+            slot.pathHash = pathHash;
+            slot.layerIndex = layerIndex;
+            slot.fileHandle = fileHandle;
+            ++index.count;
+            return MergedSlot{};
+        }
+        if (slot.pathHash == pathHash) {
+            // Same path hash already present: normally the mount override
+            // rule (a higher-priority layer replacing a lower one). Hand the
+            // previous occupant back so the caller can tell that apart from a
+            // true hash collision without probing a second time.
+            const MergedSlot previous = slot;
+            slot.layerIndex = layerIndex;
+            slot.fileHandle = fileHandle;
+            return previous;
+        }
+        position = (position + 1) & index.mask;
+    }
+}
+
+void PakMount::OverlayLayer(MergedIndex& index, uint32_t layerIndex, PakReader& reader)
+{
+    const uint32_t count = reader.GetFileCount();
+    GrowIndex(index, count);
+
+    for (uint32_t i = 0; i < count; ++i) {
+        const PakFileInfo* info = reader.InfoByIndex(i);
+        if (!info) continue;
+
+        // The archive stores this hash, so mounting never re-hashes a path.
+        // It is also what lets a layer mounted without its name blob still
+        // participate in the merged namespace.
+        const MergedSlot replaced = InsertSlot(index, info->pathHash, layerIndex,
+                                               PakFileHandle{i});
+
+        // A genuine 64-bit hash collision between two different paths would
+        // silently shadow one asset with another, which is close to
+        // undebuggable from the outside. Turning that into a loud error costs
+        // one string compare, and only on a slot that was already occupied --
+        // which is almost always just the ordinary override case.
+        if (replaced.Empty()) continue;
+
+        PakReader* owner = index.layerReaders[replaced.layerIndex];
+        const PakFileInfo* replacedInfo = owner
+            ? owner->InfoByIndex(replaced.fileHandle.index) : nullptr;
+        if (replacedInfo && !replacedInfo->filename.empty() &&
+            !info->filename.empty() &&
+            replacedInfo->filename != info->filename) {
+            Log(PakLogLevel::Error,
+                "PakMount: path hash collision between '" +
+                std::string(replacedInfo->filename) + "' and '" +
+                std::string(info->filename) + "'; the latter wins.");
+        }
+    }
+}
+
+const PakMount::MergedSlot* PakMount::ProbeIndex(const MergedIndex& index, uint64_t pathHash)
+{
+    if (index.slots.empty()) return nullptr;
+
+    uint64_t position = pathHash & index.mask;
+    while (true) {
+        const MergedSlot& slot = index.slots[static_cast<size_t>(position)];
+        if (slot.Empty()) return nullptr;
+        if (slot.pathHash == pathHash) return &slot;
+        position = (position + 1) & index.mask;
+    }
+}
+
+void PakMount::PublishIndexLocked(std::shared_ptr<const MergedIndex> index)
+{
+    indexOwner_ = std::move(index);
+    index_.store(indexOwner_.get(), std::memory_order_release);
 }
 
 // ---------------------------------------------------------------------------
@@ -64,16 +189,29 @@ bool PakMount::MountReader(std::shared_ptr<PakReader> reader)
     if (!reader || !reader->IsOpen()) return false;
 
     std::unique_lock lock(mutex_);
+
+    // Copy the previous index forward and overlay only the incoming layer.
+    // The copy is a flat vector memcpy rather than a per-entry rehash, which
+    // is what keeps mounting linear in total entries instead of quadratic.
+    auto merged = indexOwner_
+        ? std::make_shared<MergedIndex>(*indexOwner_)
+        : std::make_shared<MergedIndex>();
+
+    const uint32_t layerIndex = static_cast<uint32_t>(layers_.size());
+    merged->layerReaders.push_back(reader.get());
+    OverlayLayer(*merged, layerIndex, *reader);
+
     layers_.push_back(std::move(reader));
-    RebuildMergedIndexLocked();
+    PublishIndexLocked(std::move(merged));
     return true;
 }
 
 void PakMount::Clear()
 {
     std::unique_lock lock(mutex_);
+    index_.store(nullptr, std::memory_order_release);
+    indexOwner_.reset();
     layers_.clear();
-    index_.reset();
 }
 
 size_t PakMount::LayerCount() const
@@ -89,32 +227,6 @@ std::shared_ptr<PakReader> PakMount::GetLayerReader(size_t layerIndex) const
     return layers_[layerIndex];
 }
 
-void PakMount::RebuildMergedIndexLocked()
-{
-    auto newIndex = std::make_shared<MergedIndex>();
-
-    // Low-to-high priority so later (higher-index / more-recently-mounted)
-    // layers naturally overwrite earlier ones on name conflicts.
-    for (uint32_t layerIdx = 0; layerIdx < layers_.size(); ++layerIdx) {
-        const auto& reader = layers_[layerIdx];
-        uint32_t count = reader->GetFileCount();
-        for (uint32_t i = 0; i < count; ++i) {
-            const PakFileInfo* info = reader->InfoByIndex(i);
-            if (!info) continue;
-            newIndex->byName[std::string(info->filename)] =
-                MergedEntry{layerIdx, PakFileHandle{i}};
-        }
-    }
-
-    newIndex->sortedNames.reserve(newIndex->byName.size());
-    for (const auto& [name, entry] : newIndex->byName) {
-        newIndex->sortedNames.push_back(name);
-    }
-    std::sort(newIndex->sortedNames.begin(), newIndex->sortedNames.end());
-
-    index_ = std::move(newIndex);
-}
-
 // ---------------------------------------------------------------------------
 // Lookup
 // ---------------------------------------------------------------------------
@@ -123,18 +235,25 @@ PakMountHandle PakMount::FindInIndex(const MergedIndex& index, std::string_view 
 {
     if (filename.empty()) return {};
 
-    auto it = index.byName.find(filename);
-    if (it == index.byName.end()) return {};
-    return PakMountHandle{it->second.layerIndex, it->second.fileHandle};
+    const MergedSlot* slot = ProbeIndex(index, PakPathHash(filename));
+    if (!slot) return {};
+
+    // Confirm the name, so a hash collision cannot hand back the wrong asset.
+    // Archives opened without a resident name blob report an empty filename;
+    // there the 64-bit hash is all there is to go on, which is the documented
+    // trade for dropping the names.
+    PakReader* owner = index.layerReaders[slot->layerIndex];
+    if (owner) {
+        const PakFileInfo* info = owner->InfoByIndex(slot->fileHandle.index);
+        if (info && !info->filename.empty() && info->filename != filename) return {};
+    }
+
+    return PakMountHandle{slot->layerIndex, slot->fileHandle};
 }
 
 PakMountHandle PakMount::Find(std::string_view filename) const
 {
-    std::shared_ptr<const MergedIndex> index;
-    {
-        std::shared_lock lock(mutex_);
-        index = index_;
-    }
+    const MergedIndex* index = AcquireIndex();
     if (!index) return {};
 
     if (NeedsPathNormalization(filename)) {
@@ -149,11 +268,7 @@ size_t PakMount::Resolve(std::span<const std::string_view> filenames,
     size_t resolvedCount = 0;
     size_t count = std::min(filenames.size(), handles.size());
 
-    std::shared_ptr<const MergedIndex> index;
-    {
-        std::shared_lock lock(mutex_);
-        index = index_;
-    }
+    const MergedIndex* index = AcquireIndex();
     if (!index) {
         for (size_t i = 0; i < count; ++i) handles[i] = {};
         return 0;
@@ -170,69 +285,52 @@ size_t PakMount::Resolve(std::span<const std::string_view> filenames,
 }
 
 // ---------------------------------------------------------------------------
-// Handle dispatch -- snapshot the winning layer's reader, then forward
-// straight into its own handle-based method. Mirrors PakReader's own
-// snapshot-then-release discipline: the mutex_ is held only long enough to
-// copy a shared_ptr, never during I/O or decompression.
+// Handle dispatch -- resolve the winning layer from the published index and
+// forward straight into that reader's own handle-based method. No lock and
+// no reference count on the way through; see PakReader::ReadSnapshot for the
+// reasoning.
 // ---------------------------------------------------------------------------
 
 const PakFileInfo* PakMount::Info(PakMountHandle handle) const
 {
-    std::shared_ptr<PakReader> reader;
-    {
-        std::shared_lock lock(mutex_);
-        if (!handle || handle.layerIndex >= layers_.size()) return nullptr;
-        reader = layers_[handle.layerIndex];
-    }
-    return reader->Info(handle.fileHandle);
+    const MergedIndex* index = AcquireIndex();
+    if (!index || !handle || handle.layerIndex >= index->layerReaders.size()) return nullptr;
+    return index->layerReaders[handle.layerIndex]->Info(handle.fileHandle);
 }
 
 PakStatus PakMount::View(PakMountHandle handle, PakView& outView) const
 {
-    std::shared_ptr<PakReader> reader;
-    {
-        std::shared_lock lock(mutex_);
-        if (!handle || handle.layerIndex >= layers_.size()) return PakStatus::InvalidHandle;
-        reader = layers_[handle.layerIndex];
-    }
-    return reader->View(handle.fileHandle, outView);
+    const MergedIndex* index = AcquireIndex();
+    if (!index || !handle || handle.layerIndex >= index->layerReaders.size())
+        return PakStatus::InvalidHandle;
+    return index->layerReaders[handle.layerIndex]->View(handle.fileHandle, outView);
 }
 
 PakStatus PakMount::Read(PakMountHandle handle, std::span<uint8_t> destination,
                          uint64_t* bytesWritten) const
 {
-    std::shared_ptr<PakReader> reader;
-    {
-        std::shared_lock lock(mutex_);
-        if (!handle || handle.layerIndex >= layers_.size()) return PakStatus::InvalidHandle;
-        reader = layers_[handle.layerIndex];
-    }
-    return reader->Read(handle.fileHandle, destination, bytesWritten);
+    const MergedIndex* index = AcquireIndex();
+    if (!index || !handle || handle.layerIndex >= index->layerReaders.size())
+        return PakStatus::InvalidHandle;
+    return index->layerReaders[handle.layerIndex]->Read(handle.fileHandle, destination, bytesWritten);
 }
 
 PakStatus PakMount::Load(PakMountHandle handle, std::vector<uint8_t>& outData) const
 {
-    std::shared_ptr<PakReader> reader;
-    {
-        std::shared_lock lock(mutex_);
-        if (!handle || handle.layerIndex >= layers_.size()) {
-            outData.clear();
-            return PakStatus::InvalidHandle;
-        }
-        reader = layers_[handle.layerIndex];
+    const MergedIndex* index = AcquireIndex();
+    if (!index || !handle || handle.layerIndex >= index->layerReaders.size()) {
+        outData.clear();
+        return PakStatus::InvalidHandle;
     }
-    return reader->Load(handle.fileHandle, outData);
+    return index->layerReaders[handle.layerIndex]->Load(handle.fileHandle, outData);
 }
 
 PakStatus PakMount::Prefetch(PakMountHandle handle) const
 {
-    std::shared_ptr<PakReader> reader;
-    {
-        std::shared_lock lock(mutex_);
-        if (!handle || handle.layerIndex >= layers_.size()) return PakStatus::InvalidHandle;
-        reader = layers_[handle.layerIndex];
-    }
-    return reader->Prefetch(handle.fileHandle);
+    const MergedIndex* index = AcquireIndex();
+    if (!index || !handle || handle.layerIndex >= index->layerReaders.size())
+        return PakStatus::InvalidHandle;
+    return index->layerReaders[handle.layerIndex]->Prefetch(handle.fileHandle);
 }
 
 // ---------------------------------------------------------------------------
@@ -262,15 +360,12 @@ PakSpan PakMount::ReadFileZeroCopy(const std::string& filename) const
     // class), so PakMount cannot assemble one directly -- determine which
     // layer owns this file, then delegate to that layer's own
     // ReadFileZeroCopy(), which can.
-    std::shared_ptr<PakReader> reader;
-    {
-        PakMountHandle handle = Find(filename);
-        if (!handle) return PakSpan{};
-        std::shared_lock lock(mutex_);
-        if (handle.layerIndex >= layers_.size()) return PakSpan{};
-        reader = layers_[handle.layerIndex];
-    }
-    return reader->ReadFileZeroCopy(filename);
+    PakMountHandle handle = Find(filename);
+    if (!handle) return PakSpan{};
+
+    const MergedIndex* index = AcquireIndex();
+    if (!index || handle.layerIndex >= index->layerReaders.size()) return PakSpan{};
+    return index->layerReaders[handle.layerIndex]->ReadFileZeroCopy(filename);
 }
 
 bool PakMount::FileExists(std::string_view filename) const
@@ -280,49 +375,49 @@ bool PakMount::FileExists(std::string_view filename) const
 
 uint32_t PakMount::GetFileCount() const
 {
-    std::shared_ptr<const MergedIndex> index;
-    {
-        std::shared_lock lock(mutex_);
-        index = index_;
-    }
-    return index ? static_cast<uint32_t>(index->byName.size()) : 0;
+    const MergedIndex* index = AcquireIndex();
+    return index ? index->count : 0;
 }
 
 // ---------------------------------------------------------------------------
 // Enumeration
+//
+// Names are no longer cached in the index, so these materialize and sort on
+// demand. That is a deliberate trade: enumeration is a tools/debug path,
+// while mounting is on the critical path of every level load.
 // ---------------------------------------------------------------------------
 
 std::vector<std::string> PakMount::ListFiles() const
 {
-    std::shared_ptr<const MergedIndex> index;
-    {
-        std::shared_lock lock(mutex_);
-        index = index_;
-    }
+    const MergedIndex* index = AcquireIndex();
     if (!index) return {};
-    return index->sortedNames;
+
+    std::vector<std::string> files;
+    files.reserve(index->count);
+    for (const MergedSlot& slot : index->slots) {
+        if (slot.Empty()) continue;
+        PakReader* owner = index->layerReaders[slot.layerIndex];
+        if (!owner) continue;
+        const PakFileInfo* info = owner->InfoByIndex(slot.fileHandle.index);
+        if (!info || info->filename.empty()) continue;
+        files.emplace_back(info->filename);
+    }
+    std::sort(files.begin(), files.end());
+    return files;
 }
 
 std::vector<std::string> PakMount::ListFilesWithPrefix(const std::string& prefix) const
 {
-    std::shared_ptr<const MergedIndex> index;
-    {
-        std::shared_lock lock(mutex_);
-        index = index_;
-    }
-    if (!index) return {};
+    const std::string normalizedPrefix = NormalizePathSeparators(prefix);
+    std::vector<std::string> files = ListFiles();
 
-    std::string normalizedPrefix = NormalizePathSeparators(prefix);
-
-    // sortedNames is sorted, so every match forms one contiguous run
-    // starting at the first name >= the prefix -- binary search straight to
-    // it instead of an O(n) scan.
-    auto begin = std::lower_bound(index->sortedNames.begin(), index->sortedNames.end(),
-                                   normalizedPrefix);
+    // ListFiles() returns sorted names, so matches form one contiguous run
+    // starting at the first name >= the prefix.
+    auto begin = std::lower_bound(files.begin(), files.end(), normalizedPrefix);
 
     std::vector<std::string> matches;
-    for (auto it = begin; it != index->sortedNames.end() && it->starts_with(normalizedPrefix); ++it) {
-        matches.push_back(*it);
+    for (auto it = begin; it != files.end() && it->starts_with(normalizedPrefix); ++it) {
+        matches.push_back(std::move(*it));
     }
     return matches;
 }

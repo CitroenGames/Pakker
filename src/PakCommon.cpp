@@ -31,6 +31,15 @@ const char* PakStatusToString(PakStatus status)
 
 namespace PakInternal {
 
+size_t ThreadShardIndex() noexcept
+{
+    static std::atomic<size_t> nextIndex{0};
+    // Assigned once per thread and cached, so the hot path pays a thread-local
+    // read rather than an atomic.
+    thread_local const size_t index = nextIndex.fetch_add(1, std::memory_order_relaxed);
+    return index;
+}
+
 void Log(PakLogLevel level, const std::string& msg)
 {
     auto cb = g_logCallback.load(std::memory_order_acquire);
@@ -107,12 +116,17 @@ bool ReadPakHeader(std::istream& stream, PakHeader& header)
         Log(PakLogLevel::Error, "ReadPakHeader: Invalid magic number.");
         return false;
     }
-    if (header.version != PAK_VERSION_6) {
+    if (header.version != PAK_VERSION_7) {
         Log(PakLogLevel::Error, "ReadPakHeader: Unsupported PAK version: " + std::to_string(header.version));
         return false;
     }
     if (header.numFiles > MAX_FILES_IN_PAK) {
         Log(PakLogLevel::Error, "ReadPakHeader: Too many files in PAK: " + std::to_string(header.numFiles));
+        return false;
+    }
+    if (header.nameBlobSize > MAX_NAME_BLOB_SIZE) {
+        Log(PakLogLevel::Error, "ReadPakHeader: Name blob too large: " +
+            std::to_string(header.nameBlobSize));
         return false;
     }
     return true;
@@ -132,83 +146,133 @@ bool WritePakHeader(std::ostream& stream, const PakHeader& header)
 // File table I/O
 // ---------------------------------------------------------------------------
 
-bool ReadFileTable(std::istream& stream, uint32_t numFiles,
+bool ReadFileTable(std::istream& stream, const PakHeader& header,
                    std::vector<PakEntry>& entries)
 {
     entries.clear();
+
+    const uint32_t numFiles = header.numFiles;
+    if (numFiles == 0) return true;
+
+    std::vector<PakEntryRecord> records(numFiles);
+    stream.seekg(static_cast<std::streamoff>(header.fileTableOffset), std::ios::beg);
+    if (!stream) {
+        Log(PakLogLevel::Error, "ReadFileTable: Failed to seek to file table.");
+        return false;
+    }
+    stream.read(reinterpret_cast<char*>(records.data()),
+                static_cast<std::streamsize>(records.size() * sizeof(PakEntryRecord)));
+    if (!stream) {
+        Log(PakLogLevel::Error, "ReadFileTable: Failed to read entry records.");
+        return false;
+    }
+
+    std::vector<char> nameBlob(static_cast<size_t>(header.nameBlobSize));
+    if (!nameBlob.empty()) {
+        stream.seekg(static_cast<std::streamoff>(header.nameBlobOffset), std::ios::beg);
+        if (!stream) {
+            Log(PakLogLevel::Error, "ReadFileTable: Failed to seek to name blob.");
+            return false;
+        }
+        stream.read(nameBlob.data(), static_cast<std::streamsize>(nameBlob.size()));
+        if (!stream) {
+            Log(PakLogLevel::Error, "ReadFileTable: Failed to read name blob.");
+            return false;
+        }
+    }
+
     entries.reserve(numFiles);
-
-    for (uint32_t i = 0; i < numFiles; ++i) {
-        uint16_t nameLength;
-        stream.read(reinterpret_cast<char*>(&nameLength), sizeof(nameLength));
-        if (!stream || nameLength == 0 || nameLength > MAX_FILENAME_LENGTH) {
-            Log(PakLogLevel::Error, "ReadFileTable: Invalid filename length: " + std::to_string(nameLength));
+    for (const PakEntryRecord& record : records) {
+        if (record.nameLength == 0 ||
+            record.nameOffset > nameBlob.size() ||
+            record.nameLength > nameBlob.size() - record.nameOffset) {
+            Log(PakLogLevel::Error, "ReadFileTable: Name range outside the name blob.");
             return false;
         }
 
-        std::string filename(nameLength, '\0');
-        stream.read(&filename[0], nameLength);
-        if (!stream) {
-            Log(PakLogLevel::Error, "ReadFileTable: Failed to read filename.");
+        std::string filename(nameBlob.data() + record.nameOffset, record.nameLength);
+        if (!IsValidFilename(filename)) {
+            Log(PakLogLevel::Error, "ReadFileTable: Invalid filename: " + filename);
             return false;
         }
 
-        uint64_t offset, originalSize;
-        stream.read(reinterpret_cast<char*>(&offset), sizeof(offset));
-        stream.read(reinterpret_cast<char*>(&originalSize), sizeof(originalSize));
-        if (!stream) {
-            Log(PakLogLevel::Error, "ReadFileTable: Failed to read file entry for: " + filename);
-            return false;
-        }
-
-        uint64_t compressedSize = 0;
-        uint8_t flags = 0;
-        stream.read(reinterpret_cast<char*>(&compressedSize), sizeof(compressedSize));
-        stream.read(reinterpret_cast<char*>(&flags), sizeof(flags));
-        if (!stream) {
-            Log(PakLogLevel::Error, "ReadFileTable: Failed to read compression fields for: " + filename);
-            return false;
-        }
-
-        uint64_t contentHash = 0;
-        stream.read(reinterpret_cast<char*>(&contentHash), sizeof(contentHash));
-        if (!stream) {
-            Log(PakLogLevel::Error, "ReadFileTable: Failed to read content hash for: " + filename);
-            return false;
-        }
-
-        PakEntry entry(std::move(filename), offset, originalSize, compressedSize, flags, contentHash);
-        if (!IsValidFilename(entry.filename)) {
-            Log(PakLogLevel::Error, "ReadFileTable: Invalid filename: " + entry.filename);
-            return false;
-        }
-        entries.emplace_back(std::move(entry));
+        entries.emplace_back(std::move(filename), record.offset, record.originalSize,
+                             record.compressedSize, record.flags, record.contentHash,
+                             record.pathHash);
     }
     return true;
 }
 
-bool WriteFileTable(std::ostream& stream, const std::vector<PakEntry>& entries)
+bool WriteFileTable(std::ostream& stream, const std::vector<PakEntry>& entries,
+                    PakHeader& header)
 {
+    uint64_t nameBlobSize = 0;
     for (const auto& entry : entries) {
         if (entry.filename.length() > MAX_FILENAME_LENGTH) {
             Log(PakLogLevel::Error, "WriteFileTable: Filename too long: " + entry.filename);
             return false;
         }
+        nameBlobSize += entry.filename.size();
+    }
+    if (nameBlobSize > MAX_NAME_BLOB_SIZE) {
+        Log(PakLogLevel::Error, "WriteFileTable: Name blob too large: " +
+            std::to_string(nameBlobSize));
+        return false;
+    }
 
-        uint16_t nameLength = static_cast<uint16_t>(entry.filename.size());
-        stream.write(reinterpret_cast<const char*>(&nameLength), sizeof(nameLength));
-        stream.write(entry.filename.data(), nameLength);
-        stream.write(reinterpret_cast<const char*>(&entry.offset), sizeof(entry.offset));
-        stream.write(reinterpret_cast<const char*>(&entry.originalSize), sizeof(entry.originalSize));
-        stream.write(reinterpret_cast<const char*>(&entry.compressedSize), sizeof(entry.compressedSize));
-        stream.write(reinterpret_cast<const char*>(&entry.flags), sizeof(entry.flags));
-        stream.write(reinterpret_cast<const char*>(&entry.contentHash), sizeof(entry.contentHash));
+    const uint64_t tableOffset = SafeStreamPos(stream, stream.tellp());
+    if (!stream) {
+        Log(PakLogLevel::Error, "WriteFileTable: Failed to get file table offset.");
+        return false;
+    }
 
+    // Records first, then every name back to back. The reader gets both in
+    // one bulk read each and never parses entry by entry.
+    std::vector<PakEntryRecord> records;
+    records.reserve(entries.size());
+
+    uint32_t nameOffset = 0;
+    for (const auto& entry : entries) {
+        PakEntryRecord record{};
+        record.offset = entry.offset;
+        record.originalSize = entry.originalSize;
+        record.compressedSize = entry.compressedSize;
+        record.contentHash = entry.contentHash;
+        record.pathHash = entry.pathHash;
+        record.nameOffset = nameOffset;
+        record.nameLength = static_cast<uint16_t>(entry.filename.size());
+        record.flags = entry.flags;
+        records.push_back(record);
+        nameOffset += static_cast<uint32_t>(entry.filename.size());
+    }
+
+    if (!records.empty()) {
+        stream.write(reinterpret_cast<const char*>(records.data()),
+                     static_cast<std::streamsize>(records.size() * sizeof(PakEntryRecord)));
         if (!stream) {
-            Log(PakLogLevel::Error, "WriteFileTable: Failed to write file entry for: " + entry.filename);
+            Log(PakLogLevel::Error, "WriteFileTable: Failed to write entry records.");
             return false;
         }
     }
+
+    const uint64_t blobOffset = SafeStreamPos(stream, stream.tellp());
+    if (!stream) {
+        Log(PakLogLevel::Error, "WriteFileTable: Failed to get name blob offset.");
+        return false;
+    }
+
+    for (const auto& entry : entries) {
+        if (entry.filename.empty()) continue;
+        stream.write(entry.filename.data(), static_cast<std::streamsize>(entry.filename.size()));
+        if (!stream) {
+            Log(PakLogLevel::Error, "WriteFileTable: Failed to write name blob.");
+            return false;
+        }
+    }
+
+    header.fileTableOffset = tableOffset;
+    header.nameBlobOffset = blobOffset;
+    header.nameBlobSize = nameBlobSize;
     return true;
 }
 

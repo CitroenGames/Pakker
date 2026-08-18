@@ -11,14 +11,15 @@ Its main job is to build `.pak` archives offline, then serve assets at runtime
 with predictable lookup cost, memory-mapped I/O when available, zero-copy views
 for eligible files, and thread-safe concurrent reads.
 
-The current archive format is v6-only.
+The current archive format is v7-only.
 
 ## Repository Map
 
 | Path | Purpose |
 |------|---------|
 | `src/Pak.h` | Public API, archive structures, runtime handles, cache options, `PakMount`, and thread-safety contract |
-| `src/PakInternal.h` | Private implementation header: codec-neutral size ceiling and FNV fingerprint/hash helpers shared across the files below |
+| `src/PakInternal.h` | Private implementation header: codec-neutral size ceiling and FNV fingerprint helpers (non-persisted values only) shared across the files below |
+| `src/PakHash.cpp` | XXH64 wrappers behind `PakPathHash()` / `PakInternal::HashBytesFast()`; the only translation unit that includes the vendored xxHash header |
 | `src/PakCommon.cpp` | Shared archive-format contract: logging, path/filename validation, header and file-table I/O, encryption |
 | `src/PakCompression.h`, `src/PakCompression.cpp` | Shared LZ4/Zstd compress+decompress dispatch; the only translation unit that includes the vendor codec headers |
 | `src/PakBuilder.cpp` | `Pakker` build-time API: create, extract, list, validate (incl. deep content-hash verification), and modify PAK files |
@@ -104,42 +105,71 @@ there unless the public API truly needs to know about it.
 
 ## Archive Format
 
-The current format is v6:
+The current format is v7:
 
 - Header magic is `PAK0`.
-- Header version is `6`.
-- The header stores file count, file-table offset, data alignment, and reserved
-  fields.
-- Each file-table entry stores UTF-8 path, data offset, original size,
-  compressed size, flags, and a content-integrity hash (FNV-1a-64 of the
-  on-disk, post-compression/post-encryption bytes).
+- Header version is `7`.
+- The header stores file count, data alignment, the file-table offset, and the
+  name-blob offset and size.
+- The file table is an array of **fixed-size 48-byte `PakEntryRecord`s**:
+  data offset, original size, compressed size, content hash, path hash, name
+  offset, name length, and flags.
+- All entry names live together in a single contiguous **name blob** that
+  follows the record array. A record refers to its name by
+  `(nameOffset, nameLength)` into that blob.
+- Content hashes and path hashes are both XXH64. Content hashes cover the
+  on-disk, post-compression/post-encryption bytes; path hashes cover the
+  normalized name and are what `PakPathHash()` returns.
 - File data is written before the file table.
 - File data offsets are padded to `PakOptions::alignment`.
 - Bit `0x01` in entry flags means the on-disk data is LZ4-compressed. Bit
   `0x02` means Zstd-compressed. The two are mutually exclusive; helper
   `PakInternal::IsCompressed(flags)` checks either.
 
+### Why fixed-size records plus a name blob
+
+v6 stored a length-prefixed name inline with each entry, which made the table
+variable-stride: opening an archive meant reading it entry by entry and heap-
+allocating a `std::string` per file, then a second copy inside a node-based
+`unordered_map`. That cost about 218 resident bytes per entry and scaled
+badly -- a 200k-entry archive took ~200 ms to open, and a 24-layer mount ran
+to 28 seconds.
+
+The v7 split lets `PakReader::Open()` do exactly two bulk reads (records, then
+names) and use the record array as its final runtime representation. Storing
+the path hash in the record additionally means opening does no string hashing
+at all, and that layered mounts can merge namespaces without re-hashing or
+even loading names.
+
 Format invariants:
 
-- Only v6 archives are accepted. v5 (no Zstd flag bit) and v4 (no
-  `contentHash` field) are both rejected with no dual-format read path and no
-  in-place upgrade tool -- rebuild from source with the current library. This
-  is the third hard version cutover in this project's history (v3->v4,
-  v4->v5, v5->v6) -- keep following that precedent rather than introducing a
-  dual-format reader unless there's a strong reason to break it.
+- Only v7 archives are accepted. v6 (variable-length file table), v5 (no Zstd
+  flag bit) and v4 (no `contentHash` field) are all rejected with no
+  dual-format read path and no in-place upgrade tool -- rebuild from source
+  with the current library. This is the fourth hard version cutover in this
+  project's history (v3->v4, v4->v5, v5->v6, v6->v7) -- keep following that
+  precedent rather than introducing a dual-format reader unless there's a
+  strong reason to break it.
 - File names are normalized to forward slashes.
 - Empty, invalid, too-long, duplicate-after-normalization, or traversal-like
   names must be rejected.
 - Entry offsets and sizes must be validated against the archive size before
-  runtime reads. This structural check (`ValidateEntry()`) stays O(1) per
-  entry and does not read file content -- it must not become O(entry size),
-  since it runs on every open/list/extract path. Content-hash verification is
-  a separate, explicitly-invoked operation (see Integrity Verification).
+  runtime reads. This structural check stays O(1) per entry and does not read
+  file content -- it must not become O(entry size), since it runs on every
+  open/list/extract path. Content-hash verification is a separate, explicitly
+  invoked operation (see Integrity Verification).
+- Every entry's `(nameOffset, nameLength)` must lie inside the name blob. This
+  is checked against `header.nameBlobSize` so it holds whether or not the blob
+  was actually loaded.
+- Path hashes must be unique within an archive. Two entries sharing one means
+  either a duplicate path or a genuine 64-bit collision; either way the
+  archive is unusable as written and `Open()` rejects it rather than making
+  one of the two entries unreachable.
 - Alignment must be a power of two. `0` is treated as `1`.
 
 Any archive-format change must update `PakInternal::PakHeader`,
-`ReadPakHeader()`, `WritePakHeader()`, file-table I/O, validation, tests,
-README, and this handbook.
+`PakInternal::PakEntryRecord`, `ReadPakHeader()`, `WritePakHeader()`,
+file-table I/O, validation, tests, README, and this handbook.
 
 ## Runtime Read Path
 
@@ -190,7 +220,7 @@ non-mapped reads.
 
 ## Integrity Verification
 
-Every entry stores an FNV-1a-64 hash of its on-disk bytes (post-compression,
+Every entry stores an XXH64 hash of its on-disk bytes (post-compression,
 post-encryption), computed once at build time in `Pakker::CreatePak()`,
 `CreatePakFromFolder()`, and `AddFileToPak()`. Verification is layered so the
 default hot path pays nothing for it:
@@ -342,8 +372,8 @@ Keep the hot runtime path allocation-conscious:
 Keep compatibility explicit:
 
 - If a change breaks old archives, make the version boundary obvious.
-- If a change only affects v6 internals, add tests that prove old v6 behavior
-  still works.
+- If a change only affects v7 internals, add tests that prove existing v7
+  behavior still works.
 - If adding a new public API, update `src/Pak.h`, `README.MD`, examples or tests
   as appropriate.
 
