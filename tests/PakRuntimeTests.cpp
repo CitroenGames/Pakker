@@ -1,6 +1,8 @@
 #include "Pak.h"
 #include "PakInternal.h"
 #include "PakLooseOverlay.h"
+#include "PakPlatform.h"
+#include "PakCompression.h"
 
 // This suite uses assert() to both exercise (call) and verify library
 // behavior in the same expression, e.g. assert(reader.Open(path)). NDEBUG
@@ -2114,6 +2116,853 @@ static void ReadBatchIsSafeFromMultipleThreads()
 }
 
 
+// ---------------------------------------------------------------------------
+// Additional comprehensive tests
+// ---------------------------------------------------------------------------
+
+static void PakkerToolingAndExtraction()
+{
+    fs::path root = TestRoot();
+    fs::path pakPath = root / "tooling.pak";
+    fs::path extractDir = root / "extracted";
+
+    std::map<std::string, std::vector<uint8_t>> files;
+    files["plain.txt"] = Bytes("plain-text-content");
+    files["compressed/lz4.bin"] = std::vector<uint8_t>(4096, 0xAA);
+    files["nested/folder/deep.bin"] = Bytes("nested-content");
+    files["empty.bin"] = {};
+
+    PakOptions options;
+    options.compression = PakCompression::LZ4;
+
+    Pakker pakker;
+    assert(pakker.CreatePak(pakPath.string(), files, options));
+    assert(pakker.ValidatePak(pakPath.string(), /*deepVerify=*/true));
+
+    // FileExists and GetFileInfo
+    assert(pakker.FileExists(pakPath.string(), "plain.txt"));
+    assert(pakker.FileExists(pakPath.string(), "/plain.txt"));
+    assert(pakker.FileExists(pakPath.string(), "compressed\\lz4.bin"));
+    assert(!pakker.FileExists(pakPath.string(), "missing.txt"));
+
+    Pakker::FileInfo info = pakker.GetFileInfo(pakPath.string(), "plain.txt");
+    assert(info.found);
+    assert(info.filename == "plain.txt");
+    assert(info.size == files["plain.txt"].size());
+
+    Pakker::FileInfo missingInfo = pakker.GetFileInfo(pakPath.string(), "nonexistent.bin");
+    assert(!missingInfo.found);
+
+    // ReadFileFromPak
+    std::vector<uint8_t> plainRead = pakker.ReadFileFromPak(pakPath.string(), "plain.txt");
+    assert(plainRead == files["plain.txt"]);
+    std::vector<uint8_t> lz4Read = pakker.ReadFileFromPak(pakPath.string(), "compressed/lz4.bin");
+    assert(lz4Read == files["compressed/lz4.bin"]);
+    std::vector<uint8_t> emptyRead = pakker.ReadFileFromPak(pakPath.string(), "empty.bin");
+    assert(emptyRead.empty());
+    std::vector<uint8_t> missingRead = pakker.ReadFileFromPak(pakPath.string(), "not_there.bin");
+    assert(missingRead.empty());
+
+    // LoadFile
+    auto plainLoad = pakker.LoadFile(pakPath.string(), "plain.txt");
+    assert(plainLoad && *plainLoad == files["plain.txt"]);
+    auto missingLoad = pakker.LoadFile(pakPath.string(), "not_there.bin");
+    assert(missingLoad == nullptr);
+
+    // ListFiles and ListFilesWithPrefix
+    std::vector<std::string> allFiles = pakker.ListFiles(pakPath.string());
+    assert(allFiles.size() == 4);
+    std::vector<std::string> prefixed = pakker.ListFilesWithPrefix(pakPath.string(), "compressed");
+    assert(prefixed.size() == 1 && prefixed[0] == "compressed/lz4.bin");
+    std::vector<std::string> noMatch = pakker.ListFilesWithPrefix(pakPath.string(), "unknown/");
+    assert(noMatch.empty());
+
+    // ListPak
+    assert(pakker.ListPak(pakPath.string()));
+
+    // ExtractPak
+    assert(pakker.ExtractPak(pakPath.string(), extractDir.string()));
+    assert(fs::exists(extractDir / "plain.txt"));
+    assert(fs::exists(extractDir / "compressed" / "lz4.bin"));
+    assert(fs::exists(extractDir / "nested" / "folder" / "deep.bin"));
+    assert(fs::exists(extractDir / "empty.bin"));
+    assert(ReadWholeFile(extractDir / "plain.txt") == files["plain.txt"]);
+    assert(ReadWholeFile(extractDir / "compressed" / "lz4.bin") == files["compressed/lz4.bin"]);
+    assert(ReadWholeFile(extractDir / "nested" / "folder" / "deep.bin") == files["nested/folder/deep.bin"]);
+    assert(ReadWholeFile(extractDir / "empty.bin").empty());
+
+    // ExtractSingleFile
+    fs::path singleExtractPath = root / "single_extract.txt";
+    assert(pakker.ExtractSingleFile(pakPath.string(), "plain.txt", singleExtractPath.string()));
+    assert(ReadWholeFile(singleExtractPath) == files["plain.txt"]);
+
+    fs::path singleEmptyPath = root / "single_empty.bin";
+    assert(pakker.ExtractSingleFile(pakPath.string(), "empty.bin", singleEmptyPath.string()));
+    assert(fs::exists(singleEmptyPath));
+    assert(ReadWholeFile(singleEmptyPath).empty());
+
+    fs::path missingExtractPath = root / "should_not_exist.bin";
+    assert(!pakker.ExtractSingleFile(pakPath.string(), "missing.bin", missingExtractPath.string()));
+    assert(!fs::exists(missingExtractPath));
+
+    // Non-existent pak operations
+    assert(pakker.GetFileCount((root / "nonexistent.pak").string()) == 0);
+    assert(!pakker.FileExists((root / "nonexistent.pak").string(), "any.bin"));
+    assert(!pakker.ExtractPak((root / "nonexistent.pak").string(), extractDir.string()));
+    assert(!pakker.ListPak((root / "nonexistent.pak").string()));
+    assert(pakker.ListFiles((root / "nonexistent.pak").string()).empty());
+    assert(pakker.ReadFileFromPak((root / "nonexistent.pak").string(), "any.bin").empty());
+}
+
+static void PakkerEncryptedWorkflow()
+{
+    fs::path root = TestRoot();
+    fs::path pakPath = root / "encrypted_workflow.pak";
+    fs::path extractDir = root / "enc_extracted";
+    const std::string key = "super-secret-passphrase";
+    const std::string wrongKey = "wrong-passphrase";
+
+    std::map<std::string, std::vector<uint8_t>> files;
+    files["secret.txt"] = Bytes("classified information");
+    files["data.bin"] = std::vector<uint8_t>(2048, 0x5A);
+
+    PakOptions options;
+    options.compression = PakCompression::LZ4;
+    Pakker pakker(key);
+    assert(pakker.CreatePak(pakPath.string(), files, options));
+
+    // AddFileToPak to encrypted archive
+    std::vector<uint8_t> addedData = Bytes("appended encrypted content");
+    assert(pakker.AddFileToPak(pakPath.string(), "added.txt", addedData));
+
+    // Verify ReadFileFromPak with correct key
+    assert(pakker.ReadFileFromPak(pakPath.string(), "secret.txt") == files["secret.txt"]);
+    assert(pakker.ReadFileFromPak(pakPath.string(), "added.txt") == addedData);
+
+    // Verify ExtractPak with correct key
+    assert(pakker.ExtractPak(pakPath.string(), extractDir.string()));
+    assert(ReadWholeFile(extractDir / "secret.txt") == files["secret.txt"]);
+    assert(ReadWholeFile(extractDir / "added.txt") == addedData);
+
+    // PakReader with correct key
+    PakReader correctReader(key);
+    assert(correctReader.Open(pakPath.string()));
+    assert(correctReader.ReadFile("secret.txt") == files["secret.txt"]);
+    assert(correctReader.ReadFile("added.txt") == addedData);
+
+    // PakReader with wrong key fails to decompress compressed payload
+    PakReader wrongReader(wrongKey);
+    assert(wrongReader.Open(pakPath.string()));
+    PakFileHandle dataHandle = wrongReader.Find("data.bin");
+    assert(dataHandle);
+    std::vector<uint8_t> wrongLoaded;
+    PakStatus status = wrongReader.Load(dataHandle, wrongLoaded);
+    assert(status == PakStatus::DecompressionFailed);
+
+    // Mount with encrypted archive
+    PakMount mount;
+    assert(mount.Mount(pakPath.string(), key));
+    assert(mount.ReadFile("secret.txt") == files["secret.txt"]);
+    assert(mount.ReadFile("added.txt") == addedData);
+}
+
+static void PakkerValidationAndErrorHandling()
+{
+    fs::path root = TestRoot();
+    Pakker pakker;
+
+    // Invalid alignment (must be power of 2)
+    {
+        fs::path pakPath = root / "bad_align.pak";
+        std::map<std::string, std::vector<uint8_t>> files;
+        files["test.txt"] = Bytes("abc");
+        PakOptions options;
+        options.alignment = 3;
+        assert(!pakker.CreatePak(pakPath.string(), files, options));
+    }
+
+    // Invalid chunk size (not power of 2, too small, too large)
+    {
+        fs::path pakPath = root / "bad_chunk.pak";
+        std::map<std::string, std::vector<uint8_t>> files;
+        files["test.txt"] = Bytes("abc");
+        PakOptions options;
+        options.compression = PakCompression::LZ4;
+
+        options.compressionChunkSize = 3000;
+        assert(!pakker.CreatePak(pakPath.string(), files, options));
+
+        options.compressionChunkSize = 2048;
+        assert(!pakker.CreatePak(pakPath.string(), files, options));
+
+        options.compressionChunkSize = 32u * 1024 * 1024;
+        assert(!pakker.CreatePak(pakPath.string(), files, options));
+    }
+
+    // Duplicate normalized names in CreatePak
+    {
+        fs::path pakPath = root / "dup_names.pak";
+        std::map<std::string, std::vector<uint8_t>> files;
+        files["folder/file.txt"] = Bytes("one");
+        files["folder\\file.txt"] = Bytes("two");
+        PakOptions options;
+        assert(!pakker.CreatePak(pakPath.string(), files, options));
+    }
+
+    // Invalid filenames
+    {
+        const std::string badNames[] = {
+            "has<angle.bin", "has>angle.bin", "has:colon.bin", "has\"quote.bin",
+            "has|pipe.bin", "has?question.bin", "has*star.bin", "path/../traversal.bin",
+            "", std::string("has\0null.bin", 12)
+        };
+        for (const auto& badName : badNames) {
+            fs::path pakPath = root / "invalid_name.pak";
+            std::map<std::string, std::vector<uint8_t>> files;
+            files[badName] = Bytes("data");
+            PakOptions options;
+            assert(!pakker.CreatePak(pakPath.string(), files, options));
+        }
+    }
+
+    // AddFileToPak duplicate and error checks
+    {
+        fs::path pakPath = root / "add_dup.pak";
+        std::map<std::string, std::vector<uint8_t>> files;
+        files["original.txt"] = Bytes("hello");
+        PakOptions options;
+        assert(pakker.CreatePak(pakPath.string(), files, options));
+
+        assert(!pakker.AddFileToPak(pakPath.string(), "original.txt", Bytes("duplicate")));
+        assert(!pakker.AddFileToPak(pakPath.string(), "bad:name.txt", Bytes("bad")));
+        assert(!pakker.AddFileToPak((root / "missing.pak").string(), "new.txt", Bytes("new")));
+    }
+
+    // Corrupt header magic
+    {
+        fs::path pakPath = root / "corrupt_magic.pak";
+        std::map<std::string, std::vector<uint8_t>> files;
+        files["file.bin"] = Bytes("content");
+        PakOptions options;
+        assert(pakker.CreatePak(pakPath.string(), files, options));
+
+        std::fstream stream(pakPath, std::ios::in | std::ios::out | std::ios::binary);
+        assert(stream);
+        char badMagic[4] = {'B', 'A', 'D', '0'};
+        stream.write(badMagic, 4);
+        stream.close();
+
+        assert(!pakker.ValidatePak(pakPath.string()));
+        PakReader reader;
+        assert(!reader.Open(pakPath.string()));
+    }
+}
+
+static void PakReaderComprehensiveApi()
+{
+    fs::path root = TestRoot();
+    fs::path pakPath = root / "reader_api.pak";
+
+    std::map<std::string, std::vector<uint8_t>> files;
+    files["assets/texture.bin"] = std::vector<uint8_t>(2048, 0x11);
+    files["scripts/init.lua"] = Bytes("print('hello')");
+    files["empty.dat"] = {};
+
+    PakOptions options;
+    options.compression = PakCompression::LZ4;
+
+    Pakker pakker;
+    assert(pakker.CreatePak(pakPath.string(), files, options));
+
+    PakReader reader;
+    assert(!reader.IsOpen());
+    assert(reader.GetFileCount() == 0);
+    assert(reader.InfoByIndex(0) == nullptr);
+    assert(reader.Prefetch(PakFileHandle{0}) == PakStatus::NotOpen);
+
+    assert(reader.Open(pakPath.string()));
+    assert(reader.IsOpen());
+    assert(reader.GetFileCount() == 3);
+
+    // InfoByIndex
+    for (uint32_t i = 0; i < reader.GetFileCount(); ++i) {
+        const PakFileInfo* info = reader.InfoByIndex(i);
+        assert(info != nullptr);
+        assert(!info->filename.empty());
+        assert(info->pathHash == PakPathHash(info->filename));
+    }
+    assert(reader.InfoByIndex(3) == nullptr);
+    assert(reader.InfoByIndex(9999) == nullptr);
+
+    // GetFileInfo
+    PakReader::FileInfo texInfo = reader.GetFileInfo("assets/texture.bin");
+    assert(texInfo.found);
+    assert(texInfo.filename == "assets/texture.bin");
+    assert(texInfo.originalSize == 2048);
+    assert(texInfo.compressed);
+
+    PakReader::FileInfo emptyInfo = reader.GetFileInfo("empty.dat");
+    assert(emptyInfo.found);
+    assert(emptyInfo.originalSize == 0);
+
+    PakReader::FileInfo notFoundInfo = reader.GetFileInfo("missing.dat");
+    assert(!notFoundInfo.found);
+
+    // ReadFile
+    std::vector<uint8_t> scriptData = reader.ReadFile("scripts/init.lua");
+    assert(scriptData == files["scripts/init.lua"]);
+    std::vector<uint8_t> missingData = reader.ReadFile("nonexistent.dat");
+    assert(missingData.empty());
+
+    // LoadFile
+    auto scriptLoad = reader.LoadFile("scripts/init.lua");
+    assert(scriptLoad && *scriptLoad == files["scripts/init.lua"]);
+    auto missingLoad = reader.LoadFile("nonexistent.dat");
+    assert(missingLoad == nullptr);
+
+    // ReadFiles batch convenience wrapper
+    std::vector<std::string> batchNames = {
+        "assets/texture.bin",
+        "scripts/init.lua",
+        "missing.dat",
+        "empty.dat"
+    };
+    auto batchResults = reader.ReadFiles(batchNames);
+    assert(batchResults.size() == 4);
+    assert(batchResults[0].first == "assets/texture.bin" && batchResults[0].second == files["assets/texture.bin"]);
+    assert(batchResults[1].first == "scripts/init.lua" && batchResults[1].second == files["scripts/init.lua"]);
+    assert(batchResults[2].first == "missing.dat" && batchResults[2].second.empty());
+    assert(batchResults[3].first == "empty.dat" && batchResults[3].second.empty());
+
+    // Prefetch
+    assert(reader.Prefetch(reader.Find("assets/texture.bin")) == PakStatus::Ok);
+    assert(reader.Prefetch(reader.Find("empty.dat")) == PakStatus::Ok);
+    assert(reader.Prefetch(PakFileHandle{}) == PakStatus::InvalidHandle);
+    assert(reader.Prefetch(PakFileHandle{999}) == PakStatus::InvalidHandle);
+
+    // Move constructor
+    PakReader movedReader(std::move(reader));
+    assert(!reader.IsOpen());
+    assert(movedReader.IsOpen());
+    assert(movedReader.GetFileCount() == 3);
+    assert(movedReader.ReadFile("scripts/init.lua") == files["scripts/init.lua"]);
+
+    // Move assignment
+    PakReader assignedReader;
+    assignedReader = std::move(movedReader);
+    assert(!movedReader.IsOpen());
+    assert(assignedReader.IsOpen());
+    assert(assignedReader.GetFileCount() == 3);
+    assert(assignedReader.ReadFile("scripts/init.lua") == files["scripts/init.lua"]);
+
+    assignedReader.Close();
+    assert(!assignedReader.IsOpen());
+    assert(assignedReader.GetFileCount() == 0);
+}
+
+static void PakReaderCacheManagement()
+{
+    fs::path root = TestRoot();
+    fs::path pakPath = root / "cache_mgmt.pak";
+
+    std::map<std::string, std::vector<uint8_t>> files;
+    files["c1.bin"] = std::vector<uint8_t>(4096, 1);
+    files["c2.bin"] = std::vector<uint8_t>(4096, 2);
+
+    PakOptions pakOptions;
+    pakOptions.compression = PakCompression::LZ4;
+    Pakker pakker;
+    assert(pakker.CreatePak(pakPath.string(), files, pakOptions));
+
+    PakCacheOptions options = TestCacheOptions(root);
+    options.memoryBudgetBytes = 16 * 1024 * 1024;
+    options.persistentBudgetBytes = 32 * 1024 * 1024;
+
+    PakReader reader;
+    reader.SetCacheOptions(options);
+
+    PakCacheOptions retrieved = reader.GetCacheOptions();
+    assert(retrieved.memoryBudgetBytes == options.memoryBudgetBytes);
+    assert(retrieved.persistentBudgetBytes == options.persistentBudgetBytes);
+    assert(retrieved.persistentCacheDirectory == options.persistentCacheDirectory);
+
+    assert(reader.Open(pakPath.string()));
+    assert(reader.ReadFile("c1.bin") == files["c1.bin"]);
+    assert(reader.ReadFile("c2.bin") == files["c2.bin"]);
+
+    // ClearPersistentCache and ClearCache
+    assert(reader.ClearPersistentCache());
+    assert(reader.ClearCache());
+    assert(reader.GetCacheStats().memoryBytes == 0);
+
+    // ReadBatch with PakBatchOptions (prefetch = false and prefetch = true)
+    PakBatchOptions noPrefetch;
+    noPrefetch.prefetch = false;
+
+    std::vector<uint8_t> buf1(files["c1.bin"].size());
+    std::vector<uint8_t> buf2(files["c2.bin"].size());
+    std::vector<PakReadRequest> requests(2);
+    requests[0].handle = reader.Find("c1.bin");
+    requests[0].destination = buf1;
+    requests[1].handle = reader.Find("c2.bin");
+    requests[1].destination = buf2;
+
+    assert(reader.ReadBatch(requests, noPrefetch) == 2);
+    assert(requests[0].status == PakStatus::Ok && buf1 == files["c1.bin"]);
+    assert(requests[1].status == PakStatus::Ok && buf2 == files["c2.bin"]);
+}
+
+static void PakMountComprehensiveApi()
+{
+    fs::path root = TestRoot();
+    fs::path basePak = root / "mount_api_base.pak";
+    fs::path patchPak = root / "mount_api_patch.pak";
+
+    std::map<std::string, std::vector<uint8_t>> baseFiles;
+    baseFiles["raw.txt"] = Bytes("base-raw-text");
+    baseFiles["shader.bin"] = std::vector<uint8_t>(1024, 0x11);
+    baseFiles["override.txt"] = Bytes("base-override");
+
+    std::map<std::string, std::vector<uint8_t>> patchFiles;
+    patchFiles["override.txt"] = Bytes("patch-override");
+    patchFiles["new.txt"] = Bytes("patch-new");
+
+    PakOptions options;
+    Pakker pakker;
+    assert(pakker.CreatePak(basePak.string(), baseFiles, options));
+    assert(pakker.CreatePak(patchPak.string(), patchFiles, options));
+
+    PakMount mount;
+    assert(mount.Mount(basePak.string()));
+    assert(mount.Mount(patchPak.string()));
+    assert(mount.LayerCount() == 2);
+    assert(mount.GetFileCount() == 4);
+
+    // Find and Info
+    PakMountHandle overrideHandle = mount.Find("override.txt");
+    assert(overrideHandle);
+    assert(overrideHandle.layerIndex == 1);
+    const PakFileInfo* info = mount.Info(overrideHandle);
+    assert(info != nullptr);
+    assert(info->filename == "override.txt");
+    assert(info->originalSize == patchFiles["override.txt"].size());
+
+    // Resolve
+    std::string_view lookupNames[] = {"raw.txt", "missing.bin", "override.txt", "new.txt"};
+    PakMountHandle handles[4];
+    assert(mount.Resolve(lookupNames, handles) == 3);
+    assert(handles[0] && handles[0].layerIndex == 0);
+    assert(!handles[1]);
+    assert(handles[2] && handles[2].layerIndex == 1);
+    assert(handles[3] && handles[3].layerIndex == 1);
+
+    // View
+    PakView view;
+    PakMountHandle rawHandle = mount.Find("raw.txt");
+    assert(rawHandle);
+    PakStatus viewStatus = mount.View(rawHandle, view);
+    if (viewStatus == PakStatus::Ok) {
+        assert(view.mapped);
+        assert(view.size == baseFiles["raw.txt"].size());
+        assert(std::string_view(reinterpret_cast<const char*>(view.data), static_cast<size_t>(view.size)) == "base-raw-text");
+    }
+
+    // Read with buffer size checking
+    std::vector<uint8_t> tooSmall(2);
+    uint64_t written = 999;
+    assert(mount.Read(rawHandle, tooSmall, &written) == PakStatus::BufferTooSmall);
+    assert(written == 0);
+
+    std::vector<uint8_t> exact(baseFiles["raw.txt"].size());
+    assert(mount.Read(rawHandle, exact, &written) == PakStatus::Ok);
+    assert(written == baseFiles["raw.txt"].size());
+    assert(exact == baseFiles["raw.txt"]);
+
+    // Read with invalid handle
+    assert(mount.Read(PakMountHandle{}, exact) == PakStatus::InvalidHandle);
+    assert(mount.View(PakMountHandle{}, view) == PakStatus::InvalidHandle);
+    assert(mount.Load(PakMountHandle{}, exact) == PakStatus::InvalidHandle);
+    assert(mount.Prefetch(PakMountHandle{}) == PakStatus::InvalidHandle);
+
+    // Prefetch
+    assert(mount.Prefetch(rawHandle) == PakStatus::Ok);
+
+    // ReadFile and LoadFile
+    assert(mount.ReadFile("override.txt") == patchFiles["override.txt"]);
+    assert(mount.ReadFile("raw.txt") == baseFiles["raw.txt"]);
+    assert(mount.ReadFile("missing.txt").empty());
+
+    auto loaded = mount.LoadFile("override.txt");
+    assert(loaded && *loaded == patchFiles["override.txt"]);
+    assert(mount.LoadFile("missing.txt") == nullptr);
+
+    // ReadFileZeroCopy
+    PakSpan span = mount.ReadFileZeroCopy("raw.txt");
+    assert(span);
+    assert(span.size == baseFiles["raw.txt"].size());
+    assert(std::string_view(reinterpret_cast<const char*>(span.data), static_cast<size_t>(span.size)) == "base-raw-text");
+    assert(!mount.ReadFileZeroCopy("missing.txt"));
+
+    // Move constructor
+    PakMount movedMount(std::move(mount));
+    assert(mount.LayerCount() == 0);
+    assert(movedMount.LayerCount() == 2);
+    assert(movedMount.ReadFile("override.txt") == patchFiles["override.txt"]);
+
+    // Move assignment
+    PakMount assignedMount;
+    assignedMount = std::move(movedMount);
+    assert(movedMount.LayerCount() == 0);
+    assert(assignedMount.LayerCount() == 2);
+    assert(assignedMount.ReadFile("override.txt") == patchFiles["override.txt"]);
+}
+
+static void PakLooseOverlayComprehensiveApi()
+{
+    fs::path root = TestRoot();
+    fs::path pakPath = root / "loose_api.pak";
+    fs::path looseDir = root / "loose_api_dir";
+    fs::create_directories(looseDir / "sub");
+
+    std::map<std::string, std::vector<uint8_t>> files;
+    files["archive_file.txt"] = Bytes("from-archive");
+    files["shared.txt"] = Bytes("archive-version");
+
+    PakOptions options;
+    Pakker pakker;
+    assert(pakker.CreatePak(pakPath.string(), files, options));
+
+    // Create loose files
+    std::ofstream f1(looseDir / "shared.txt", std::ios::binary);
+    f1 << "loose-version";
+    f1.close();
+
+    std::ofstream f2(looseDir / "sub" / "empty_loose.bin", std::ios::binary);
+    f2.close();
+
+    auto reader = std::make_shared<PakReader>();
+    assert(reader->Open(pakPath.string()));
+
+    PakLooseOverlay overlay(reader, looseDir.string());
+    assert(overlay.WrappedReader() == reader);
+    assert(overlay.LooseDirectory() == looseDir.string());
+
+    // FileExists
+    assert(overlay.FileExists("shared.txt"));
+    assert(overlay.FileExists("sub/empty_loose.bin"));
+    assert(overlay.FileExists("archive_file.txt"));
+    assert(!overlay.FileExists("nowhere.txt"));
+
+    // Read: loose file
+    std::vector<uint8_t> buf(32);
+    uint64_t written = 0;
+    assert(overlay.Read("shared.txt", buf, &written) == PakStatus::Ok);
+    assert(written == 13);
+    assert(std::string_view(reinterpret_cast<const char*>(buf.data()), static_cast<size_t>(written)) == "loose-version");
+
+    // Read: buffer too small
+    std::vector<uint8_t> tiny(4);
+    assert(overlay.Read("shared.txt", tiny, &written) == PakStatus::BufferTooSmall);
+
+    // Read: archive fallback
+    buf.assign(32, 0);
+    assert(overlay.Read("archive_file.txt", buf, &written) == PakStatus::Ok);
+    assert(written == 12);
+    assert(std::string_view(reinterpret_cast<const char*>(buf.data()), static_cast<size_t>(written)) == "from-archive");
+
+    // Read: empty loose file
+    written = 999;
+    assert(overlay.Read("sub/empty_loose.bin", buf, &written) == PakStatus::Ok);
+    assert(written == 0);
+
+    // Load: empty loose file
+    std::vector<uint8_t> loadedData;
+    assert(overlay.Load("sub/empty_loose.bin", loadedData) == PakStatus::Ok);
+    assert(loadedData.empty());
+
+    // Read: non-existent file
+    assert(overlay.Read("nowhere.txt", buf) == PakStatus::NotFound);
+    assert(overlay.Load("nowhere.txt", loadedData) == PakStatus::NotFound);
+
+    // Overlay with null reader
+    PakLooseOverlay nullReaderOverlay(nullptr, looseDir.string());
+    assert(nullReaderOverlay.FileExists("shared.txt"));
+    assert(!nullReaderOverlay.FileExists("archive_file.txt"));
+    assert(nullReaderOverlay.Load("archive_file.txt", loadedData) == PakStatus::NotFound);
+    assert(nullReaderOverlay.Load("shared.txt", loadedData) == PakStatus::Ok);
+    assert(loadedData == Bytes("loose-version"));
+}
+
+static void PakPlatformDirectTests()
+{
+    fs::path root = TestRoot();
+    fs::path filePath = root / "platform_test.bin";
+
+    std::vector<uint8_t> testBytes(8192);
+    for (size_t i = 0; i < testBytes.size(); ++i) {
+        testBytes[i] = static_cast<uint8_t>(i % 251);
+    }
+    {
+        std::ofstream out(filePath, std::ios::binary);
+        out.write(reinterpret_cast<const char*>(testBytes.data()), static_cast<std::streamsize>(testBytes.size()));
+    }
+
+    // Default cache directory
+    std::string cacheDir = PakPlatform::GetDefaultCacheDirectory();
+#if defined(_WIN32)
+    assert(!cacheDir.empty());
+    assert(cacheDir.find("Pakker") != std::string::npos);
+#endif
+
+    // MapFileReadOnly
+    PakPlatform::MappedFile mf = PakPlatform::MapFileReadOnly(filePath.string().c_str());
+#ifndef PAK_NO_MMAP
+    assert(mf.data != nullptr);
+    assert(mf.size == testBytes.size());
+    assert(std::memcmp(mf.data, testBytes.data(), testBytes.size()) == 0);
+
+    // PrefetchMappedRange
+    assert(PakPlatform::PrefetchMappedRange(mf, 0, 4096));
+    assert(PakPlatform::PrefetchMappedRange(mf, 4096, 4096));
+    assert(PakPlatform::PrefetchMappedRange(mf, 0, 0));
+    assert(!PakPlatform::PrefetchMappedRange(mf, 9000, 100));
+
+    // PrefetchMappedRanges
+    PakPlatform::PrefetchRange ranges[] = {
+        {0, 1024},
+        {2048, 1024},
+        {4096, 1024}
+    };
+    assert(PakPlatform::PrefetchMappedRanges(mf, ranges, 3));
+    assert(PakPlatform::PrefetchMappedRanges(mf, nullptr, 0));
+
+    // Unmap
+    PakPlatform::UnmapFile(mf);
+    assert(mf.data == nullptr);
+    assert(mf.size == 0);
+#endif
+
+    // MapFileReadOnly on non-existent file
+    PakPlatform::MappedFile badMf = PakPlatform::MapFileReadOnly((root / "nonexistent.bin").string().c_str());
+    assert(badMf.data == nullptr);
+    assert(badMf.size == 0);
+
+    // MapFileReadOnly on 0-byte file
+    fs::path emptyPath = root / "empty_file.bin";
+    {
+        std::ofstream out(emptyPath, std::ios::binary);
+    }
+    PakPlatform::MappedFile emptyMf = PakPlatform::MapFileReadOnly(emptyPath.string().c_str());
+    assert(emptyMf.data == nullptr);
+    assert(emptyMf.size == 0);
+
+    // PrefetchFileRange
+    assert(PakPlatform::PrefetchFileRange(filePath.string().c_str(), 0, 4096));
+    assert(PakPlatform::PrefetchFileRange(nullptr, 0, 0));
+}
+
+static void LoggingAndDiagnostics()
+{
+    assert(std::string_view(PakStatusToString(PakStatus::Ok)) == "Ok");
+    assert(std::string_view(PakStatusToString(PakStatus::NotOpen)) == "NotOpen");
+    assert(std::string_view(PakStatusToString(PakStatus::NotFound)) == "NotFound");
+    assert(std::string_view(PakStatusToString(PakStatus::InvalidHandle)) == "InvalidHandle");
+    assert(std::string_view(PakStatusToString(PakStatus::InvalidArgument)) == "InvalidArgument");
+    assert(std::string_view(PakStatusToString(PakStatus::BufferTooSmall)) == "BufferTooSmall");
+    assert(std::string_view(PakStatusToString(PakStatus::Unsupported)) == "Unsupported");
+    assert(std::string_view(PakStatusToString(PakStatus::CorruptArchive)) == "CorruptArchive");
+    assert(std::string_view(PakStatusToString(PakStatus::IoError)) == "IoError");
+    assert(std::string_view(PakStatusToString(PakStatus::DecompressionFailed)) == "DecompressionFailed");
+    assert(std::string_view(PakStatusToString(PakStatus::HashMismatch)) == "HashMismatch");
+    assert(std::string_view(PakStatusToString(static_cast<PakStatus>(9999))) == "Unknown");
+
+    static std::atomic<int> logCount{0};
+    static std::atomic<PakLogLevel> lastLevel{PakLogLevel::Info};
+    auto callback = [](PakLogLevel level, const char* msg) {
+        (void)msg;
+        lastLevel.store(level);
+        logCount.fetch_add(1);
+    };
+
+    PakSetLogCallback(callback);
+
+    PakInternal::Log(PakLogLevel::Warning, "Test warning log");
+    assert(logCount.load() >= 1);
+    assert(lastLevel.load() == PakLogLevel::Warning);
+
+    PakInternal::Log(PakLogLevel::Error, "Test error log");
+    assert(lastLevel.load() == PakLogLevel::Error);
+
+    PakSetLogCallback(nullptr);
+    const int countAfterReset = logCount.load();
+    PakInternal::Log(PakLogLevel::Error, "Should not increment counter");
+    assert(logCount.load() == countAfterReset);
+}
+
+static void InternalUtilitiesRobustness()
+{
+    using namespace PakInternal;
+
+    // NormalizePathSeparators
+    assert(NormalizePathSeparators("") == "");
+    assert(NormalizePathSeparators("///") == "");
+    assert(NormalizePathSeparators("\\\\\\") == "");
+    assert(NormalizePathSeparators("/dir/file.txt") == "dir/file.txt");
+    assert(NormalizePathSeparators("///dir/sub/file.txt") == "dir/sub/file.txt");
+    assert(NormalizePathSeparators("dir\\sub\\file.txt") == "dir/sub/file.txt");
+    assert(NormalizePathSeparators("\\\\dir\\sub\\file.txt") == "dir/sub/file.txt");
+
+    // IsValidFilename
+    assert(!IsValidFilename(""));
+    assert(!IsValidFilename(".."));
+    assert(!IsValidFilename("../test.txt"));
+    assert(!IsValidFilename("test/../test.txt"));
+    assert(!IsValidFilename("bad:name"));
+    assert(!IsValidFilename("bad*name"));
+    assert(!IsValidFilename("bad?name"));
+    assert(!IsValidFilename("bad\"name"));
+    assert(!IsValidFilename("bad<name"));
+    assert(!IsValidFilename("bad>name"));
+    assert(!IsValidFilename("bad|name"));
+    assert(!IsValidFilename(std::string("null\0byte", 9)));
+    assert(!IsValidFilename(std::string(MAX_FILENAME_LENGTH + 1, 'a')));
+    assert(IsValidFilename("valid_file-123.dat"));
+    assert(IsValidFilename("folder/subfolder/file.ext"));
+    assert(IsValidFilename(".dotfile"));
+    assert(IsValidFilename("name.with.many.dots.txt"));
+
+    // ValidateEntry
+    PakEntry validEntry("valid.txt", 100, 50, 50);
+    assert(ValidateEntry(validEntry, 1000));
+
+    // Entry offset beyond file size
+    PakEntry outOfBoundsOffset("valid.txt", 1001, 50, 50);
+    assert(!ValidateEntry(outOfBoundsOffset, 1000));
+
+    // Disk size beyond file size
+    PakEntry outOfBoundsSize("valid.txt", 100, 1500, 1500);
+    assert(!ValidateEntry(outOfBoundsSize, 1000));
+
+    // Offset + disk size exceeds file size
+    PakEntry exceedsSum("valid.txt", 800, 300, 300);
+    assert(!ValidateEntry(exceedsSum, 1000));
+
+    // Integer overflow in offset + diskSize
+    PakEntry overflowEntry("valid.txt", UINT64_MAX - 10, 50, 50);
+    assert(!ValidateEntry(overflowEntry, 1000));
+
+    // Invalid filename in entry
+    PakEntry badFilenameEntry("invalid:name.txt", 100, 50, 50);
+    assert(!ValidateEntry(badFilenameEntry, 1000));
+
+    // DecompressBuffer error paths and uncompressed defensive fallback
+    std::vector<uint8_t> bogusData = {0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03, 0x04};
+    std::vector<uint8_t> decompressed(64);
+    assert(DecompressBuffer(PAK_FLAG_LZ4_COMPRESSED, bogusData.data(), bogusData.size(),
+                            decompressed.data(), decompressed.size()) == PakStatus::DecompressionFailed);
+    assert(DecompressBuffer(PAK_FLAG_ZSTD_COMPRESSED, bogusData.data(), bogusData.size(),
+                            decompressed.data(), decompressed.size()) == PakStatus::DecompressionFailed);
+    // flags == 0 with mismatched sizes returns CorruptArchive
+    assert(DecompressBuffer(0, bogusData.data(), bogusData.size(),
+                            decompressed.data(), decompressed.size()) == PakStatus::CorruptArchive);
+    // flags == 0 with matching sizes acts as a raw copy
+    std::vector<uint8_t> rawCopied(bogusData.size());
+    assert(DecompressBuffer(0, bogusData.data(), bogusData.size(),
+                            rawCopied.data(), rawCopied.size()) == PakStatus::Ok);
+    assert(rawCopied == bogusData);
+    // Size exceeding MAX_COMPRESSIBLE_ENTRY_SIZE returns CorruptArchive
+    assert(DecompressBuffer(0, bogusData.data(), MAX_COMPRESSIBLE_ENTRY_SIZE + 1,
+                            rawCopied.data(), rawCopied.size()) == PakStatus::CorruptArchive);
+
+    // EncryptDecrypt corner cases
+    std::vector<uint8_t> data = Bytes("quick brown fox");
+    std::vector<uint8_t> copy = data;
+    EncryptDecrypt(copy, "");
+    assert(copy == data);
+
+    std::vector<uint8_t> emptyVec;
+    EncryptDecrypt(emptyVec, "key");
+    assert(emptyVec.empty());
+
+    EncryptDecrypt(copy, "k");
+    assert(copy != data);
+    EncryptDecrypt(copy, "k");
+    assert(copy == data);
+
+    EncryptDecrypt(copy, "long-key-longer-than-data-itself-1234567890");
+    assert(copy != data);
+    EncryptDecrypt(copy, "long-key-longer-than-data-itself-1234567890");
+    assert(copy == data);
+
+    // HashBytesFast
+    assert(HashBytesFast(nullptr, 0) == HashBytesFast("", 0));
+    assert(HashBytesFast("abc", 3) == HashBytesFast("abc", 3));
+    assert(HashBytesFast("abc", 3) != HashBytesFast("abd", 3));
+}
+
+static void PakSpanMoveAndLifetimeTests()
+{
+    fs::path root = TestRoot();
+    fs::path pakPath = root / "span_move.pak";
+
+    std::map<std::string, std::vector<uint8_t>> files;
+    files["raw.bin"] = Bytes("span-move-raw-content");
+    files["compressed.bin"] = std::vector<uint8_t>(4096, 0x33);
+
+    PakOptions options;
+    options.compression = PakCompression::LZ4;
+    Pakker pakker;
+    assert(pakker.CreatePak(pakPath.string(), files, options));
+
+    PakReader reader;
+    assert(reader.Open(pakPath.string()));
+
+    // Non-owning span move
+    {
+        PakSpan span1 = reader.ReadFileZeroCopy("raw.bin");
+        assert(span1);
+        const uint8_t* origData = span1.data;
+        const uint64_t origSize = span1.size;
+
+        PakSpan span2(std::move(span1));
+        assert(!span1);
+        assert(span2);
+        assert(span2.data == origData);
+        assert(span2.size == origSize);
+
+        PakSpan span3;
+        span3 = std::move(span2);
+        assert(!span2);
+        assert(span3);
+        assert(span3.data == origData);
+        assert(span3.size == origSize);
+    }
+
+    // Owning span move
+    {
+        PakSpan span1 = reader.ReadFileZeroCopy("compressed.bin");
+        assert(span1);
+        assert(span1.ownsData);
+        const uint8_t* origData = span1.data;
+        const uint64_t origSize = span1.size;
+
+        PakSpan span2(std::move(span1));
+        assert(!span1);
+        assert(span2);
+        assert(span2.data == origData);
+        assert(span2.size == origSize);
+        assert(span2.ownsData);
+
+        PakSpan span3;
+        span3 = std::move(span2);
+        assert(!span2);
+        assert(span3);
+        assert(span3.data == origData);
+        assert(span3.ownsData);
+    }
+}
+
+
 int main()
 {
     RuntimeHandleApi();
@@ -2171,5 +3020,16 @@ int main()
     ReadBatchMatchesIndividualReads();
     ReadBatchReportsPerRequestFailures();
     ReadBatchIsSafeFromMultipleThreads();
+    PakkerToolingAndExtraction();
+    PakkerEncryptedWorkflow();
+    PakkerValidationAndErrorHandling();
+    PakReaderComprehensiveApi();
+    PakReaderCacheManagement();
+    PakMountComprehensiveApi();
+    PakLooseOverlayComprehensiveApi();
+    PakPlatformDirectTests();
+    LoggingAndDiagnostics();
+    InternalUtilitiesRobustness();
+    PakSpanMoveAndLifetimeTests();
     return 0;
 }
