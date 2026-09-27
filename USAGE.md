@@ -5,30 +5,7 @@ streaming and caching, integrating Pakker with an engine, and the complete
 public API. For the project overview and current benchmark results, see the
 [README](README.MD).
 
-## Features
-
-- **Memory-mapped I/O** -- maps the entire PAK into the address space; the OS handles caching, prefetching, and page management
-- **Zero-copy mapped views** (`PakView`) -- returns a direct pointer into mapped memory for uncompressed assets, eliminating heap allocation entirely
-- **Handle-based runtime API** -- resolve paths once with `Find()`/`Resolve()`, cache `PakFileHandle`, then read without repeated path normalization or lookup allocation
-- **Caller-owned reads** -- `Read(handle, span)` fills engine-owned buffers and reports precise `PakStatus` errors
-- **Page-aligned data** (v8 format) -- file data aligned to configurable boundaries (16 B, 4 KB, 64 KB) for efficient page faults and GPU upload
-- **Per-entry content integrity hashing** -- XXH64 checksum of each entry's on-disk bytes, with opt-in deep verification (`ValidatePak(deepVerify)`, `PakReader::VerifyEntry()`, `PakOpenOptions::verifyOnRead`) to catch corrupted or tampered archives before they reach the engine
-- **Layered archives** (`PakMount`) -- mount a base archive plus patch/DLC/language archives with override semantics, resolved through one composed namespace
-- **Loose-file hot-reload override** (`PakLooseOverlay`) -- dev-only wrapper that serves an edited-on-disk asset over the archive's copy, for iteration without repacking
-- **Lock-free read path** -- reads reach an immutable published snapshot through a single atomic load, taking no lock and no reference count, so lookup and read throughput scale with worker-thread count
-- **Hybrid decoded caching** -- OS page cache/mmap remains the fast path, with default in-memory and persistent decoded caches for compressed, encrypted, and non-mmap reads
-- **O(1) file lookup** via a flat open-addressing index built over stored path hashes -- no per-entry allocation, no string hashing at open
-- **LZ4 or Zstd per-file compression** -- LZ4 for latency-sensitive hot-reload style reads (~4 GB/s decode), Zstd for a better ratio at similar decode cost; selected per-file, both pluggable side by side in the same archive
-- **Partial/streaming reads** (`PakReader::ReadRange`) -- read a slice of a large asset without materializing the whole entry; works on compressed entries too when built with chunking
-- **Chunked compression** -- split compressed entries into independently-decodable blocks, bounding time-to-first-byte on a large asset to one block instead of the whole file
-- **Parallel packing** -- entry compression, encryption and hashing fan out across worker threads while output stays byte-identical and deterministically ordered
-- **Scatter reads** (`PakReader::ReadBatch`) -- serve a whole set of reads in archive-offset order with batched prefetch hints, instead of one call per asset
-- **Hash-keyed lookups** (`PakPathHash`, `FindByHash`) -- carry baked 64-bit asset ids instead of path strings, and optionally drop the name blob entirely in shipping builds
-- **Silent by default** -- no console output unless you set a log callback
-- **Optional XOR encryption** -- disabled by default for best performance; this is lightweight obfuscation, not a security boundary -- see Encryption below
-- **No external dependencies** -- LZ4 and Zstd are vendored, only needs C++20 and a C compiler
-
-## Dependencies
+## Requirements
 
 - C++20 compatible compiler
 - CMake 3.10+
@@ -480,7 +457,7 @@ void AssetStreamWorker(PakReader& reader, AssetQueue& queue) {
 | `View(handle, view)` | Zero-copy mapped view for uncompressed, unencrypted data; never content-hash verified, even under `verifyOnRead` |
 | `Read(handle, span)` | Fill caller-owned memory, returns `PakStatus` |
 | `Load(handle, vector)` | Allocating convenience read into a vector |
-| `ReadRange(handle, rangeOffset, span)` | Partial read of an uncompressed entry's decoded content; `PakStatus::Unsupported` for compressed entries |
+| `ReadRange(handle, rangeOffset, span)` | Partial decoded-content read for uncompressed and chunked-compressed entries; whole-frame compressed entries return `PakStatus::Unsupported` |
 | `Prefetch(handle)` | Best-effort mapped range prefetch hint |
 | `VerifyEntry(handle)` | Off-hot-path integrity check: re-hashes on-disk bytes against the stored content hash, returns `PakStatus::HashMismatch` on failure |
 | `FileExists(name)` | O(1) hash lookup, no disk I/O |
@@ -504,14 +481,14 @@ void AssetStreamWorker(PakReader& reader, AssetQueue& queue) {
 
 | Method | Description |
 |--------|-------------|
-| `Mount(filename, encryptionKey="")` | Opens a new `PakReader` and mounts it as the highest-priority layer so far |
+| `Mount(filename, encryptionKey="")` / `Mount(filename, options, encryptionKey="")` | Opens a reader and mounts it as the highest-priority layer; repeated identical path/options/key mounts increment its reference count |
 | `MountReader(reader)` | Mounts an externally-owned, already-open `shared_ptr<PakReader>` as the highest-priority layer |
 | `Clear()` | Unmounts every layer |
 | `Unmount(path)` / `UnmountReader(reader)` | Releases one layer reference and removes it at zero |
-| `LayerCount()` | Number of mounted layers |
+| `LayerCount()` / `LayerRefCount(index)` | Number of unique mounted layers and references held for one layer |
 | `GetLayerReader(index)` | Direct access to a layer's own `PakReader` (index 0 = first mounted); use for per-layer `SetCacheOptions` |
 | `Find(name)` / `Resolve(names, handles)` | Resolve across layers, highest-priority match wins; returns `PakMountHandle` |
-| `Info(handle)`, `View(handle, view)`, `Read(handle, span)`, `Load(handle, vector)`, `Prefetch(handle)` | Dispatch straight to the winning layer's own `PakReader` method |
+| `Info(handle)`, `View(handle, view)`, `Read(handle, span)`, `ReadRange(handle, offset, span)`, `Load(handle, vector)`, `Prefetch(handle)`, `VerifyEntry(handle)` | Dispatch straight to the winning layer's own `PakReader` method |
 | `ReadFile`, `LoadFile`, `ReadFileZeroCopy` | Convenience wrappers |
 | `FileExists(name)`, `GetFileCount()` | Query the deduplicated merged namespace |
 | `ListFiles()`, `ListFilesWithPrefix(prefix)` | Deduplicated, override-aware enumeration |
@@ -660,9 +637,9 @@ Internally:
 
 `PakMount` is **thread-safe** for concurrent reads, and composes with `PakReader`'s own contract:
 
-- `Find()`, `Resolve()`, `Info()`, `View()`, `Read()`, `Load()`, `Prefetch()`, `ListFiles()`, `ListFilesWithPrefix()`, and convenience wrappers -- safe to call concurrently from any number of threads, and safe alongside reads issued directly against a `shared_ptr<PakReader>` an engine also holds outside the mount.
+- `Find()`, `Resolve()`, `Info()`, `View()`, `Read()`, `ReadRange()`, `Load()`, `Prefetch()`, `VerifyEntry()`, `ListFiles()`, `ListFilesWithPrefix()`, and convenience wrappers -- safe to call concurrently from any number of threads, and safe alongside reads issued directly against a `shared_ptr<PakReader>` an engine also holds outside the mount.
 - `Mount()`, `MountReader()`, `Unmount()`, `UnmountReader()`, and `Clear()` take exclusive locks. Do not call them while reads are in progress -- same rule as `PakReader::Open()`/`Close()`.
-- `PakMountHandle` values remain valid as long as the layer they reference is still mounted; do not use a handle resolved before a `Clear()` call.
+- `PakMountHandle` values remain valid across additive mounts and reference-count changes. Removing a final layer reference or calling `Clear()` invalidates old handles; generation checks make their operations return `PakStatus::InvalidHandle` or `nullptr`.
 - Moving a `PakMount` acquires an exclusive lock. The source must not be in use by other threads during the move.
 
 ### Pakker (build-time)
@@ -684,38 +661,6 @@ Internally:
 | Parallel reads | Dispatch cached handles through engine jobs | Serialized by stream mutex |
 | Concurrent reads | Fully parallel | Serialized through mutex |
 | Repeated compressed/encrypted reads | Decoded memory/persistent cache | Decoded memory/persistent cache |
-
-### Current large-game scale benchmark
-
-These are the current local Windows x64 Release results for 50,000 entries and
-eight mount requests, measured with:
-
-```powershell
-.\build\Release\PakkerScaleBenchmark.exe 50000 8
-```
-
-| Measurement | Result |
-|-------------|-------:|
-| Archive creation | 196.365 ms |
-| Archive size | 7.63221 MiB |
-| Open with names | 32.8174 ms |
-| Resident metadata with names | 6.42969 MiB (134 bytes/entry) |
-| Random path lookup | 382.194 ns/lookup |
-| Missing path lookup | 128.432 ns/lookup |
-| Precomputed-hash lookup with names | 45.144 ns/lookup |
-| Verify all 50,000 entries | 2.1726 ms |
-| Enumerate and sort all names | 9.9907 ms |
-| Open without names | 3.4889 ms |
-| Resident metadata without names | 4.11719 MiB (86 bytes/entry) |
-| Precomputed-hash lookup without names | 31.618 ns/lookup |
-| Eight duplicate mount requests | 6.6946 ms total (0.836825 ms/request) |
-| Resident duplicate-mount state | 6.08203 MiB |
-| Duplicate-mount result | 1 unique layer, reference count 8 |
-
-The mount measurement uses `PakOpenOptions::loadNames = false`, matching the
-shipping hash-only configuration. These figures are a point-in-time local
-baseline; hardware, storage state, compiler version, and background load affect
-absolute timings.
 
 ## Build Options
 
@@ -755,11 +700,3 @@ target_link_libraries(YourTarget PRIVATE Pakker::Pakker)
 ```
 
 The exported target propagates its C++20 requirement and public include directory automatically -- no manual `CMAKE_CXX_STANDARD` bump needed on the consumer side.
-
-## Contributing
-
-Contributions are welcome! Please feel free to submit a Pull Request.
-
-## License
-
-This project is licensed under the MIT License - see the LICENSE file for details.

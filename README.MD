@@ -11,7 +11,8 @@ lookups, layered archives, integrity checks, and concurrent runtime reads.
 
 // Build assets.pak from a directory.
 Pakker builder;
-builder.CreatePakFromFolder("assets.pak", "assets");
+PakOptions options;
+builder.CreatePakFromFolder("assets.pak", "assets", options);
 
 // Open it and load one asset.
 PakReader reader;
@@ -21,15 +22,9 @@ std::vector<uint8_t> data;
 reader.Load(reader.Find("textures/diffuse.dds"), data);
 ```
 
-Link the exported CMake target:
-
-```cmake
-add_subdirectory(path/to/Pakker)
-target_link_libraries(YourGame PRIVATE Pakker::Pakker)
-```
-
 See the [usage guide](USAGE.md) for compression, streaming reads, layered
-archives, caching, integrity verification, installation, and the complete API.
+archives, caching, integrity verification, CMake integration, installation,
+and the complete API.
 
 ## Highlights
 
@@ -74,9 +69,9 @@ and background load.
 
 ## Documentation
 
-- [Usage guide](USAGE.md) — integration, configuration, examples, and API
-- [Contributor handbook](HANDBOOK.md) — architecture, invariants, and testing
-- [Example application](example/main.cpp) — complete executable example
+- [Usage guide](USAGE.md) - integration, configuration, examples, and API
+- [Contributor handbook](HANDBOOK.md) - architecture, invariants, and testing
+- [Example application](example/main.cpp) - complete executable example
 
 ## Requirements
 

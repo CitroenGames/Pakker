@@ -571,7 +571,7 @@ public:
                       PakCompression compression = PakCompression::None,
                       int zstdLevel = 19);
 
-    // Creates a v6 PAK from a folder with PakOptions.
+    // Creates a v8 PAK from a folder with PakOptions.
     bool CreatePakFromFolder(const std::string& pakFilename,
                              const std::string& folderPath,
                              const PakOptions& options);
