@@ -682,6 +682,38 @@ Internally:
 | Concurrent reads | Fully parallel | Serialized through mutex |
 | Repeated compressed/encrypted reads | Decoded memory/persistent cache | Decoded memory/persistent cache |
 
+### Current large-game scale benchmark
+
+These are the current local Windows x64 Release results for 50,000 entries and
+eight mount requests, measured with:
+
+```powershell
+.\build\Release\PakkerScaleBenchmark.exe 50000 8
+```
+
+| Measurement | Result |
+|-------------|-------:|
+| Archive creation | 196.365 ms |
+| Archive size | 7.63221 MiB |
+| Open with names | 32.8174 ms |
+| Resident metadata with names | 6.42969 MiB (134 bytes/entry) |
+| Random path lookup | 382.194 ns/lookup |
+| Missing path lookup | 128.432 ns/lookup |
+| Precomputed-hash lookup with names | 45.144 ns/lookup |
+| Verify all 50,000 entries | 2.1726 ms |
+| Enumerate and sort all names | 9.9907 ms |
+| Open without names | 3.4889 ms |
+| Resident metadata without names | 4.11719 MiB (86 bytes/entry) |
+| Precomputed-hash lookup without names | 31.618 ns/lookup |
+| Eight duplicate mount requests | 6.6946 ms total (0.836825 ms/request) |
+| Resident duplicate-mount state | 6.08203 MiB |
+| Duplicate-mount result | 1 unique layer, reference count 8 |
+
+The mount measurement uses `PakOpenOptions::loadNames = false`, matching the
+shipping hash-only configuration. These figures are a point-in-time local
+baseline; hardware, storage state, compiler version, and background load affect
+absolute timings.
+
 ## Build Options
 
 | Option | Default | Description |
