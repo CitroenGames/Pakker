@@ -103,6 +103,30 @@ The platform layer is intentionally narrow. `PakPlatform` owns file mapping,
 unmapping, prefetch hints, and cache-directory discovery. Keep OS-specific code
 there unless the public API truly needs to know about it.
 
+### Large-game reference: MW2019 XPAK
+
+The MW2019 XPAK implementation is a useful scale reference, while its I/O
+model is different enough that features should be translated rather than
+copied mechanically:
+
+- Loaded pack files are identified by name and reference-counted. Re-adding a
+  pack increments its count; removal closes it only at zero. `PakMount` now
+  applies that lifecycle to canonical path/options/key identities and to
+  shared reader object identities.
+- Runtime index records are fixed-size `(64-bit key, offset, size)` values.
+  Pakker already has the equivalent shipping path through stored 64-bit path
+  hashes, fixed-size records, `FindByHash()`, and `loadNames=false`. The
+  `PakMount::Mount(path, options)` overload makes that mode directly usable
+  across a layered install.
+- XPAK streams its index through two 96 KiB, 4 KiB-aligned buffers because it
+  uses explicit asynchronous file requests. Pakker memory-maps the archive and
+  lets the OS page index/data on demand, while `ReadBatch()` coalesces prefetch
+  ranges. Duplicating XPAK's private index buffers would add memory and copying
+  without preserving its storage model.
+- XPAK supports list-driven multivolume packs. Pakker's independent archive
+  layers cover patch/DLC composition; a manifest API remains a useful future
+  convenience if projects need one logical mount operation for many volumes.
+
 ## Archive Format
 
 The current format is v8:
@@ -380,17 +404,17 @@ Do not move a `PakReader` while other threads are using it.
   concurrently with each other and with reads issued directly against a
   `shared_ptr<PakReader>` an engine also holds outside the mount (e.g. one
   obtained via `GetLayerReader()` or passed into `MountReader()`).
-- `Mount()`, `MountReader()`, and `Clear()` take an exclusive lock on
-  `PakMount`'s own mutex and rebuild the merged lookup index (a full rebuild,
-  not incremental -- mounting is rare/load-screen-scale, so this amortizes
-  fine). Do not call them concurrently with any other `PakMount` method on the
+- `Mount()`, `MountReader()`, `Unmount()`, `UnmountReader()`, and `Clear()`
+  take an exclusive lock on `PakMount`'s own mutex. A new mount overlays one
+  layer incrementally; removing a final reference rebuilds the merged index.
+  Do not call mutations concurrently with any other `PakMount` method on the
   same instance.
 - `PakMount` never holds a layer's own `PakReader` lock while blocked on its
   own `mutex_`, and vice versa -- no cross-lock ordering hazard.
-- `PakMountHandle` values remain valid as long as the layer they reference is
-  still mounted; a handle resolved before `Clear()` degrades safely to
-  `PakStatus::InvalidHandle`/`nullptr` afterward (bounds-checked against
-  `layers_.size()`), it does not dereference a dangling layer.
+- `PakMountHandle` values remain valid across additive mounts and reference
+  count changes. Removing a final layer reference or calling `Clear()`
+  invalidates prior handles; generation checks make them degrade safely to
+  `PakStatus::InvalidHandle`/`nullptr`.
 - Do not move a `PakMount` while other threads are using it.
 
 `PakLooseOverlay` has no mutable state after construction (the wrapped
@@ -467,10 +491,10 @@ Keep compatibility explicit:
 
 Known limitations (deliberate, revisitable scope cuts, not oversights):
 
-- `PakMount` v1 has no per-layer `Unmount()`, only `Clear()` (drop every
-  layer). Layer identity is ambiguous for `MountReader()`-mounted layers that
-  may carry no filename, and the dominant mount pattern -- mount everything
-  once at a load-screen boundary -- doesn't need selective removal.
+- Archive mounts are identified by canonical path, open options, and encryption key;
+  `MountReader()` mounts are identified by reader object identity. Repeated
+  mounts share one reader/index layer and are balanced by reference-counted
+  `Unmount()`/`UnmountReader()` calls.
 - There is no in-place archive upgrade tool between any format version.
   Rebuild from source with the current library.
 - `PakReader::ReadRange()` supports uncompressed entries (encrypted or not)
@@ -645,19 +669,17 @@ For `PakLooseOverlay` changes, verify at least:
 
 ### Change PakMount Layering
 
-1. Start from `RebuildMergedIndexLocked()` for merge-order/override semantics
+1. Start from `RebuildIndexLocked()` for merge-order/override semantics
    and `PakMountHandle` for the layer+handle dispatch shape.
-2. Keep the merge a full rebuild on `Mount()`/`MountReader()`/`Clear()` --
-   incremental merge/unmerge is more complex for negligible benefit given how
-   rarely mounting happens relative to `Find()` calls.
+2. Keep new-layer mounts incremental. Removing a final reference must rebuild
+   because a lower-priority entry may become visible again.
 3. Keep `PakMount` a pure `PakReader` consumer: dispatch by snapshotting a
    layer's `shared_ptr<PakReader>` under `PakMount`'s own lock, then release
    before calling into it -- never hold both locks at once.
 4. Do not add a second decoded-cache layer; per-layer caching is already
    available via `GetLayerReader(index)->SetCacheOptions(...)`.
-5. If adding per-layer `Unmount()`, decide layer identity for
-   `MountReader()`-mounted layers (which may carry no filename) before
-   settling on an API shape.
+5. Preserve layer identity rules: canonical path plus open options and encryption key for
+   `Mount()`, reader object identity for `MountReader()`.
 
 ### Change PakLooseOverlay Behavior
 

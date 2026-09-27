@@ -1001,12 +1001,14 @@ struct PakMountHandle {
 
     uint32_t layerIndex = InvalidLayer;
     PakFileHandle fileHandle{};
+    uint32_t generation = 0;
 
     explicit operator bool() const {
         return layerIndex != InvalidLayer && static_cast<bool>(fileHandle);
     }
     friend bool operator==(PakMountHandle a, PakMountHandle b) {
-        return a.layerIndex == b.layerIndex && a.fileHandle == b.fileHandle;
+        return a.layerIndex == b.layerIndex && a.fileHandle == b.fileHandle &&
+               a.generation == b.generation;
     }
     friend bool operator!=(PakMountHandle a, PakMountHandle b) { return !(a == b); }
 };
@@ -1024,18 +1026,20 @@ struct PakMountHandle {
 // cache (see PakCacheOptions, PakReader::SetCacheOptions) applies
 // transparently. Use GetLayerReader() to tune cache budgets per layer.
 //
-// v1 has no per-layer Unmount(): only Clear() (drop every layer). The
-// dominant mount pattern -- mount everything once at a load-screen boundary
-// -- doesn't need selective removal, and layer identity is ambiguous for
-// MountReader()-mounted layers that may carry no filename. This is a
-// deliberate, revisitable scope cut, not an oversight.
+// Repeated mounts of the same archive/options/key tuple, or the same PakReader
+// object, share one layer and increment its reference count. Unmount decrements that
+// count and only removes the layer at zero. Removing a layer invalidates all
+// previously resolved PakMountHandle values; their generation is checked so
+// stale handles fail instead of dispatching into a shifted layer index.
 //
 // Thread safety:
-//   - Mount(), MountReader(), and Clear() take an exclusive lock and rebuild
-//     the merged lookup index. Do not call them concurrently with any other
+//   - Mount(), MountReader(), Unmount(), UnmountReader(), and Clear() take an
+//     exclusive lock. New unique layers overlay the index incrementally;
+//     removing a final reference rebuilds it. Do not call them with any other
 //     PakMount method on the same instance -- same rule as PakReader's
 //     Open()/Close().
-//   - Find(), Resolve(), Info(), View(), Read(), Load(), Prefetch(),
+//   - Find(), Resolve(), Info(), View(), Read(), ReadRange(), Load(),
+//     Prefetch(), VerifyEntry(),
 //     ListFiles(), ListFilesWithPrefix(), FileExists(), GetFileCount(),
 //     LayerCount(), GetLayerReader(), and convenience wrappers are safe to
 //     call concurrently from multiple threads, and safe to call concurrently
@@ -1044,8 +1048,9 @@ struct PakMountHandle {
 //     or passed into MountReader()).
 //   - PakMount is non-copyable, movable. Moving a PakMount acquires an
 //     exclusive lock on the instance being moved from.
-//   - PakMountHandle values remain valid as long as the layer they reference
-//     is still mounted; do not use a handle resolved before a Clear() call.
+//   - PakMountHandle values remain valid across additive mounts and reference
+//     count changes. Removing a final layer reference or calling Clear()
+//     invalidates all previously resolved handles.
 // ---------------------------------------------------------------------------
 
 class PakMount {
@@ -1062,6 +1067,8 @@ public:
     // the highest-priority layer so far. Returns false (mounting nothing) if
     // Open() fails.
     bool Mount(const std::string& pakFilename, const std::string& encryptionKey = "");
+    bool Mount(const std::string& pakFilename, const PakOpenOptions& options,
+               const std::string& encryptionKey = "");
 
     // Mounts an externally-owned/managed reader as the highest-priority
     // layer so far. `reader` must already be open (IsOpen() == true), or
@@ -1070,10 +1077,18 @@ public:
     // PakMount reads.
     bool MountReader(std::shared_ptr<PakReader> reader);
 
+    // Balances Mount()/MountReader(). A repeated mount only decrements its
+    // reference count; the layer and merged index are removed at zero.
+    bool Unmount(const std::string& pakFilename, const std::string& encryptionKey = "");
+    bool Unmount(const std::string& pakFilename, const PakOpenOptions& options,
+                 const std::string& encryptionKey = "");
+    bool UnmountReader(const std::shared_ptr<PakReader>& reader);
+
     // Unmounts every layer and clears the merged index.
     void Clear();
 
     size_t LayerCount() const;
+    uint32_t LayerRefCount(size_t layerIndex) const;
 
     // Layer 0 is the first-mounted (lowest-priority) layer; LayerCount()-1
     // is the most-recently-mounted (highest-priority) layer. Returns nullptr
@@ -1089,8 +1104,13 @@ public:
     PakStatus View(PakMountHandle handle, PakView& outView) const;
     PakStatus Read(PakMountHandle handle, std::span<uint8_t> destination,
                    uint64_t* bytesWritten = nullptr) const;
+    // Reads a slice of the winning layer's decoded entry. The same range
+    // limits and compression support as PakReader::ReadRange() apply.
+    PakStatus ReadRange(PakMountHandle handle, uint64_t rangeOffset,
+                        std::span<uint8_t> destination, uint64_t* bytesWritten = nullptr) const;
     PakStatus Load(PakMountHandle handle, std::vector<uint8_t>& outData) const;
     PakStatus Prefetch(PakMountHandle handle) const;
+    PakStatus VerifyEntry(PakMountHandle handle) const;
 
     // Convenience wrappers. Prefer the handle API in runtime engine code.
     std::vector<uint8_t> ReadFile(const std::string& filename) const;
@@ -1133,6 +1153,7 @@ private:
         std::vector<PakReader*> layerReaders;
         uint64_t mask = 0;
         uint32_t count = 0;
+        uint32_t generation = 0;
     };
 
     static void GrowIndex(MergedIndex& index, uint32_t additionalEntries);
@@ -1144,6 +1165,9 @@ private:
     static const MergedSlot* ProbeIndex(const MergedIndex& index, uint64_t pathHash);
     static PakMountHandle FindInIndex(const MergedIndex& index, std::string_view filename);
 
+    bool MountReaderLocked(std::shared_ptr<PakReader> reader, std::string identity);
+    bool RemoveLayerLocked(size_t layerIndex);
+    void RebuildIndexLocked();
     void PublishIndexLocked(std::shared_ptr<const MergedIndex> index);
 
     const MergedIndex* AcquireIndex() const noexcept
@@ -1153,6 +1177,9 @@ private:
 
     mutable std::shared_mutex mutex_;
     std::vector<std::shared_ptr<PakReader>> layers_; // index 0 = lowest priority
+    std::vector<std::string> layerIdentities_;       // empty for MountReader layers
+    std::vector<uint32_t> layerRefCounts_;
+    uint32_t generation_ = 1;
     std::shared_ptr<const MergedIndex> indexOwner_;
     std::atomic<const MergedIndex*> index_{nullptr};
 };

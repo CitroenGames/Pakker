@@ -215,9 +215,11 @@ int main(int argc, char** argv)
     {
         const uint64_t before = ResidentBytes();
         PakMount mount;
+        PakOpenOptions mountOptions;
+        mountOptions.loadNames = false;
         auto start = Clock::now();
         for (size_t layer = 0; layer < layerCount; ++layer) {
-            if (!mount.Mount(pakPath.string())) {
+            if (!mount.Mount(pakPath.string(), mountOptions)) {
                 std::cerr << "failed to mount layer " << layer << "\n";
                 return 1;
             }
@@ -225,11 +227,13 @@ int main(int argc, char** argv)
         auto elapsed = Clock::now() - start;
         const uint64_t after = ResidentBytes();
 
-        std::cout << "Mount " << layerCount << " layers : " << Ms(elapsed) << " ms ("
-                  << (Ms(elapsed) / static_cast<double>(layerCount)) << " ms/layer)\n";
+        std::cout << "Mount " << layerCount << " requests: " << Ms(elapsed) << " ms ("
+                  << (Ms(elapsed) / static_cast<double>(layerCount)) << " ms/request)\n";
         if (before && after >= before)
             std::cout << "  mount resident: " << MiB(after - before) << " MiB\n";
-        std::cout << "  merged entries: " << mount.GetFileCount() << "\n";
+        std::cout << "  unique layers:  " << mount.LayerCount() << "\n"
+                  << "  layer refs:     " << mount.LayerRefCount(0) << "\n"
+                  << "  merged entries: " << mount.GetFileCount() << "\n";
     }
 
     fs::remove_all(root, ec);

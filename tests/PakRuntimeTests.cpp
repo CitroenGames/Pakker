@@ -938,6 +938,81 @@ static void MountClearRemovesAllLayers()
     assert(mount.Info(handleBeforeClear) == nullptr);
 }
 
+static void MountDeduplicatesAndReferenceCountsLayers()
+{
+    fs::path root = TestRoot();
+    fs::path basePak = root / "mount_ref_base.pak";
+    fs::path patchPak = root / "mount_ref_patch.pak";
+
+    std::map<std::string, std::vector<uint8_t>> baseFiles, patchFiles;
+    baseFiles["base.txt"] = Bytes("base-only");
+    baseFiles["shared.txt"] = Bytes("base");
+    patchFiles["shared.txt"] = Bytes("patch");
+
+    Pakker pakker;
+    PakOptions options;
+    assert(pakker.CreatePak(basePak.string(), baseFiles, options));
+    assert(pakker.CreatePak(patchPak.string(), patchFiles, options));
+
+    PakMount mount;
+    assert(mount.Mount(basePak.string()));
+    assert(mount.Mount(basePak.string()));
+    assert(mount.LayerCount() == 1);
+    assert(mount.LayerRefCount(0) == 2);
+
+    assert(mount.Mount(patchPak.string()));
+    assert(mount.LayerCount() == 2);
+    PakMountHandle oldBase = mount.Find("base.txt");
+    PakMountHandle oldPatch = mount.Find("shared.txt");
+    assert(oldBase.layerIndex == 0);
+    assert(oldPatch.layerIndex == 1);
+
+    // First removal balances the duplicate reference without rebuilding.
+    assert(mount.Unmount(basePak.string()));
+    assert(mount.LayerRefCount(0) == 1);
+    std::vector<uint8_t> loaded;
+    assert(mount.Load(oldBase, loaded) == PakStatus::Ok);
+    assert(loaded == baseFiles["base.txt"]);
+
+    // Removing the final reference compacts layers and invalidates old handles.
+    assert(mount.Unmount(basePak.string()));
+    assert(mount.LayerCount() == 1);
+    assert(!mount.Find("base.txt"));
+    assert(mount.Load(oldBase, loaded) == PakStatus::InvalidHandle);
+    assert(mount.Load(oldPatch, loaded) == PakStatus::InvalidHandle);
+    PakMountHandle newPatch = mount.Find("shared.txt");
+    assert(newPatch && newPatch.layerIndex == 0);
+    assert(mount.Load(newPatch, loaded) == PakStatus::Ok);
+    assert(loaded == patchFiles["shared.txt"]);
+    assert(!mount.Unmount(basePak.string()));
+
+    auto sharedReader = std::make_shared<PakReader>();
+    assert(sharedReader->Open(basePak.string()));
+    assert(mount.MountReader(sharedReader));
+    assert(mount.MountReader(sharedReader));
+    assert(mount.LayerCount() == 2);
+    assert(mount.LayerRefCount(1) == 2);
+    assert(mount.UnmountReader(sharedReader));
+    assert(mount.LayerRefCount(1) == 1);
+    assert(mount.UnmountReader(sharedReader));
+    assert(!mount.UnmountReader(sharedReader));
+
+    // Open policy participates in identity: shipping no-name mounts share
+    // each other, but never alias a tools mount that retains names.
+    PakMount policyMount;
+    PakOpenOptions shippingOptions;
+    shippingOptions.loadNames = false;
+    assert(policyMount.Mount(basePak.string(), shippingOptions));
+    assert(policyMount.Mount(basePak.string(), shippingOptions));
+    assert(policyMount.LayerCount() == 1);
+    assert(policyMount.LayerRefCount(0) == 2);
+    assert(policyMount.Mount(basePak.string()));
+    assert(policyMount.LayerCount() == 2);
+    assert(policyMount.Unmount(basePak.string(), shippingOptions));
+    assert(policyMount.Unmount(basePak.string(), shippingOptions));
+    assert(policyMount.LayerCount() == 1);
+}
+
 static void MountEnumerationDeduplicatesAcrossLayers()
 {
     fs::path root = TestRoot();
@@ -2578,8 +2653,27 @@ static void PakMountComprehensiveApi()
     assert(written == baseFiles["raw.txt"].size());
     assert(exact == baseFiles["raw.txt"]);
 
+    // Range reads and integrity checks dispatch to the handle's owning layer.
+    std::vector<uint8_t> slice(5);
+    written = 999;
+    assert(mount.ReadRange(overrideHandle, 6, slice, &written) == PakStatus::Ok);
+    assert(written == slice.size());
+    assert(slice == Bytes("overr"));
+    assert(mount.ReadRange(rawHandle, 5, slice, &written) == PakStatus::Ok);
+    assert(slice == Bytes("raw-t"));
+    assert(mount.VerifyEntry(overrideHandle) == PakStatus::Ok);
+    assert(mount.VerifyEntry(rawHandle) == PakStatus::Ok);
+    written = 999;
+    assert(mount.ReadRange(overrideHandle, patchFiles["override.txt"].size(), slice, &written)
+           == PakStatus::InvalidArgument);
+    assert(written == 0);
+
     // Read with invalid handle
     assert(mount.Read(PakMountHandle{}, exact) == PakStatus::InvalidHandle);
+    written = 999;
+    assert(mount.ReadRange(PakMountHandle{}, 0, slice, &written) == PakStatus::InvalidHandle);
+    assert(written == 0);
+    assert(mount.VerifyEntry(PakMountHandle{}) == PakStatus::InvalidHandle);
     assert(mount.View(PakMountHandle{}, view) == PakStatus::InvalidHandle);
     assert(mount.Load(PakMountHandle{}, exact) == PakStatus::InvalidHandle);
     assert(mount.Prefetch(PakMountHandle{}) == PakStatus::InvalidHandle);
@@ -2989,6 +3083,7 @@ int main()
     MountReaderRejectsUnopenedReader();
     MountThreeLayerPriorityAndLayerAccessors();
     MountClearRemovesAllLayers();
+    MountDeduplicatesAndReferenceCountsLayers();
     MountEnumerationDeduplicatesAcrossLayers();
     MountConcurrentReadsAcrossLayers();
     ZstdCompressionRoundTrips();

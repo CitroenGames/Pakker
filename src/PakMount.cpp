@@ -1,6 +1,8 @@
 #include "Pak.h"
 #include "PakInternal.h"
 #include <algorithm>
+#include <cctype>
+#include <filesystem>
 
 using namespace PakInternal;
 
@@ -9,6 +11,8 @@ using namespace PakInternal;
 // ===========================================================================
 
 namespace {
+
+namespace fs = std::filesystem;
 
 bool NeedsPathNormalization(std::string_view path)
 {
@@ -30,16 +34,44 @@ uint64_t NextPowerOfTwo(uint64_t value)
     return result;
 }
 
+std::string ArchiveIdentity(const std::string& filename, const PakOpenOptions& options,
+                            const std::string& encryptionKey)
+{
+    std::error_code ec;
+    fs::path path = fs::weakly_canonical(fs::path(filename), ec);
+    if (ec) {
+        ec.clear();
+        path = fs::absolute(fs::path(filename), ec);
+        if (ec) path = fs::path(filename);
+    }
+    std::string identity = path.lexically_normal().generic_string();
+#ifdef _WIN32
+    std::transform(identity.begin(), identity.end(), identity.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+#endif
+    identity.push_back('\0');
+    identity.append(encryptionKey);
+    identity.push_back('\0');
+    identity.push_back(options.verifyOnRead ? '\1' : '\0');
+    identity.push_back(options.loadNames ? '\1' : '\0');
+    return identity;
+}
+
 } // namespace
 
 PakMount::PakMount(PakMount&& other) noexcept
 {
     std::unique_lock lock(other.mutex_);
     layers_ = std::move(other.layers_);
+    layerIdentities_ = std::move(other.layerIdentities_);
+    layerRefCounts_ = std::move(other.layerRefCounts_);
+    generation_ = other.generation_;
     indexOwner_ = std::move(other.indexOwner_);
     index_.store(other.index_.load(std::memory_order_relaxed), std::memory_order_relaxed);
     other.index_.store(nullptr, std::memory_order_relaxed);
     other.layers_.clear();
+    other.layerIdentities_.clear();
+    other.layerRefCounts_.clear();
 }
 
 PakMount& PakMount::operator=(PakMount&& other) noexcept
@@ -56,10 +88,15 @@ PakMount& PakMount::operator=(PakMount&& other) noexcept
         }
 
         layers_ = std::move(other.layers_);
+        layerIdentities_ = std::move(other.layerIdentities_);
+        layerRefCounts_ = std::move(other.layerRefCounts_);
+        generation_ = other.generation_;
         indexOwner_ = std::move(other.indexOwner_);
         index_.store(other.index_.load(std::memory_order_relaxed), std::memory_order_relaxed);
         other.index_.store(nullptr, std::memory_order_relaxed);
         other.layers_.clear();
+        other.layerIdentities_.clear();
+        other.layerRefCounts_.clear();
     }
     return *this;
 }
@@ -179,9 +216,28 @@ void PakMount::PublishIndexLocked(std::shared_ptr<const MergedIndex> index)
 
 bool PakMount::Mount(const std::string& pakFilename, const std::string& encryptionKey)
 {
+    return Mount(pakFilename, PakOpenOptions{}, encryptionKey);
+}
+
+bool PakMount::Mount(const std::string& pakFilename, const PakOpenOptions& options,
+                     const std::string& encryptionKey)
+{
+    const std::string identity = ArchiveIdentity(pakFilename, options, encryptionKey);
+    {
+        std::unique_lock lock(mutex_);
+        for (size_t i = 0; i < layerIdentities_.size(); ++i) {
+            if (layerIdentities_[i] == identity) {
+                ++layerRefCounts_[i];
+                return true;
+            }
+        }
+    }
+
     auto reader = std::make_shared<PakReader>(encryptionKey);
-    if (!reader->Open(pakFilename)) return false;
-    return MountReader(std::move(reader));
+    if (!reader->Open(pakFilename, options)) return false;
+
+    std::unique_lock lock(mutex_);
+    return MountReaderLocked(std::move(reader), identity);
 }
 
 bool PakMount::MountReader(std::shared_ptr<PakReader> reader)
@@ -189,6 +245,25 @@ bool PakMount::MountReader(std::shared_ptr<PakReader> reader)
     if (!reader || !reader->IsOpen()) return false;
 
     std::unique_lock lock(mutex_);
+    for (size_t i = 0; i < layers_.size(); ++i) {
+        if (layers_[i].get() == reader.get()) {
+            ++layerRefCounts_[i];
+            return true;
+        }
+    }
+    return MountReaderLocked(std::move(reader), {});
+}
+
+bool PakMount::MountReaderLocked(std::shared_ptr<PakReader> reader, std::string identity)
+{
+    if (!identity.empty()) {
+        for (size_t i = 0; i < layerIdentities_.size(); ++i) {
+            if (layerIdentities_[i] == identity) {
+                ++layerRefCounts_[i];
+                return true;
+            }
+        }
+    }
 
     // Copy the previous index forward and overlay only the incoming layer.
     // The copy is a flat vector memcpy rather than a per-entry rehash, which
@@ -199,11 +274,73 @@ bool PakMount::MountReader(std::shared_ptr<PakReader> reader)
 
     const uint32_t layerIndex = static_cast<uint32_t>(layers_.size());
     merged->layerReaders.push_back(reader.get());
+    merged->generation = generation_;
     OverlayLayer(*merged, layerIndex, *reader);
 
     layers_.push_back(std::move(reader));
+    layerIdentities_.push_back(std::move(identity));
+    layerRefCounts_.push_back(1);
     PublishIndexLocked(std::move(merged));
     return true;
+}
+
+bool PakMount::Unmount(const std::string& pakFilename, const std::string& encryptionKey)
+{
+    return Unmount(pakFilename, PakOpenOptions{}, encryptionKey);
+}
+
+bool PakMount::Unmount(const std::string& pakFilename, const PakOpenOptions& options,
+                       const std::string& encryptionKey)
+{
+    const std::string identity = ArchiveIdentity(pakFilename, options, encryptionKey);
+    std::unique_lock lock(mutex_);
+    for (size_t i = 0; i < layerIdentities_.size(); ++i) {
+        if (layerIdentities_[i] == identity) return RemoveLayerLocked(i);
+    }
+    return false;
+}
+
+bool PakMount::UnmountReader(const std::shared_ptr<PakReader>& reader)
+{
+    if (!reader) return false;
+    std::unique_lock lock(mutex_);
+    for (size_t i = 0; i < layers_.size(); ++i) {
+        if (layers_[i].get() == reader.get()) return RemoveLayerLocked(i);
+    }
+    return false;
+}
+
+bool PakMount::RemoveLayerLocked(size_t layerIndex)
+{
+    if (layerIndex >= layers_.size()) return false;
+    if (layerRefCounts_[layerIndex] > 1) {
+        --layerRefCounts_[layerIndex];
+        return true;
+    }
+
+    layers_.erase(layers_.begin() + static_cast<std::ptrdiff_t>(layerIndex));
+    layerIdentities_.erase(layerIdentities_.begin() + static_cast<std::ptrdiff_t>(layerIndex));
+    layerRefCounts_.erase(layerRefCounts_.begin() + static_cast<std::ptrdiff_t>(layerIndex));
+    ++generation_;
+    if (generation_ == 0) ++generation_;
+    RebuildIndexLocked();
+    return true;
+}
+
+void PakMount::RebuildIndexLocked()
+{
+    if (layers_.empty()) {
+        index_.store(nullptr, std::memory_order_release);
+        indexOwner_.reset();
+        return;
+    }
+
+    auto merged = std::make_shared<MergedIndex>();
+    merged->generation = generation_;
+    merged->layerReaders.reserve(layers_.size());
+    for (const auto& layer : layers_) merged->layerReaders.push_back(layer.get());
+    for (uint32_t i = 0; i < layers_.size(); ++i) OverlayLayer(*merged, i, *layers_[i]);
+    PublishIndexLocked(std::move(merged));
 }
 
 void PakMount::Clear()
@@ -212,6 +349,10 @@ void PakMount::Clear()
     index_.store(nullptr, std::memory_order_release);
     indexOwner_.reset();
     layers_.clear();
+    layerIdentities_.clear();
+    layerRefCounts_.clear();
+    ++generation_;
+    if (generation_ == 0) ++generation_;
 }
 
 size_t PakMount::LayerCount() const
@@ -248,7 +389,7 @@ PakMountHandle PakMount::FindInIndex(const MergedIndex& index, std::string_view 
         if (info && !info->filename.empty() && info->filename != filename) return {};
     }
 
-    return PakMountHandle{slot->layerIndex, slot->fileHandle};
+    return PakMountHandle{slot->layerIndex, slot->fileHandle, index.generation};
 }
 
 PakMountHandle PakMount::Find(std::string_view filename) const
@@ -294,14 +435,16 @@ size_t PakMount::Resolve(std::span<const std::string_view> filenames,
 const PakFileInfo* PakMount::Info(PakMountHandle handle) const
 {
     const MergedIndex* index = AcquireIndex();
-    if (!index || !handle || handle.layerIndex >= index->layerReaders.size()) return nullptr;
+    if (!index || !handle || handle.generation != index->generation ||
+        handle.layerIndex >= index->layerReaders.size()) return nullptr;
     return index->layerReaders[handle.layerIndex]->Info(handle.fileHandle);
 }
 
 PakStatus PakMount::View(PakMountHandle handle, PakView& outView) const
 {
     const MergedIndex* index = AcquireIndex();
-    if (!index || !handle || handle.layerIndex >= index->layerReaders.size())
+    if (!index || !handle || handle.generation != index->generation ||
+        handle.layerIndex >= index->layerReaders.size())
         return PakStatus::InvalidHandle;
     return index->layerReaders[handle.layerIndex]->View(handle.fileHandle, outView);
 }
@@ -310,15 +453,36 @@ PakStatus PakMount::Read(PakMountHandle handle, std::span<uint8_t> destination,
                          uint64_t* bytesWritten) const
 {
     const MergedIndex* index = AcquireIndex();
-    if (!index || !handle || handle.layerIndex >= index->layerReaders.size())
+    if (!index || !handle || handle.generation != index->generation ||
+        handle.layerIndex >= index->layerReaders.size())
         return PakStatus::InvalidHandle;
     return index->layerReaders[handle.layerIndex]->Read(handle.fileHandle, destination, bytesWritten);
+}
+
+uint32_t PakMount::LayerRefCount(size_t layerIndex) const
+{
+    std::shared_lock lock(mutex_);
+    return layerIndex < layerRefCounts_.size() ? layerRefCounts_[layerIndex] : 0;
+}
+
+PakStatus PakMount::ReadRange(PakMountHandle handle, uint64_t rangeOffset,
+                              std::span<uint8_t> destination, uint64_t* bytesWritten) const
+{
+    const MergedIndex* index = AcquireIndex();
+    if (!index || !handle || handle.generation != index->generation ||
+        handle.layerIndex >= index->layerReaders.size()) {
+        if (bytesWritten) *bytesWritten = 0;
+        return PakStatus::InvalidHandle;
+    }
+    return index->layerReaders[handle.layerIndex]->ReadRange(
+        handle.fileHandle, rangeOffset, destination, bytesWritten);
 }
 
 PakStatus PakMount::Load(PakMountHandle handle, std::vector<uint8_t>& outData) const
 {
     const MergedIndex* index = AcquireIndex();
-    if (!index || !handle || handle.layerIndex >= index->layerReaders.size()) {
+    if (!index || !handle || handle.generation != index->generation ||
+        handle.layerIndex >= index->layerReaders.size()) {
         outData.clear();
         return PakStatus::InvalidHandle;
     }
@@ -328,9 +492,19 @@ PakStatus PakMount::Load(PakMountHandle handle, std::vector<uint8_t>& outData) c
 PakStatus PakMount::Prefetch(PakMountHandle handle) const
 {
     const MergedIndex* index = AcquireIndex();
-    if (!index || !handle || handle.layerIndex >= index->layerReaders.size())
+    if (!index || !handle || handle.generation != index->generation ||
+        handle.layerIndex >= index->layerReaders.size())
         return PakStatus::InvalidHandle;
     return index->layerReaders[handle.layerIndex]->Prefetch(handle.fileHandle);
+}
+
+PakStatus PakMount::VerifyEntry(PakMountHandle handle) const
+{
+    const MergedIndex* index = AcquireIndex();
+    if (!index || !handle || handle.generation != index->generation ||
+        handle.layerIndex >= index->layerReaders.size())
+        return PakStatus::InvalidHandle;
+    return index->layerReaders[handle.layerIndex]->VerifyEntry(handle.fileHandle);
 }
 
 // ---------------------------------------------------------------------------
@@ -364,7 +538,8 @@ PakSpan PakMount::ReadFileZeroCopy(const std::string& filename) const
     if (!handle) return PakSpan{};
 
     const MergedIndex* index = AcquireIndex();
-    if (!index || handle.layerIndex >= index->layerReaders.size()) return PakSpan{};
+    if (!index || handle.generation != index->generation ||
+        handle.layerIndex >= index->layerReaders.size()) return PakSpan{};
     return index->layerReaders[handle.layerIndex]->ReadFileZeroCopy(filename);
 }
 

@@ -131,6 +131,17 @@ mount.Mount("base.pak");
 mount.Mount("patch_1_2.pak");
 mount.Mount("dlc_desert_pack.pak");
 
+// Shared dependencies are reference-counted instead of opened/indexed twice.
+mount.Mount("base.pak");
+mount.LayerCount();       // 3 unique layers
+mount.LayerRefCount(0);   // 2
+mount.Unmount("base.pak"); // base remains mounted with one reference
+
+// Shipping mode: retain hashes and metadata, skip resident path strings.
+PakOpenOptions shipping;
+shipping.loadNames = false;
+mount.Mount("season_4.pak", shipping);
+
 // Same ergonomics as PakReader: resolve once, dispatch by handle
 PakMountHandle texture = mount.Find("textures/diffuse.dds");
 if (texture) {
@@ -155,10 +166,12 @@ if (auto base = mount.GetLayerReader(0)) {
 for (const auto& name : mount.ListFiles()) { /* ... */ }
 ```
 
-`PakMount` v1 has no per-layer `Unmount()` -- only `Clear()` (drop every
-layer). The dominant mount pattern is "mount everything once at a load-screen
-boundary," which `Clear()` + re-`Mount()` covers; selective removal is a
-natural follow-up if a use case needs it.
+Mounting the same canonical archive path with the same open options and
+encryption key reuses the existing layer and increments its reference count. `Unmount()` balances
+`Mount()`; `UnmountReader()` does the same for repeated mounts of one shared
+reader object. When the count reaches zero, Pakker rebuilds the merged index.
+That structural change invalidates previously resolved `PakMountHandle`
+values, which carry a generation so stale use returns `InvalidHandle`.
 
 ### Partial reads for large assets
 
@@ -491,6 +504,7 @@ void AssetStreamWorker(PakReader& reader, AssetQueue& queue) {
 | `Mount(filename, encryptionKey="")` | Opens a new `PakReader` and mounts it as the highest-priority layer so far |
 | `MountReader(reader)` | Mounts an externally-owned, already-open `shared_ptr<PakReader>` as the highest-priority layer |
 | `Clear()` | Unmounts every layer |
+| `Unmount(path)` / `UnmountReader(reader)` | Releases one layer reference and removes it at zero |
 | `LayerCount()` | Number of mounted layers |
 | `GetLayerReader(index)` | Direct access to a layer's own `PakReader` (index 0 = first mounted); use for per-layer `SetCacheOptions` |
 | `Find(name)` / `Resolve(names, handles)` | Resolve across layers, highest-priority match wins; returns `PakMountHandle` |
@@ -644,7 +658,7 @@ Internally:
 `PakMount` is **thread-safe** for concurrent reads, and composes with `PakReader`'s own contract:
 
 - `Find()`, `Resolve()`, `Info()`, `View()`, `Read()`, `Load()`, `Prefetch()`, `ListFiles()`, `ListFilesWithPrefix()`, and convenience wrappers -- safe to call concurrently from any number of threads, and safe alongside reads issued directly against a `shared_ptr<PakReader>` an engine also holds outside the mount.
-- `Mount()`, `MountReader()`, and `Clear()` take exclusive locks and rebuild the merged lookup index. Do not call them while reads are in progress -- same rule as `PakReader::Open()`/`Close()`.
+- `Mount()`, `MountReader()`, `Unmount()`, `UnmountReader()`, and `Clear()` take exclusive locks. Do not call them while reads are in progress -- same rule as `PakReader::Open()`/`Close()`.
 - `PakMountHandle` values remain valid as long as the layer they reference is still mounted; do not use a handle resolved before a `Clear()` call.
 - Moving a `PakMount` acquires an exclusive lock. The source must not be in use by other threads during the move.
 
